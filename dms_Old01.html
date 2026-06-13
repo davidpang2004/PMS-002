@@ -1,0 +1,3610 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>QC 文件 Management System (QCDMS)</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  html, body, #root { height: 100%; margin: 0; }
+  body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+</style>
+</head>
+<body class="bg-stone-50">
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useCallback, useMemo, useRef } = React;
+
+/* =============================================================================
+ * INLINE ICONS (subset of lucide-react, hand-rolled to avoid bundler)
+ * Each accepts size + className. Strokes use currentColor.
+ * =============================================================================
+ */
+const I = ({ d, size = 16, className = "", children, viewBox = "0 0 24 24" }) => (
+  <svg
+    xmlns="http://www.w3.org/2000/svg"
+    width={size}
+    height={size}
+    viewBox={viewBox}
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="2"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+  >
+    {children || (typeof d === "string" ? <path d={d} /> : d)}
+  </svg>
+);
+const ChevronRight = (p) => <I {...p}><polyline points="9 18 15 12 9 6" /></I>;
+const ChevronDown  = (p) => <I {...p}><polyline points="6 9 12 15 18 9" /></I>;
+const ChevronLeft  = (p) => <I {...p}><polyline points="15 18 9 12 15 6" /></I>;
+const 文件夹 = (p) => (
+  <I {...p}><path d="M4 4h5l2 3h9a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z" /></I>
+);
+const 文件夹打开 = (p) => (
+  <I {...p}>
+    <path d="M6 14l1.45-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.55 6a2 2 0 0 1-1.94 1.5H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h3.93a2 2 0 0 1 1.66.9l.82 1.2a2 2 0 0 0 1.66.9H18a2 2 0 0 1 2 2v2"/>
+  </I>
+);
+const FileText = (p) => (
+  <I {...p}>
+    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+    <polyline points="14 2 14 8 20 8" />
+    <line x1="16" y1="13" x2="8" y2="13" />
+    <line x1="16" y1="17" x2="8" y2="17" />
+    <polyline points="10 9 9 9 8 9" />
+  </I>
+);
+const ImageIcon = (p) => (
+  <I {...p}>
+    <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+    <circle cx="8.5" cy="8.5" r="1.5" />
+    <polyline points="21 15 16 10 5 21" />
+  </I>
+);
+const File = (p) => (
+  <I {...p}>
+    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+    <polyline points="14 2 14 8 20 8" />
+  </I>
+);
+const Plus = (p) => <I {...p}><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></I>;
+const Trash2 = (p) => (
+  <I {...p}>
+    <polyline points="3 6 5 6 21 6" />
+    <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+    <path d="M10 11v6" />
+    <path d="M14 11v6" />
+    <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
+  </I>
+);
+const 上传 = (p) => (
+  <I {...p}>
+    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+    <polyline points="17 8 12 3 7 8" />
+    <line x1="12" y1="3" x2="12" y2="15" />
+  </I>
+);
+const 搜索 = (p) => <I {...p}><circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" /></I>;
+const X = (p) => <I {...p}><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></I>;
+const Edit2 = (p) => (
+  <I {...p}>
+    <path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z" />
+  </I>
+);
+const Download = (p) => (
+  <I {...p}>
+    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+    <polyline points="7 10 12 15 17 10" />
+    <line x1="12" y1="15" x2="12" y2="3" />
+  </I>
+);
+const Tag = (p) => (
+  <I {...p}>
+    <path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z" />
+    <line x1="7" y1="7" x2="7.01" y2="7" />
+  </I>
+);
+const Hash = (p) => (
+  <I {...p}>
+    <line x1="4" y1="9" x2="20" y2="9" /><line x1="4" y1="15" x2="20" y2="15" />
+    <line x1="10" y1="3" x2="8" y2="21" /><line x1="16" y1="3" x2="14" y2="21" />
+  </I>
+);
+const Calendar = (p) => (
+  <I {...p}>
+    <rect x="3" y="4" width="18" height="18" rx="2" ry="2" />
+    <line x1="16" y1="2" x2="16" y2="6" />
+    <line x1="8" y1="2" x2="8" y2="6" />
+    <line x1="3" y1="10" x2="21" y2="10" />
+  </I>
+);
+const HardDrive = (p) => (
+  <I {...p}>
+    <line x1="22" y1="12" x2="2" y2="12" />
+    <path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" />
+    <line x1="6" y1="16" x2="6.01" y2="16" />
+    <line x1="10" y1="16" x2="10.01" y2="16" />
+  </I>
+);
+const Cloud = (p) => <I {...p}><path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z" /></I>;
+const Book = (p) => (
+  <I {...p}>
+    <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
+    <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" />
+  </I>
+);
+const CheckSquare = (p) => (
+  <I {...p}>
+    <polyline points="9 11 12 14 22 4" />
+    <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
+  </I>
+);
+const Square = (p) => <I {...p}><rect x="3" y="3" width="18" height="18" rx="2" ry="2" /></I>;
+const MinusSquare = (p) => (
+  <I {...p}>
+    <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+    <line x1="8" y1="12" x2="16" y2="12" />
+  </I>
+);
+
+/* =============================================================================
+ * STORAGE ADAPTER LAYER (REST API implementation)
+ * ---------------------------------------------------------------------------
+ * Talks to the Python Flask server (dms_server.py) running on the same host.
+ * Tree + index live in <storage_root>/index.json on disk.
+ * 文件s live as real files in <storage_root>/docs/<DOC-ID>.<ext>.
+ *
+ * To migrate to a remote/production server later, just change API_BASE to
+ * the remote URL — no other code in this file changes.
+ * =============================================================================
+ */
+const API_BASE = ""; // same origin as the page (e.g. http://localhost:8000)
+
+const DEFAULT_KEY_PARAMETERS = [
+  "category",
+  "rev",
+  "supplier",
+  "drawing_number",
+  "equipment_tag",
+  "serial_number",
+  "manufacturer",
+  "project",
+  "discipline",
+  "status",
+  "inspection_type",
+  "certificate_type",
+  "asset_id"
+];
+
+const normalizeKeyParameters = (items) => {
+  const seen = new Set();
+  const out = [];
+  for (const raw of (items || [])) {
+    const v = String(raw || "").trim();
+    if (!v) continue;
+    const k = v.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(v);
+  }
+  return out;
+};
+
+const StorageAdapter = {
+  async _json(path, opts = {}) {
+    const res = await fetch(API_BASE + path, opts);
+    if (!res.ok) {
+      let detail = "";
+      try { detail = (await res.json()).error || ""; } catch {}
+      throw new Error(`${path} → HTTP ${res.status} ${res.statusText} ${detail}`);
+    }
+    return res.json();
+  },
+
+  async getSettings() {
+    return this._json("/api/settings");
+  },
+
+  async saveSettings(storagePath) {
+    return this._json("/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ storage_path: storagePath }),
+    });
+  },
+
+  async getTree() {
+    const r = await this._json("/api/tree");
+    return r.tree;
+  },
+
+  async saveTree(tree) {
+    await this._json("/api/tree", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tree }),
+    });
+  },
+
+  async list文件Index() {
+    const r = await this._json("/api/doc-index");
+    return r.docIndex || [];
+  },
+
+  async save文件Index(docIndex) {
+    await this._json("/api/doc-index", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ docIndex }),
+    });
+  },
+
+  async getKeyParameters() {
+    const r = await this._json("/api/key-parameters");
+    return normalizeKeyParameters(r.keyParameters || DEFAULT_KEY_PARAMETERS);
+  },
+
+  async saveKeyParameters(keyParameters) {
+    await this._json("/api/key-parameters", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ keyParameters: normalizeKeyParameters(keyParameters) }),
+    });
+  },
+
+  // 文件s: upload as multipart, retrieve as URL
+  async save文件(doc) {
+    // doc.dataUrl is base64. Convert to Blob and POST as multipart/form-data.
+    // NOTE: do NOT use `new File(...)` here — our React `File` icon component
+    // shadows the global File constructor in this scope. FormData accepts a
+    // Blob plus filename argument, which works the same way.
+    const response = await fetch(doc.dataUrl);
+    const blob = await response.blob();
+    const form = new FormData();
+    form.append("file", blob, doc.name);
+    form.append("doc_id", doc.id);
+    const res = await fetch(API_BASE + "/api/docs", { method: "POST", body: form });
+    if (!res.ok) {
+      let detail = "";
+      try { detail = (await res.json()).error || ""; } catch {}
+      throw new Error(`上传 failed: HTTP ${res.status} ${detail}`);
+    }
+    console.log(`[DMS] ✓ 上传ed ${doc.name} as ${doc.id}`);
+  },
+
+  async get文件(docId) {
+    // For viewing, the document is just a URL — the server streams it.
+    // We also need its metadata (name, mime, etc.) which is in the doc index.
+    const idx = await this.list文件Index();
+    const meta = idx.find((d) => d.id === docId);
+    if (!meta) return null;
+    return {
+      id: docId,
+      name: meta.name,
+      mime: meta.mime,
+      size: meta.size,
+      uploadedAt: meta.uploadedAt,
+      originalNodeId: meta.originalNodeId || meta.nodeId,
+      metadata: meta.metadata || {},
+      // dataUrl is now a server URL — viewer can use it directly
+      dataUrl: API_BASE + "/api/docs/" + docId,
+    };
+  },
+
+  async delete文件(docId) {
+    try {
+      await fetch(API_BASE + "/api/docs/" + docId, { method: "DELETE" });
+    } catch (e) {
+      console.warn("[DMS] 删除 failed (non-fatal):", e);
+    }
+  },
+};
+
+/* =============================================================================
+ * ID GENERATION
+ * =============================================================================
+ */
+const genDocId = () => {
+  const d = new Date();
+  const ymd =
+    d.getFullYear().toString() +
+    String(d.getMonth() + 1).padStart(2, "0") +
+    String(d.getDate()).padStart(2, "0");
+  const rand = Math.random().toString(36).slice(2, 8).toUpperCase();
+  return `DOC-${ymd}-${rand}`;
+};
+
+const genNodeId = () => {
+  const rand = Math.random().toString(36).slice(2, 8).toUpperCase();
+  return `NODE-${rand}`;
+};
+
+/* =============================================================================
+ * TREE OPERATIONS
+ * =============================================================================
+ */
+const findNode = (root, nodeId) => {
+  if (!root) return null;
+  if (root.id === nodeId) return root;
+  for (const child of root.children || []) {
+    const found = findNode(child, nodeId);
+    if (found) return found;
+  }
+  return null;
+};
+
+const collectAllDocIds = (node, acc = []) => {
+  if (!node) return acc;
+  (node.documents || []).forEach((d) => acc.push(d.id));
+  (node.children || []).forEach((c) => collectAllDocIds(c, acc));
+  return acc;
+};
+
+const updateNodeInTree = (root, nodeId, updater) => {
+  if (root.id === nodeId) return updater(root);
+  return {
+    ...root,
+    children: (root.children || []).map((c) =>
+      updateNodeInTree(c, nodeId, updater)
+    ),
+  };
+};
+
+const removeNodeFromTree = (root, nodeId) => {
+  return {
+    ...root,
+    children: (root.children || [])
+      .filter((c) => c.id !== nodeId)
+      .map((c) => removeNodeFromTree(c, nodeId)),
+  };
+};
+
+/* =============================================================================
+ * SEED DATA
+ * =============================================================================
+ */
+const buildSeedTree = () => ({
+  id: genNodeId(),
+  name: "GA-001 Centrifugal pump assembly",
+  description: "Top-level general assembly drawing",
+  children: [
+    {
+      id: genNodeId(),
+      name: "SA-100 Casing assembly",
+      description: "Pump volute and inlet/outlet flanges",
+      children: [
+        {
+          id: genNodeId(),
+          name: "P-101 Volute housing",
+          description: "Cast iron, machined",
+          children: [],
+          documents: [],
+        },
+        {
+          id: genNodeId(),
+          name: "P-102 Suction flange",
+          description: "ANSI 150# raised face",
+          children: [],
+          documents: [],
+        },
+      ],
+      documents: [],
+    },
+    {
+      id: genNodeId(),
+      name: "SA-200 Rotor assembly",
+      description: "Shaft, impeller, and bearings",
+      children: [
+        {
+          id: genNodeId(),
+          name: "P-201 Impeller",
+          description: "关闭d type, 6-vane",
+          children: [],
+          documents: [],
+        },
+        {
+          id: genNodeId(),
+          name: "P-202 Shaft",
+          description: "AISI 4140, hardened",
+          children: [],
+          documents: [],
+        },
+      ],
+      documents: [],
+    },
+  ],
+  documents: [],
+});
+
+/* =============================================================================
+ * UI: TREE NODE
+ * =============================================================================
+ */
+const TreeNode = ({
+  node, depth, selectedId, expandedIds, isRoot,
+  renamingId, addingChildToId,
+  onToggle, onSelect,
+  onStart重命名, onCommit重命名, on取消重命名,
+  onStartAddChild, onCommitAddChild, on取消AddChild,
+  on删除, onContextMenu, on上传ToNode,
+}) => {
+  const isExpanded = expandedIds.has(node.id);
+  const isSelected = selectedId === node.id;
+  const isRenaming = renamingId === node.id;
+  const isAddingChild = addingChildToId === node.id;
+  const hasChildren = (node.children || []).length > 0;
+  const docCount = (node.documents || []).length;
+
+  const [draftName, setDraftName] = useState(node.name);
+  const [newChildName, setNewChildName] = useState("");
+
+  useEffect(() => { if (isRenaming) setDraftName(node.name); }, [isRenaming, node.name]);
+  useEffect(() => { if (isAddingChild) setNewChildName(""); }, [isAddingChild]);
+
+  const commit重命名 = () => {
+    const trimmed = draftName.trim();
+    if (trimmed && trimmed !== node.name) onCommit重命名(node.id, trimmed);
+    else on取消重命名();
+  };
+
+  const commitAddChild = () => {
+    const trimmed = newChildName.trim();
+    if (trimmed) onCommitAddChild(node.id, trimmed);
+    else on取消AddChild();
+  };
+
+  return (
+    <div>
+      <div
+        onClick={() => !isRenaming && onSelect(node.id)}
+        onDoubleClick={(e) => { e.stopPropagation(); onStart重命名(node.id); }}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          onSelect(node.id);
+          onContextMenu(e.clientX, e.clientY, node.id);
+        }}
+        className={`group flex items-center gap-1.5 py-1.5 px-2 cursor-pointer text-sm border-l-2 transition-colors ${
+          isSelected
+            ? "bg-amber-50 border-amber-600 text-stone-900"
+            : "border-transparent text-stone-700 hover:bg-stone-100"
+        }`}
+        style={{ paddingLeft: `${depth * 14 + 8}px` }}
+      >
+        <span
+          onClick={(e) => { e.stopPropagation(); if (hasChildren) onToggle(node.id); }}
+          className="w-4 flex items-center justify-center"
+        >
+          {hasChildren ? (
+            isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />
+          ) : <span className="w-3.5" />}
+        </span>
+        {isExpanded && hasChildren ? (
+          <文件夹打开 size={15} className="text-amber-700 shrink-0" />
+        ) : (
+          <文件夹 size={15} className="text-amber-700 shrink-0" />
+        )}
+
+        {isRenaming ? (
+          <input
+            autoFocus
+            type="text"
+            value={draftName}
+            onChange={(e) => setDraftName(e.target.value)}
+            onClick={(e) => e.stopPropagation()}
+            onBlur={commit重命名}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") commit重命名();
+              if (e.key === "Escape") on取消重命名();
+            }}
+            className="flex-1 text-sm px-1 py-0 border border-amber-500 rounded bg-white text-stone-900 focus:outline-none"
+          />
+        ) : (
+          <span className="truncate flex-1" title="Double-click to rename">
+            {node.name}
+            {node.sn && (
+              <span className="ml-1.5 text-[10px] text-amber-700 font-mono">· {node.sn}</span>
+            )}
+          </span>
+        )}
+
+        {!isRenaming && (
+          <>
+            {docCount > 0 && (
+              <span className="text-[10px] tabular-nums px-1.5 py-0.5 bg-stone-200 text-stone-700 rounded">
+                {docCount}
+              </span>
+            )}
+            <div className="hidden group-hover:flex items-center gap-0.5 ml-1">
+              <button
+                onClick={(e) => { e.stopPropagation(); onStartAddChild(node.id); }}
+                title="Add child folder"
+                className="text-stone-500 hover:text-amber-700 p-0.5 rounded hover:bg-white"
+              >
+                <Plus size={12} />
+              </button>
+              <label
+                onClick={(e) => e.stopPropagation()}
+                title="上传文件 to this folder"
+                className="text-stone-500 hover:text-amber-700 p-0.5 rounded hover:bg-white cursor-pointer"
+              >
+                <上传 size={12} />
+                <input
+                  type="file"
+                  multiple
+                  accept="application/pdf,image/*"
+                  className="hidden"
+                  onChange={(e) => on上传ToNode(node.id, e)}
+                />
+              </label>
+              {!isRoot && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); on删除(node.id); }}
+                  title="删除 node"
+                  className="text-stone-500 hover:text-red-600 p-0.5 rounded hover:bg-white"
+                >
+                  <Trash2 size={12} />
+                </button>
+              )}
+            </div>
+          </>
+        )}
+      </div>
+
+      {isAddingChild && (
+        <div
+          className="flex items-center gap-1.5 py-1 px-2"
+          style={{ paddingLeft: `${(depth + 1) * 14 + 8}px` }}
+        >
+          <span className="w-4" />
+          <文件夹 size={15} className="text-amber-400 shrink-0" />
+          <input
+            autoFocus
+            type="text"
+            value={newChildName}
+            placeholder="New folder / sub-assembly name…"
+            onChange={(e) => setNewChildName(e.target.value)}
+            onBlur={commitAddChild}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") commitAddChild();
+              if (e.key === "Escape") on取消AddChild();
+            }}
+            className="flex-1 text-sm px-1 py-0 border border-amber-500 rounded bg-white text-stone-900 focus:outline-none"
+          />
+        </div>
+      )}
+
+      {isExpanded && (node.children || []).map((child) => (
+        <TreeNode
+          key={child.id}
+          node={child}
+          depth={depth + 1}
+          selectedId={selectedId}
+          expandedIds={expandedIds}
+          isRoot={false}
+          renamingId={renamingId}
+          addingChildToId={addingChildToId}
+          onToggle={onToggle}
+          onSelect={onSelect}
+          onStart重命名={onStart重命名}
+          onCommit重命名={onCommit重命名}
+          on取消重命名={on取消重命名}
+          onStartAddChild={onStartAddChild}
+          onCommitAddChild={onCommitAddChild}
+          on取消AddChild={on取消AddChild}
+          on删除={on删除}
+          onContextMenu={onContextMenu}
+          on上传ToNode={on上传ToNode}
+        />
+      ))}
+    </div>
+  );
+};
+
+/* =============================================================================
+ * UI: CONTEXT MENU
+ * =============================================================================
+ */
+const ContextMenu = ({ x, y, isRoot, on关闭, on重命名, onAddChild, on上传, on删除 }) => {
+  useEffect(() => {
+    const close = () => on关闭();
+    window.addEventListener("click", close);
+    window.addEventListener("scroll", close, true);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("scroll", close, true);
+    };
+  }, [on关闭]);
+
+  return (
+    <div
+      style={{ position: "fixed", left: x, top: y, zIndex: 60 }}
+      className="bg-white border border-stone-300 rounded shadow-lg py-1 min-w-[180px] text-sm"
+      onClick={(e) => e.stopPropagation()}
+    >
+      <button
+        onClick={() => { onAddChild(); on关闭(); }}
+        className="w-full text-left px-3 py-1.5 hover:bg-amber-50 flex items-center gap-2 text-stone-700"
+      >
+        <文件夹 size={13} /> Add sub-folder
+      </button>
+      <button
+        onClick={() => { on上传(); on关闭(); }}
+        className="w-full text-left px-3 py-1.5 hover:bg-amber-50 flex items-center gap-2 text-stone-700"
+      >
+        <上传 size={13} /> 上传文件
+      </button>
+      <div className="border-t border-stone-200 my-1" />
+      <button
+        onClick={() => { on重命名(); on关闭(); }}
+        className="w-full text-left px-3 py-1.5 hover:bg-amber-50 flex items-center gap-2 text-stone-700"
+      >
+        <Edit2 size={13} /> 重命名
+      </button>
+      {!isRoot && (
+        <>
+          <div className="border-t border-stone-200 my-1" />
+          <button
+            onClick={() => { on删除(); on关闭(); }}
+            className="w-full text-left px-3 py-1.5 hover:bg-red-50 flex items-center gap-2 text-red-600"
+          >
+            <Trash2 size={13} /> 删除 folder
+          </button>
+        </>
+      )}
+    </div>
+  );
+};
+
+/* =============================================================================
+ * UI: DOCUMENT VIEWER
+ * =============================================================================
+ */
+const 文件Viewer = ({ doc, on关闭 }) => {
+  if (!doc) return null;
+  const isImage = doc.mime?.startsWith("image/");
+  const isPdf = doc.mime === "application/pdf";
+
+  return (
+    <div
+      className="fixed inset-0 bg-stone-900/80 z-50 flex items-center justify-center p-4"
+      onClick={on关闭}
+    >
+      <div
+        className="bg-white w-full max-w-5xl h-[90vh] flex flex-col rounded shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between px-4 py-3 border-b border-stone-200">
+          <div className="min-w-0">
+            <div className="text-sm font-medium text-stone-900 truncate">{doc.name}</div>
+            <div className="text-[11px] text-stone-500 font-mono">{doc.id}</div>
+          </div>
+          <div className="flex gap-2">
+            <a
+              href={doc.dataUrl}
+              download={doc.name}
+              className="text-xs px-3 py-1.5 border border-stone-300 text-stone-700 hover:bg-stone-100 rounded flex items-center gap-1.5"
+            >
+              <Download size={13} /> Download
+            </a>
+            <button
+              onClick={on关闭}
+              className="text-xs px-3 py-1.5 border border-stone-300 text-stone-700 hover:bg-stone-100 rounded flex items-center gap-1"
+            >
+              <X size={13} /> 关闭
+            </button>
+          </div>
+        </div>
+        <div className="flex-1 overflow-auto bg-stone-100">
+          {isImage && (
+            <div className="h-full flex items-center justify-center p-4">
+              <img src={doc.dataUrl} alt={doc.name} className="max-w-full max-h-full object-contain" />
+            </div>
+          )}
+          {isPdf && (
+            <iframe src={doc.dataUrl} title={doc.name} className="w-full h-full border-0" />
+          )}
+          {!isImage && !isPdf && (
+            <div className="h-full flex flex-col items-center justify-center text-stone-500 gap-3">
+              <File size={48} />
+              <div className="text-sm">Preview not available for this file type.</div>
+              <div className="text-xs font-mono">{doc.mime}</div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+/* =============================================================================
+ * UI: METADATA EDITOR
+ * =============================================================================
+ */
+const MetadataEditor = ({ metadata, onChange, keyParameters = [] }) => {
+  const entries = Object.entries(metadata || {});
+  const suggestions = normalizeKeyParameters(keyParameters);
+
+  const updateKey = (oldKey, newKey) => {
+    const clean = (newKey || "").trim();
+    if (!clean || clean === oldKey) return;
+    const m = { ...(metadata || {}) };
+    m[clean] = m[oldKey];
+    delete m[oldKey];
+    onChange(m);
+  };
+  const updateValue = (key, subField, val) => {
+    const prev = (metadata || {})[key];
+    const prevObj = (prev && typeof prev === "object") ? prev : { design: typeof prev === "string" ? prev : "", actual: "" };
+    onChange({ ...(metadata || {}), [key]: { ...prevObj, [subField]: val } });
+  };
+
+  const nextUnusedKey = () => {
+    const used = new Set(Object.keys(metadata || {}).map((k) => k.toLowerCase()));
+    const suggested = suggestions.find((k) => !used.has(k.toLowerCase()));
+    if (suggested) return suggested;
+    let key = "field"; let i = 1;
+    while ((metadata || {})[key] !== undefined) key = `field_${++i}`;
+    return key;
+  };
+
+  const addField = () => {
+    const key = nextUnusedKey();
+    onChange({ ...(metadata || {}), [key]: { design: "", actual: "" } });
+  };
+  const removeField = (key) => {
+    const m = { ...(metadata || {}) }; delete m[key]; onChange(m);
+  };
+
+  const FieldKeyPicker = ({ currentKey }) => {
+    const matchedSuggestion = suggestions.find((k) => k.toLowerCase() === currentKey.toLowerCase());
+    const isListed = !!matchedSuggestion;
+    const selectValue = isListed ? matchedSuggestion : "__current_custom__";
+
+    const renameCustom = () => {
+      const next = window.prompt("Enter new field/key parameter name:", isListed ? "" : currentKey);
+      if (next === null) return;
+      const clean = (next || "").trim();
+      if (!clean) return;
+      updateKey(currentKey, clean);
+    };
+
+    return (
+      <select
+        value={selectValue}
+        onChange={(e) => {
+          const v = e.target.value;
+          if (v === "__enter_new__") {
+            renameCustom();
+            return;
+          }
+          if (v === "__current_custom__") return;
+          updateKey(currentKey, v);
+        }}
+        onDoubleClick={() => {
+          if (!isListed) renameCustom();
+        }}
+        title={isListed
+          ? "Select from Global Key Parameters, or choose Custom / Enter New"
+          : "Custom field. 打开 the list to choose a global key, or double-click to rename this custom field."
+        }
+        className={`text-xs px-2 py-1 border rounded w-1/3 min-w-[220px] font-mono bg-stone-50 focus:outline-none focus:border-amber-600 ${
+          isListed ? "border-stone-300" : "border-amber-400 text-amber-800"
+        }`}
+      >
+        {!isListed && <option value="__current_custom__">{currentKey}</option>}
+        {suggestions.map((k) => <option key={k} value={k}>{k}</option>)}
+        <option value="__enter_new__">Custom / Enter New...</option>
+      </select>
+    );
+  };
+
+  return (
+    <div className="space-y-1.5">
+      <div className="text-[10px] text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1">
+        Field names use the full Global Key Parameters pull-down list. Choose from the list, or select Custom / Enter New to type a field not in the list.
+      </div>
+
+      {entries.length === 0 && (
+        <div className="text-xs text-stone-500 italic py-2">
+          No metadata yet. Click Add field, then choose from the pull-down list or type your own key parameter.
+        </div>
+      )}
+
+      {entries.map(([key, val]) => {
+        const valObj = (val && typeof val === "object") ? val : { design: typeof val === "string" ? val : "", actual: "" };
+        return (
+          <div key={key} className="space-y-1">
+            <div className="flex gap-1.5 items-center">
+              <FieldKeyPicker currentKey={key} />
+              <button onClick={() => removeField(key)} className="text-stone-400 hover:text-red-600 p-1 ml-auto">
+                <X size={12} />
+              </button>
+            </div>
+            <div className="flex gap-1.5 items-center pl-1">
+              <span className="text-[10px] text-stone-500 w-[90px] shrink-0 text-right pr-1">Design / Req.</span>
+              <input
+                type="text"
+                value={valObj.design}
+                onChange={(e) => updateValue(key, "design", e.target.value)}
+                placeholder="Design or standard requirement"
+                className="text-xs px-2 py-1 border border-stone-300 rounded flex-1 focus:outline-none focus:border-amber-600"
+              />
+            </div>
+            <div className="flex gap-1.5 items-center pl-1 pb-1 border-b border-stone-100">
+              <span className="text-[10px] text-stone-500 w-[90px] shrink-0 text-right pr-1">Actual</span>
+              <input
+                type="text"
+                value={valObj.actual}
+                onChange={(e) => updateValue(key, "actual", e.target.value)}
+                placeholder="Actual value"
+                className="text-xs px-2 py-1 border border-stone-300 rounded flex-1 focus:outline-none focus:border-amber-600"
+              />
+            </div>
+          </div>
+        );
+      })}
+      <button onClick={addField} className="text-[11px] text-stone-600 hover:text-amber-700 flex items-center gap-1 mt-1">
+        <Plus size={11} /> Add field
+      </button>
+    </div>
+  );
+};
+
+/* =============================================================================
+ * UI: SEARCH PANEL
+ * =============================================================================
+ */
+const 搜索Panel = ({ index, refMap, getPathFor, on打开Doc, onJumpToNode }) => {
+  const [q, setQ] = useState("");
+  const [showUnref, setShowUnref] = useState(false);
+
+  const results = useMemo(() => {
+    const words = q.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    let pool = index;
+    if (showUnref) pool = pool.filter((d) => !(refMap.get(d.id)?.length));
+    if (!words.length) return pool;
+    return pool.filter((entry) => {
+      const haystack = [
+        entry.id,
+        entry.name || "",
+        entry.sn || "",
+        ...Object.keys(entry.metadata || {}),
+        ...Object.values(entry.metadata || {}).map((v) => {
+          if (v && typeof v === "object") return `${v.design || ""} ${v.actual || ""}`;
+          return String(v);
+        }),
+      ].join(" ").toLowerCase();
+      return words.every((w) => haystack.includes(w));
+    });
+  }, [q, index, refMap, showUnref]);
+
+  const unrefCount = useMemo(
+    () => index.filter((d) => !(refMap.get(d.id)?.length)).length,
+    [index, refMap]
+  );
+
+  return (
+    <div className="p-3 space-y-2">
+      <div className="relative">
+        <搜索 size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-stone-400" />
+        <input
+          type="text"
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          placeholder="搜索 by ID, name, or metadata…"
+          className="w-full pl-8 pr-3 py-1.5 text-xs border border-stone-300 rounded focus:outline-none focus:border-amber-600"
+        />
+      </div>
+      <div className="flex items-center justify-between">
+        <label className="flex items-center gap-1.5 text-[11px] text-stone-600 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={showUnref}
+            onChange={(e) => setShowUnref(e.target.checked)}
+          />
+          Show only unreferenced
+          {unrefCount > 0 && (
+            <span className="text-[10px] tabular-nums px-1 bg-amber-100 text-amber-800 rounded">
+              {unrefCount}
+            </span>
+          )}
+        </label>
+        <span className="text-[11px] text-stone-500">
+          {q.trim()
+            ? `${results.length} of ${showUnref ? unrefCount : index.length} match`
+            : `${results.length} document${results.length === 1 ? "" : "s"}`}
+        </span>
+      </div>
+      <div className="space-y-1 max-h-[60vh] overflow-auto">
+        {results.map((r) => {
+          const refs = refMap.get(r.id) || [];
+          return (
+            <div
+              key={r.id}
+              className="border border-stone-200 rounded p-2 text-xs hover:bg-amber-50 hover:border-amber-300 cursor-pointer"
+              title="Click to open · Double-click to go to node"
+              onClick={() => on打开Doc(r.id)}
+              onDoubleClick={(e) => { e.preventDefault(); refs[0] && onJumpToNode(refs[0]); }}
+            >
+              <div className="font-medium text-stone-800 truncate">{r.name}</div>
+              <div className="font-mono text-[10px] text-stone-500 mt-0.5">{r.id}</div>
+              {refs.length === 0 && (
+                <div className="text-[10px] text-amber-700 mt-0.5 italic">unreferenced</div>
+              )}
+              {refs.map((nodeId) => (
+                <div
+                  key={nodeId}
+                  className="text-[10px] text-amber-700 mt-0.5 truncate hover:underline"
+                  onClick={(e) => { e.stopPropagation(); onJumpToNode(nodeId); }}
+                >
+                  📁 {getPathFor(nodeId)}
+                </div>
+              ))}
+              {Object.keys(r.metadata || {}).length > 0 && (
+                <div className="flex flex-wrap gap-1 mt-1">
+                  {Object.entries(r.metadata).map(([k, v]) => {
+                    const valObj = (v && typeof v === "object") ? v : { design: String(v), actual: "" };
+                    return (
+                      <span key={k} className="text-[9px] bg-stone-100 px-1.5 py-0.5 rounded font-mono">
+                        {k}: {valObj.design || "—"} / {valObj.actual || "—"}
+                      </span>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+};
+
+/* =============================================================================
+ * UI: DATABOOK PANEL
+ * ---------------------------------------------------------------------------
+ * A third sidebar tab. Renders the entire tree with checkboxes for every
+ * document. Lets the user pick what to include, then generates a PDF.
+ *
+ * Selection state is held as: Map<nodeId, Set<docId>>
+ *   — a doc selected at multiple linked nodes counts separately, so the
+ *     databook will include it once per linked node (matching how the user
+ *     organized them).
+ * =============================================================================
+ */
+const DatabookPanel = ({ tree, docIndex, getPathFor, formatBytes }) => {
+  // Map<nodeId, Set<docId>>
+  const [selection, setSelection] = useState(new Map());
+  const [expanded, setExpanded] = useState(new Set());
+  const [generating, setGenerating] = useState(false);
+  const [showTitleDialog, setShowTitleDialog] = useState(false);
+  const [title, setTitle] = useState("Engineering Databook");
+  const [subtitle, setSubtitle] = useState("");
+  const [error, setError] = useState(null);
+
+  const docsById = useMemo(() => new Map(docIndex.map((d) => [d.id, d])), [docIndex]);
+
+  // Auto-expand the root node once the tree is available
+  useEffect(() => {
+    if (tree && tree.id && !expanded.has(tree.id)) {
+      setExpanded((prev) => new Set([...prev, tree.id]));
+    }
+  }, [tree?.id]);
+
+  // Load persisted selection (so iterating on a databook is easy)
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem("dms:databook-selection");
+      if (saved) {
+        const obj = JSON.parse(saved);
+        const m = new Map();
+        for (const [nid, docs] of Object.entries(obj)) m.set(nid, new Set(docs));
+        setSelection(m);
+      }
+      const t = localStorage.getItem("dms:databook-title");
+      if (t) setTitle(t);
+      const s = localStorage.getItem("dms:databook-subtitle");
+      if (s) setSubtitle(s);
+    } catch {}
+  }, []);
+
+  // Persist selection on change
+  useEffect(() => {
+    const obj = {};
+    for (const [nid, docs] of selection) obj[nid] = Array.from(docs);
+    try {
+      localStorage.setItem("dms:databook-selection", JSON.stringify(obj));
+    } catch {}
+  }, [selection]);
+
+  const toggleExpand = (id) =>
+    setExpanded((prev) => {
+      const n = new Set(prev);
+      if (n.has(id)) n.delete(id);
+      else n.add(id);
+      return n;
+    });
+
+  const isDocSelected = (nodeId, docId) =>
+    !!selection.get(nodeId)?.has(docId);
+
+  const toggleDoc = (nodeId, docId) => {
+    setSelection((prev) => {
+      const next = new Map(prev);
+      const set = new Set(next.get(nodeId) || []);
+      if (set.has(docId)) set.delete(docId);
+      else set.add(docId);
+      if (set.size === 0) next.delete(nodeId);
+      else next.set(nodeId, set);
+      return next;
+    });
+  };
+
+  // Node-level selection state: returns "all" | "some" | "none"
+  // considering the docs directly attached to this node (NOT descendants).
+  const nodeOwnState = (node) => {
+    const docs = node.documents || [];
+    if (docs.length === 0) return "none";
+    const sel = selection.get(node.id);
+    if (!sel || sel.size === 0) return "none";
+    const allSelected = docs.every((d) => sel.has(d.id));
+    return allSelected ? "all" : "some";
+  };
+
+  const setNodeAll = (node, on) => {
+    setSelection((prev) => {
+      const next = new Map(prev);
+      const allDocIds = (node.documents || []).map((d) => d.id);
+      if (on) {
+        next.set(node.id, new Set(allDocIds));
+      } else {
+        next.delete(node.id);
+      }
+      return next;
+    });
+  };
+
+  // Recursive: select all (or none) in this node + all descendants
+  const setSubtreeAll = (node, on) => {
+    setSelection((prev) => {
+      const next = new Map(prev);
+      const walk = (n) => {
+        const ids = (n.documents || []).map((d) => d.id);
+        if (on && ids.length) next.set(n.id, new Set(ids));
+        else if (!on) next.delete(n.id);
+        (n.children || []).forEach(walk);
+      };
+      walk(node);
+      return next;
+    });
+  };
+
+  const totalSelected = useMemo(() => {
+    let n = 0;
+    for (const set of selection.values()) n += set.size;
+    return n;
+  }, [selection]);
+
+  const clearAll = () => setSelection(new Map());
+  const selectAll = () => tree && setSubtreeAll(tree, true);
+
+  // Build the ordered selection payload: tree-order traversal, only include
+  // nodes that have selected docs.
+  const buildPayload = () => {
+    if (!tree) return [];
+    const out = [];
+    const walk = (node) => {
+      const set = selection.get(node.id);
+      if (set && set.size) {
+        // Preserve the original order of documents attached to this node
+        const orderedIds = (node.documents || [])
+          .map((d) => d.id)
+          .filter((id) => set.has(id));
+        if (orderedIds.length) out.push({ nodeId: node.id, docIds: orderedIds });
+      }
+      (node.children || []).forEach(walk);
+    };
+    walk(tree);
+    return out;
+  };
+
+  const generate = async () => {
+    setError(null);
+    setGenerating(true);
+    try {
+      const payload = {
+        title: title.trim() || "Engineering Databook",
+        subtitle: subtitle.trim(),
+        selection: buildPayload(),
+      };
+      try {
+        localStorage.setItem("dms:databook-title", title);
+        localStorage.setItem("dms:databook-subtitle", subtitle);
+      } catch {}
+
+      const res = await fetch("/api/databook", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      if (!res.ok) {
+        let msg = `HTTP ${res.status}`;
+        try { msg = (await res.json()).error || msg; } catch {}
+        throw new Error(msg);
+      }
+
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = (title.trim() || "Databook") + ".pdf";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      setShowTitleDialog(false);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setGenerating(false);
+    }
+  };
+
+  // Render one node row
+  const renderNode = (node, depth = 0) => {
+    const isExpanded = expanded.has(node.id);
+    const hasChildren = (node.children || []).length > 0;
+    const docs = node.documents || [];
+    const ownState = nodeOwnState(node);
+
+    return (
+      <div key={node.id}>
+        <div
+          onClick={() => hasChildren && toggleExpand(node.id)}
+          className={`flex items-center gap-1.5 py-1 pr-2 text-xs hover:bg-stone-50 ${
+            hasChildren ? "cursor-pointer" : ""
+          }`}
+          style={{ paddingLeft: `${depth * 14 + 4}px` }}
+        >
+          <span className="w-3.5 flex items-center justify-center text-stone-500">
+            {hasChildren ? (
+              isExpanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />
+            ) : <span className="w-2.5" />}
+          </span>
+
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              setNodeAll(node, ownState !== "all");
+            }}
+            disabled={docs.length === 0}
+            className={`shrink-0 p-0.5 ${
+              docs.length === 0 ? "opacity-25 cursor-not-allowed text-stone-400"
+                : "text-amber-700 hover:text-amber-900"
+            }`}
+            title={
+              docs.length === 0
+                ? "No documents directly attached to this node"
+                : ownState === "all" ? "Deselect all docs in this node" : "Select all docs in this node"
+            }
+          >
+            {ownState === "all" ? <CheckSquare size={13} />
+              : ownState === "some" ? <MinusSquare size={13} />
+              : <Square size={13} />}
+          </button>
+
+          <文件夹 size={13} className="text-amber-700 shrink-0" />
+          <span className="truncate flex-1 text-stone-800">{node.name}</span>
+
+          {docs.length > 0 && (
+            <span className="text-[10px] tabular-nums px-1 bg-stone-100 text-stone-600 rounded">
+              {docs.length}
+            </span>
+          )}
+
+          {hasChildren && (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                setSubtreeAll(node, true);
+              }}
+              className="text-[9px] uppercase tracking-wider text-stone-400 hover:text-amber-700 px-1"
+              title="Select all documents in this entire subtree"
+            >
+              all↓
+            </button>
+          )}
+        </div>
+
+        {/* 文件s at this node */}
+        {isExpanded && docs.map((ref) => {
+          const doc = docsById.get(ref.id);
+          if (!doc) return null;
+          const sel = isDocSelected(node.id, ref.id);
+          return (
+            <div
+              key={node.id + ":" + ref.id}
+              onClick={() => toggleDoc(node.id, ref.id)}
+              className={`flex items-center gap-1.5 py-0.5 pr-2 text-xs cursor-pointer ${
+                sel ? "bg-amber-50" : "hover:bg-stone-50"
+              }`}
+              style={{ paddingLeft: `${(depth + 1) * 14 + 12}px` }}
+            >
+              <span className="text-stone-400 shrink-0">
+                {sel ? <CheckSquare size={12} className="text-amber-700" /> : <Square size={12} />}
+              </span>
+              {doc.mime?.startsWith("image/")
+                ? <ImageIcon size={11} className="text-stone-500 shrink-0" />
+                : <FileText size={11} className="text-stone-500 shrink-0" />}
+              <span className="truncate text-stone-700">{doc.name}</span>
+              <span className="text-[10px] text-stone-400 shrink-0 font-mono">
+                {formatBytes(doc.size)}
+              </span>
+            </div>
+          );
+        })}
+
+        {/* Children */}
+        {isExpanded && (node.children || []).map((c) => renderNode(c, depth + 1))}
+      </div>
+    );
+  };
+
+  if (!tree) return null;
+
+  return (
+    <div className="flex flex-col h-full">
+      {/* Toolbar */}
+      <div className="border-b border-stone-200 p-2 space-y-2">
+        <div className="flex gap-1">
+          <button
+            onClick={selectAll}
+            className="flex-1 text-[11px] px-2 py-1 border border-stone-300 hover:bg-amber-50 hover:border-amber-400 rounded"
+          >
+            Select all
+          </button>
+          <button
+            onClick={clearAll}
+            disabled={totalSelected === 0}
+            className="flex-1 text-[11px] px-2 py-1 border border-stone-300 hover:bg-stone-100 rounded disabled:opacity-40"
+          >
+            Clear
+          </button>
+        </div>
+        <div className="text-[11px] text-stone-600 flex items-center justify-between">
+          <span>
+            <span className="font-mono tabular-nums">{totalSelected}</span> document
+            {totalSelected === 1 ? "" : "s"} selected
+          </span>
+        </div>
+      </div>
+
+      {/* Tree */}
+      <div className="flex-1 overflow-auto py-1">
+        {renderNode(tree)}
+      </div>
+
+      {/* Generate button */}
+      <div className="border-t border-stone-200 p-2">
+        <button
+          onClick={() => setShowTitleDialog(true)}
+          disabled={totalSelected === 0}
+          className="w-full px-3 py-2 bg-amber-600 hover:bg-amber-700 text-white text-xs font-medium rounded disabled:opacity-40 flex items-center justify-center gap-1.5"
+        >
+          <Download size={12} /> Generate databook
+        </button>
+        <div className="text-[10px] text-stone-500 text-center mt-1.5 leading-tight">
+          Builds a single PDF with cover, table of contents,<br />
+          section headers, bookmarks, and page numbers.
+        </div>
+      </div>
+
+      {/* Title/subtitle dialog */}
+      {showTitleDialog && (
+        <div
+          className="fixed inset-0 bg-stone-900/70 z-50 flex items-center justify-center p-4"
+          onClick={() => !generating && setShowTitleDialog(false)}
+        >
+          <div
+            className="bg-white w-full max-w-md rounded shadow-2xl p-5"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="text-[10px] tracking-[0.2em] uppercase text-stone-500 mb-1">
+              Generate Databook
+            </div>
+            <h2 className="text-lg font-semibold text-stone-900 mb-3">
+              Cover page details
+            </h2>
+
+            <label className="block text-xs uppercase tracking-wider text-stone-600 mb-1.5">
+              Title
+            </label>
+            <input
+              type="text"
+              autoFocus
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              placeholder="Engineering Databook"
+              className="w-full px-2 py-1.5 text-sm border border-stone-300 rounded focus:outline-none focus:border-amber-600 mb-3"
+            />
+
+            <label className="block text-xs uppercase tracking-wider text-stone-600 mb-1.5">
+              Subtitle <span className="text-stone-400 normal-case tracking-normal">(optional)</span>
+            </label>
+            <input
+              type="text"
+              value={subtitle}
+              onChange={(e) => setSubtitle(e.target.value)}
+              placeholder="e.g. Project number, revision, customer"
+              className="w-full px-2 py-1.5 text-sm border border-stone-300 rounded focus:outline-none focus:border-amber-600 mb-3"
+            />
+
+            <div className="text-xs text-stone-600 bg-stone-50 border border-stone-200 rounded p-2 mb-3">
+              Including <strong>{totalSelected}</strong> document
+              {totalSelected === 1 ? "" : "s"} across <strong>{buildPayload().length}</strong> section
+              {buildPayload().length === 1 ? "" : "s"}.
+            </div>
+
+            {error && (
+              <div className="text-xs text-red-700 bg-red-50 border border-red-200 rounded p-2 mb-3 whitespace-pre-wrap">
+                {error}
+              </div>
+            )}
+
+            <div className="flex gap-2 justify-end">
+              <button
+                onClick={() => setShowTitleDialog(false)}
+                disabled={generating}
+                className="px-4 py-1.5 text-xs border border-stone-300 hover:bg-stone-100 rounded disabled:opacity-60"
+              >
+                取消
+              </button>
+              <button
+                onClick={generate}
+                disabled={generating}
+                className="px-4 py-1.5 text-xs bg-amber-600 hover:bg-amber-700 text-white rounded disabled:opacity-60 flex items-center gap-1.5"
+              >
+                {generating ? "Generating…" : (<><Download size={11} /> Generate & Download</>)}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+
+const 文件Card = ({
+  doc, otherRefCount = 0, nodeSn = "",
+  on打开, on删除, onUpdateMeta, onUpdateSn, formatBytes, keyParameters = [],
+}) => {
+  const [showMeta, setShowMeta] = useState(false);
+  const [editingSn, setEditingSn] = useState(false);
+  const [snDraft, setSnDraft] = useState("");
+  const isImage = doc.mime?.startsWith("image/");
+  const Icon = isImage ? ImageIcon : FileText;
+
+  // Effective SN: doc's own SN if set, otherwise the parent node's SN.
+  const ownSn = (doc.sn || "").trim();
+  const effectiveSn = ownSn || nodeSn;
+  const isInherited = !ownSn && !!nodeSn;
+
+  const startEditSn = (e) => {
+    e.stopPropagation();
+    setSnDraft(ownSn);
+    setEditingSn(true);
+  };
+  const commitSn = () => {
+    onUpdateSn(snDraft);
+    setEditingSn(false);
+  };
+  const cancelSn = () => setEditingSn(false);
+
+  return (
+    <div className="border border-stone-200 rounded bg-white">
+      <div className="flex items-center gap-3 p-3">
+        <div className="w-10 h-10 bg-stone-100 rounded flex items-center justify-center text-stone-600 shrink-0">
+          <Icon size={18} />
+        </div>
+        <div className="flex-1 min-w-0 cursor-pointer" onClick={on打开}>
+          <div className="text-sm font-medium text-stone-900 truncate hover:text-amber-700 flex items-center gap-1.5">
+            {effectiveSn && (
+              <span
+                className={`text-xs font-mono px-1.5 py-0.5 rounded shrink-0 ${
+                  isInherited
+                    ? "bg-stone-100 text-stone-600 italic"
+                    : "bg-amber-100 text-amber-800"
+                }`}
+                title={isInherited
+                  ? `Inherited from parent node SN: ${nodeSn}\nClick the SN button below to set a custom SN for this document`
+                  : `Custom SN for this document (overrides node SN)`}
+              >
+                {effectiveSn}
+              </span>
+            )}
+            <span className="truncate">{doc.name}</span>
+          </div>
+          <div className="flex gap-2 text-[11px] text-stone-500 font-mono mt-0.5 flex-wrap">
+            <span className="flex items-center gap-1"><Hash size={9} /> {doc.id}</span>
+            <span>•</span>
+            <span>{formatBytes(doc.size)}</span>
+            <span>•</span>
+            <span className="flex items-center gap-1">
+              <Calendar size={9} /> {doc.uploadedAt ? new Date(doc.uploadedAt).toLocaleDateString() : "—"}
+            </span>
+            {otherRefCount > 0 && (
+              <>
+                <span>•</span>
+                <span className="text-amber-700 not-italic">
+                  also linked from {otherRefCount} other node{otherRefCount === 1 ? "" : "s"}
+                </span>
+              </>
+            )}
+          </div>
+        </div>
+
+        {/* SN edit button */}
+        <button
+          onClick={startEditSn}
+          className={`text-[10px] px-2 py-1 border rounded font-mono ${
+            ownSn
+              ? "border-amber-400 bg-amber-50 text-amber-800"
+              : "border-stone-300 text-stone-600 hover:bg-stone-100"
+          }`}
+          title={
+            ownSn
+              ? "Edit this document's custom SN"
+              : nodeSn
+                ? "Override the inherited SN with a custom one"
+                : "Set a custom SN for this document"
+          }
+        >
+          SN
+        </button>
+
+        <button
+          onClick={() => setShowMeta(!showMeta)}
+          className={`text-xs px-2 py-1 border rounded flex items-center gap-1 ${
+            showMeta ? "border-amber-400 bg-amber-50 text-amber-800" : "border-stone-300 text-stone-600 hover:bg-stone-100"
+          }`}
+          title="Edit metadata (changes apply globally to this document)"
+        >
+          <Tag size={11} /> {Object.keys(doc.metadata || {}).length || ""}
+        </button>
+        <button
+          onClick={on删除}
+          className="text-stone-400 hover:text-red-600 p-1"
+          title={
+            otherRefCount > 0
+              ? "Unlink this document from this node only (it will remain linked elsewhere)"
+              : "Unlink this document (it will move to the Unreferenced list — file stays on disk)"
+          }
+        >
+          <Trash2 size={14} />
+        </button>
+      </div>
+
+      {/* SN editor row */}
+      {editingSn && (
+        <div className="px-3 pb-3 border-t border-stone-100 bg-amber-50/40">
+          <div className="text-[10px] uppercase tracking-wider text-stone-500 mb-1.5 mt-2">
+            Custom Serial Number for this document
+          </div>
+          <div className="flex gap-1.5">
+            <input
+              autoFocus
+              type="text"
+              value={snDraft}
+              onChange={(e) => setSnDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") commitSn();
+                if (e.key === "Escape") cancelSn();
+              }}
+              placeholder={nodeSn ? `Inherits "${nodeSn}" if blank` : "Leave blank if not applicable"}
+              className="flex-1 text-xs px-2 py-1 border border-stone-300 rounded font-mono focus:outline-none focus:border-amber-600"
+            />
+            <button
+              onClick={commitSn}
+              className="text-xs px-3 py-1 bg-amber-600 hover:bg-amber-700 text-white rounded"
+            >
+              保存
+            </button>
+            <button
+              onClick={cancelSn}
+              className="text-xs px-3 py-1 border border-stone-300 hover:bg-stone-100 rounded"
+            >
+              取消
+            </button>
+          </div>
+          <div className="text-[10px] text-stone-500 mt-1.5 leading-snug">
+            {nodeSn
+              ? <>Leaving this blank will inherit the parent node's SN: <span className="font-mono text-amber-700">{nodeSn}</span></>
+              : "The parent node has no SN set; leaving this blank means no SN."}
+          </div>
+        </div>
+      )}
+
+      {showMeta && (
+        <div className="px-3 pb-3 pt-1 border-t border-stone-100 bg-stone-50/50">
+          <div className="text-[10px] uppercase tracking-wider text-stone-500 mb-2 mt-2 flex items-center justify-between">
+            <span>Metadata</span>
+            <span className="text-stone-400 normal-case tracking-normal">applies to this document everywhere it's linked</span>
+          </div>
+          <MetadataEditor metadata={doc.metadata || {}} keyParameters={keyParameters} onChange={onUpdateMeta} />
+        </div>
+      )}
+    </div>
+  );
+};
+
+/* =============================================================================
+ * UI: SETTINGS SCREEN — text input for storage path
+ * ---------------------------------------------------------------------------
+ * Shown on first run (no path configured) or when the user clicks the
+ * folder name in the header to change it.
+ * =============================================================================
+ */
+const SettingsScreen = ({ initialPath, currentPath, isInitialSetup, on保存d, on取消 }) => {
+  const [pathValue, setPathValue] = useState(initialPath || "");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const [info, setInfo] = useState(null);
+
+  // Load current settings to show diagnostic info
+  useEffect(() => {
+    (async () => {
+      try {
+        const s = await StorageAdapter.getSettings();
+        setInfo(s);
+        if (!pathValue && s.storage_path) setPathValue(s.storage_path);
+      } catch (e) {
+        setError("Could not reach the server: " + e.message);
+      }
+    })();
+  }, []);
+
+  const save = async () => {
+    setError(null);
+    setBusy(true);
+    try {
+      const trimmed = pathValue.trim();
+      if (!trimmed) throw new Error("Please enter a path.");
+      const r = await StorageAdapter.saveSettings(trimmed);
+      on保存d(r.resolved_path);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform);
+  const exampleAbs = isMac
+    ? "/Users/yourname/文件s/Company01/DMS_Storage"
+    : "C:\\Company01\\DMS_Storage";
+  const exampleHome = isMac
+    ? "~/文件s/Company01/DMS_Storage"
+    : "%USERPROFILE%\\文件s\\Company01\\DMS_Storage";
+
+  return (
+    <div className="h-screen flex items-center justify-center bg-stone-50 p-6">
+      <div className="max-w-xl w-full bg-white border border-stone-300 rounded shadow-sm p-6">
+        <div className="text-[10px] tracking-[0.2em] uppercase text-stone-500 mb-1">
+          工程文件
+        </div>
+        <h1 className="text-xl font-semibold text-stone-900 mb-3">
+          {isInitialSetup ? "Set up storage location" : "Change storage location"}
+        </h1>
+        <p className="text-sm text-stone-700 mb-4">
+          Enter the folder path where the DMS will store its repository. 上传ed
+          PDFs and photos will be saved as real files in this folder, and the
+          assembly tree will be stored as <code className="text-xs bg-stone-100 px-1">index.json</code>.
+          The folder will be created automatically if it doesn't exist.
+        </p>
+
+        <div className="text-xs text-stone-600 bg-stone-50 border border-stone-200 rounded p-3 mb-4 font-mono leading-relaxed">
+          <div className="text-stone-500">Examples:</div>
+          <div className="text-stone-900 mt-1">{exampleAbs}</div>
+          <div className="text-stone-900">{exampleHome}</div>
+        </div>
+
+        <label className="block text-xs uppercase tracking-wider text-stone-600 mb-1.5">
+          Storage path
+        </label>
+        <input
+          type="text"
+          value={pathValue}
+          onChange={(e) => setPathValue(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") save(); }}
+          placeholder={exampleAbs}
+          autoFocus
+          className="w-full px-3 py-2 border border-stone-300 rounded font-mono text-sm focus:outline-none focus:border-amber-600"
+        />
+
+        {info && info.configured && info.exists && (
+          <div className="mt-3 text-xs text-stone-600 bg-amber-50 border border-amber-200 rounded p-2">
+            <div>Currently in use: <strong className="font-mono">{info.resolved_path}</strong></div>
+            <div className="text-stone-500 mt-1">
+              {info.doc_count} document{info.doc_count === 1 ? "" : "s"} on disk
+              {info.writable ? " · writable" : " · NOT WRITABLE"}
+            </div>
+          </div>
+        )}
+
+        <div className="flex gap-2 mt-4">
+          <button
+            onClick={save}
+            disabled={busy}
+            className="flex-1 px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white text-sm font-medium rounded disabled:opacity-60"
+          >
+            {busy ? "Saving…" : isInitialSetup ? "保存 and continue" : "保存"}
+          </button>
+          {!isInitialSetup && on取消 && (
+            <button
+              onClick={on取消}
+              disabled={busy}
+              className="px-4 py-2 border border-stone-300 hover:bg-stone-100 text-stone-700 text-sm rounded disabled:opacity-60"
+            >
+              取消
+            </button>
+          )}
+        </div>
+
+        {error && (
+          <div className="mt-3 text-xs text-red-700 bg-red-50 border border-red-200 rounded p-2 whitespace-pre-wrap">
+            {error}
+          </div>
+        )}
+
+        <div className="mt-5 pt-4 border-t border-stone-200 text-[11px] text-stone-500 leading-relaxed">
+          <div className="font-medium text-stone-700 mb-1">Notes</div>
+          <ul className="list-disc pl-4 space-y-1">
+            <li>Use forward slashes <code>/</code> on Mac/Linux, backslashes <code>\</code> on Windows.</li>
+            <li>You can use <code>~</code> on Mac/Linux to refer to your home folder.</li>
+            <li>Choose a folder NOT inside iCloud Drive on Mac (e.g., not Desktop or 文件s if those are synced).</li>
+            <li>This setting is saved to <code>~/.dms_server_config.json</code> on the server, so it persists across browser sessions.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+/* =============================================================================
+ * UI: PROJECT MENU — header dropdown with Export / Import / New Project
+ * =============================================================================
+ */
+
+/* =============================================================================
+ * UI: GLOBAL KEY PARAMETERS DIALOG
+ * =============================================================================
+ */
+const KeyParametersDialog = ({ open, keyParameters, on保存, on关闭 }) => {
+  const [draft, setDraft] = useState([]);
+  const [newItem, setNewItem] = useState("");
+
+  useEffect(() => {
+    if (open) {
+      const list = normalizeKeyParameters(keyParameters?.length ? keyParameters : DEFAULT_KEY_PARAMETERS);
+      setDraft(list);
+      setNewItem("");
+    }
+  }, [open, keyParameters]);
+
+  if (!open) return null;
+
+  const add = () => {
+    const item = newItem.trim();
+    if (!item) return;
+    setDraft((prev) => normalizeKeyParameters([...prev, item]));
+    setNewItem("");
+  };
+
+  const remove = (idx) => setDraft((prev) => prev.filter((_, i) => i !== idx));
+  const update = (idx, val) => {
+    setDraft((prev) => prev.map((x, i) => i === idx ? val : x));
+  };
+  const move = (idx, delta) => {
+    const next = [...draft];
+    const j = idx + delta;
+    if (j < 0 || j >= next.length) return;
+    [next[idx], next[j]] = [next[j], next[idx]];
+    setDraft(next);
+  };
+
+  const save = () => {
+    const pending = newItem.trim();
+    const items = pending ? [...draft, pending] : draft;
+    on保存(normalizeKeyParameters(items));
+  };
+
+  return (
+    <div
+      className="fixed inset-0 bg-stone-900/70 z-50 flex items-center justify-center p-4"
+      onClick={on关闭}
+    >
+      <div
+        className="bg-white w-full max-w-lg rounded shadow-2xl p-5"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="text-[10px] tracking-[0.2em] uppercase text-stone-500 mb-1">
+          Project Settings
+        </div>
+        <h2 className="text-lg font-semibold text-stone-900 mb-2">
+          Global Key Parameters
+        </h2>
+        <p className="text-xs text-stone-600 mb-3">
+          These names appear as pull-down suggestions when adding metadata fields to any attached document.
+          Users can still type custom field names that are not in this list.
+        </p>
+
+        <div className="flex gap-2 mb-3">
+          <input
+            type="text"
+            value={newItem}
+            onChange={(e) => setNewItem(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") add(); }}
+            placeholder="e.g. contract_number"
+            className="flex-1 px-2 py-1.5 text-sm border border-stone-300 rounded font-mono focus:outline-none focus:border-amber-600"
+            autoFocus
+          />
+          <button
+            onClick={add}
+            className="px-3 py-1.5 text-xs bg-amber-600 hover:bg-amber-700 text-white rounded flex items-center gap-1"
+          >
+            <Plus size={12} /> Add
+          </button>
+        </div>
+
+        <div className="border border-stone-200 rounded max-h-72 overflow-auto mb-3">
+          {draft.length === 0 && (
+            <div className="text-xs text-stone-500 italic p-3">No key parameters yet.</div>
+          )}
+          {draft.map((item, idx) => (
+            <div key={idx} className="flex items-center gap-1.5 p-2 border-b border-stone-100 last:border-b-0">
+              <input
+                type="text"
+                value={item}
+                onChange={(e) => update(idx, e.target.value)}
+                className="flex-1 text-xs px-2 py-1 border border-stone-300 rounded font-mono focus:outline-none focus:border-amber-600"
+              />
+              <button
+                onClick={() => move(idx, -1)}
+                disabled={idx === 0}
+                className="text-[10px] px-2 py-1 border border-stone-300 rounded disabled:opacity-30 hover:bg-stone-100"
+                title="Move up"
+              >
+                ↑
+              </button>
+              <button
+                onClick={() => move(idx, 1)}
+                disabled={idx === draft.length - 1}
+                className="text-[10px] px-2 py-1 border border-stone-300 rounded disabled:opacity-30 hover:bg-stone-100"
+                title="Move down"
+              >
+                ↓
+              </button>
+              <button onClick={() => remove(idx)} className="text-stone-400 hover:text-red-600 p-1">
+                <X size={13} />
+              </button>
+            </div>
+          ))}
+        </div>
+
+        <div className="flex items-center justify-between gap-2">
+          <button
+            onClick={() => setDraft(DEFAULT_KEY_PARAMETERS)}
+            className="px-3 py-1.5 text-xs border border-stone-300 hover:bg-stone-100 rounded"
+          >
+            Restore defaults
+          </button>
+          <div className="flex gap-2">
+            <button
+              onClick={on关闭}
+              className="px-4 py-1.5 text-xs border border-stone-300 hover:bg-stone-100 rounded"
+            >
+              取消
+            </button>
+            <button
+              onClick={save}
+              className="px-4 py-1.5 text-xs bg-amber-600 hover:bg-amber-700 text-white rounded"
+            >
+              保存 key parameters
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const ProjectMenu = ({ open, on关闭, onProjectChanged, on打开KeyParameters }) => {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const [importDialog, setImportDialog] = useState(null); // { file, mode, target }
+  const [newDialog, setNewDialog] = useState(null);       // { target }
+  const [pwDialog, setPwDialog] = useState(null);         // { current, next, confirm, hasExisting }
+  const [authStatus, setAuthStatus] = useState(null);
+  const importFileRef = useRef(null);
+
+  const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform);
+  const exampleNew = isMac
+    ? "/Users/yourname/DMS_Project_2"
+    : "C:\\DMS_Project_2";
+
+  // Load auth status when menu opens
+  useEffect(() => {
+    if (!open) return;
+    fetch("/api/auth/status")
+      .then((r) => r.json())
+      .then((s) => setAuthStatus(s))
+      .catch(() => setAuthStatus(null));
+  }, [open]);
+
+  const doExport = async () => {
+    setError(null);
+    setBusy(true);
+    try {
+      const res = await fetch("/api/project/export");
+      if (!res.ok) {
+        let msg = `HTTP ${res.status}`;
+        try { msg = (await res.json()).error || msg; } catch {}
+        throw new Error(msg);
+      }
+      const blob = await res.blob();
+      const cd = res.headers.get("Content-Disposition") || "";
+      const m = cd.match(/filename="?([^"]+)"?/);
+      const filename = m ? m[1] : "project.dms";
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      on关闭();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const triggerImportPicker = () => importFileRef.current?.click();
+
+  const onImportFileChosen = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setImportDialog({ file, mode: "new", target: "" });
+    e.target.value = "";
+  };
+
+  const doImport = async () => {
+    if (!importDialog) return;
+    setError(null);
+    setBusy(true);
+    try {
+      const form = new FormData();
+      form.append("file", importDialog.file);
+      form.append("target_path", importDialog.target);
+      form.append("mode", importDialog.mode);
+      const res = await fetch("/api/project/import", { method: "POST", body: form });
+      if (!res.ok) {
+        let msg = `HTTP ${res.status}`;
+        try { msg = (await res.json()).error || msg; } catch {}
+        throw new Error(msg);
+      }
+      const data = await res.json();
+      setImportDialog(null);
+      onProjectChanged(data.imported_to);
+      on关闭();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const doNewProject = async () => {
+    if (!newDialog) return;
+    setError(null);
+    setBusy(true);
+    try {
+      const res = await fetch("/api/project/new", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ target_path: newDialog.target }),
+      });
+      if (!res.ok) {
+        let msg = `HTTP ${res.status}`;
+        try { msg = (await res.json()).error || msg; } catch {}
+        throw new Error(msg);
+      }
+      const data = await res.json();
+      setNewDialog(null);
+      onProjectChanged(data.storage_path);
+      on关闭();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const openPasswordDialog = () => {
+    setPwDialog({
+      current: "",
+      next: "",
+      confirm: "",
+      hasExisting: !!authStatus?.password_required,
+    });
+  };
+
+  const do保存Password = async () => {
+    if (!pwDialog) return;
+    if (pwDialog.next !== pwDialog.confirm) {
+      setError("New password and confirmation don't match.");
+      return;
+    }
+    setError(null);
+    setBusy(true);
+    try {
+      const res = await fetch("/api/auth/set-password", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          current_password: pwDialog.current,
+          new_password: pwDialog.next,
+        }),
+      });
+      if (!res.ok) {
+        let msg = `HTTP ${res.status}`;
+        try { msg = (await res.json()).error || msg; } catch {}
+        throw new Error(msg);
+      }
+      setPwDialog(null);
+      on关闭();
+      // Refresh status — but stay on the page since the cookie is renewed
+      window.location.reload();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const doLogout = async () => {
+    setError(null);
+    setBusy(true);
+    try {
+      await fetch("/api/auth/logout", { method: "POST" });
+      window.location.reload();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // Click-outside to close. Stash on关闭 in a ref so the effect doesn't
+  // re-attach on every parent render — just attach once when `open` flips true.
+  const on关闭Ref = useRef(on关闭);
+  useEffect(() => { on关闭Ref.current = on关闭; }, [on关闭]);
+
+  useEffect(() => {
+    if (!open) return;
+    const close = () => on关闭Ref.current?.();
+    const t = setTimeout(() => window.addEventListener("click", close), 0);
+    return () => { clearTimeout(t); window.removeEventListener("click", close); };
+  }, [open]);
+
+  if (!open) return null;
+
+  return (
+    <>
+      {/* Hidden file input for the Import action */}
+      <input
+        ref={importFileRef}
+        type="file"
+        accept=".dms,.zip,application/zip"
+        className="hidden"
+        onChange={onImportFileChosen}
+      />
+
+      {/* Dropdown */}
+      {!importDialog && !newDialog && (
+        <div
+          onClick={(e) => e.stopPropagation()}
+          className="absolute right-0 top-full mt-1 w-72 bg-white border border-stone-300 rounded shadow-lg py-1 text-sm z-30"
+        >
+          <button
+            onClick={doExport}
+            disabled={busy}
+            className="w-full text-left px-3 py-2 hover:bg-amber-50 flex items-start gap-2 disabled:opacity-50"
+          >
+            <Download size={14} className="text-stone-600 mt-0.5 shrink-0" />
+            <div>
+              <div className="text-stone-900">Export project (.dms)</div>
+              <div className="text-[11px] text-stone-500 mt-0.5">
+                Download the entire repository as a single archive file
+              </div>
+            </div>
+          </button>
+          <button
+            onClick={triggerImportPicker}
+            disabled={busy}
+            className="w-full text-left px-3 py-2 hover:bg-amber-50 flex items-start gap-2 disabled:opacity-50"
+          >
+            <上传 size={14} className="text-stone-600 mt-0.5 shrink-0" />
+            <div>
+              <div className="text-stone-900">Import project (.dms)</div>
+              <div className="text-[11px] text-stone-500 mt-0.5">
+                打开 a previously exported project and switch to it
+              </div>
+            </div>
+          </button>
+          <div className="border-t border-stone-200 my-1" />
+          <button
+            onClick={() => { on打开KeyParameters?.(); on关闭(); }}
+            disabled={busy}
+            className="w-full text-left px-3 py-2 hover:bg-amber-50 flex items-start gap-2 disabled:opacity-50"
+          >
+            <Tag size={14} className="text-stone-600 mt-0.5 shrink-0" />
+            <div>
+              <div className="text-stone-900">Global key parameters</div>
+              <div className="text-[11px] text-stone-500 mt-0.5">
+                Manage the pull-down list for document metadata fields
+              </div>
+            </div>
+          </button>
+          <div className="border-t border-stone-200 my-1" />
+          <button
+            onClick={() => setNewDialog({ target: "" })}
+            disabled={busy}
+            className="w-full text-left px-3 py-2 hover:bg-amber-50 flex items-start gap-2 disabled:opacity-50"
+          >
+            <Plus size={14} className="text-stone-600 mt-0.5 shrink-0" />
+            <div>
+              <div className="text-stone-900">New empty project</div>
+              <div className="text-[11px] text-stone-500 mt-0.5">
+                Create a fresh empty repository in a new folder
+              </div>
+            </div>
+          </button>
+          <div className="border-t border-stone-200 my-1" />
+          <button
+            onClick={openPasswordDialog}
+            disabled={busy}
+            className="w-full text-left px-3 py-2 hover:bg-amber-50 flex items-start gap-2 disabled:opacity-50"
+          >
+            <Hash size={14} className="text-stone-600 mt-0.5 shrink-0" />
+            <div>
+              <div className="text-stone-900">
+                {authStatus?.password_required ? "Change or remove password" : "Set a password"}
+              </div>
+              <div className="text-[11px] text-stone-500 mt-0.5">
+                {authStatus?.password_required
+                  ? "Currently protected — change or clear the password"
+                  : "Optional: require a password to open the DMS"}
+              </div>
+            </div>
+          </button>
+          {authStatus?.password_required && (
+            <button
+              onClick={doLogout}
+              disabled={busy}
+              className="w-full text-left px-3 py-2 hover:bg-amber-50 flex items-start gap-2 disabled:opacity-50"
+            >
+              <X size={14} className="text-stone-600 mt-0.5 shrink-0" />
+              <div>
+                <div className="text-stone-900">Sign out</div>
+                <div className="text-[11px] text-stone-500 mt-0.5">
+                  End this session and require password again
+                </div>
+              </div>
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Import dialog */}
+      {importDialog && (
+        <div
+          className="fixed inset-0 bg-stone-900/70 z-50 flex items-center justify-center p-4"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="bg-white w-full max-w-md rounded shadow-2xl p-5">
+            <div className="text-[10px] tracking-[0.2em] uppercase text-stone-500 mb-1">
+              Import Project
+            </div>
+            <h2 className="text-lg font-semibold text-stone-900 mb-2">
+              Where should this project be extracted?
+            </h2>
+            <p className="text-xs text-stone-600 mb-3">
+              Importing <strong className="font-mono">{importDialog.file.name}</strong>
+              ({Math.round(importDialog.file.size / 1024)} KB)
+            </p>
+
+            <label className="block text-xs uppercase tracking-wider text-stone-600 mb-1.5">
+              Target folder
+            </label>
+            <input
+              type="text"
+              autoFocus
+              value={importDialog.target}
+              onChange={(e) => setImportDialog({ ...importDialog, target: e.target.value })}
+              placeholder={isMac ? "/Users/yourname/DMS_Imported" : "C:\\DMS_Imported"}
+              className="w-full px-2 py-1.5 text-sm border border-stone-300 rounded font-mono mb-3"
+            />
+
+            <label className="flex items-center gap-2 text-xs text-stone-700 mb-3">
+              <input
+                type="checkbox"
+                checked={importDialog.mode === "overwrite"}
+                onChange={(e) => setImportDialog({ ...importDialog, mode: e.target.checked ? "overwrite" : "new" })}
+              />
+              Overwrite if folder isn't empty
+              <span className="text-stone-400">(deletes existing contents)</span>
+            </label>
+
+            {error && (
+              <div className="text-xs text-red-700 bg-red-50 border border-red-200 rounded p-2 mb-3 whitespace-pre-wrap">
+                {error}
+              </div>
+            )}
+
+            <div className="flex gap-2 justify-end">
+              <button
+                onClick={() => { setImportDialog(null); setError(null); }}
+                disabled={busy}
+                className="px-4 py-1.5 text-xs border border-stone-300 hover:bg-stone-100 rounded disabled:opacity-60"
+              >
+                取消
+              </button>
+              <button
+                onClick={doImport}
+                disabled={busy || !importDialog.target.trim()}
+                className="px-4 py-1.5 text-xs bg-amber-600 hover:bg-amber-700 text-white rounded disabled:opacity-60"
+              >
+                {busy ? "Importing…" : "Import & Switch"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* New project dialog */}
+      {newDialog && (
+        <div
+          className="fixed inset-0 bg-stone-900/70 z-50 flex items-center justify-center p-4"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="bg-white w-full max-w-md rounded shadow-2xl p-5">
+            <div className="text-[10px] tracking-[0.2em] uppercase text-stone-500 mb-1">
+              New Project
+            </div>
+            <h2 className="text-lg font-semibold text-stone-900 mb-3">
+              Create empty project
+            </h2>
+
+            <label className="block text-xs uppercase tracking-wider text-stone-600 mb-1.5">
+              Project folder path
+            </label>
+            <input
+              type="text"
+              autoFocus
+              value={newDialog.target}
+              onChange={(e) => setNewDialog({ target: e.target.value })}
+              onKeyDown={(e) => { if (e.key === "Enter") doNewProject(); }}
+              placeholder={exampleNew}
+              className="w-full px-2 py-1.5 text-sm border border-stone-300 rounded font-mono mb-3"
+            />
+            <div className="text-[11px] text-stone-500 mb-3 leading-snug">
+              The folder must be empty (or not exist yet). The DMS will create
+              a fresh empty repository there and switch to using it.
+            </div>
+
+            {error && (
+              <div className="text-xs text-red-700 bg-red-50 border border-red-200 rounded p-2 mb-3 whitespace-pre-wrap">
+                {error}
+              </div>
+            )}
+
+            <div className="flex gap-2 justify-end">
+              <button
+                onClick={() => { setNewDialog(null); setError(null); }}
+                disabled={busy}
+                className="px-4 py-1.5 text-xs border border-stone-300 hover:bg-stone-100 rounded disabled:opacity-60"
+              >
+                取消
+              </button>
+              <button
+                onClick={doNewProject}
+                disabled={busy || !newDialog.target.trim()}
+                className="px-4 py-1.5 text-xs bg-amber-600 hover:bg-amber-700 text-white rounded disabled:opacity-60"
+              >
+                {busy ? "Creating…" : "Create & Switch"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Password dialog */}
+      {pwDialog && (
+        <div
+          className="fixed inset-0 bg-stone-900/70 z-50 flex items-center justify-center p-4"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="bg-white w-full max-w-md rounded shadow-2xl p-5">
+            <div className="text-[10px] tracking-[0.2em] uppercase text-stone-500 mb-1">
+              Security
+            </div>
+            <h2 className="text-lg font-semibold text-stone-900 mb-3">
+              {pwDialog.hasExisting ? "Change or remove password" : "Set a password"}
+            </h2>
+            <p className="text-xs text-stone-600 mb-4 leading-relaxed">
+              {pwDialog.hasExisting
+                ? "To change the password, enter the current one and a new one. To remove protection entirely, leave the new password blank."
+                : "When set, anyone opening the DMS will be prompted for this password. Leave blank to keep the DMS unprotected."}
+            </p>
+
+            {pwDialog.hasExisting && (
+              <>
+                <label className="block text-xs uppercase tracking-wider text-stone-600 mb-1.5">
+                  Current password
+                </label>
+                <input
+                  type="password"
+                  autoFocus
+                  value={pwDialog.current}
+                  onChange={(e) => setPwDialog({ ...pwDialog, current: e.target.value })}
+                  className="w-full px-2 py-1.5 text-sm border border-stone-300 rounded mb-3"
+                />
+              </>
+            )}
+
+            <label className="block text-xs uppercase tracking-wider text-stone-600 mb-1.5">
+              New password {pwDialog.hasExisting && <span className="text-stone-400 normal-case tracking-normal">(leave blank to remove)</span>}
+            </label>
+            <input
+              type="password"
+              autoFocus={!pwDialog.hasExisting}
+              value={pwDialog.next}
+              onChange={(e) => setPwDialog({ ...pwDialog, next: e.target.value })}
+              className="w-full px-2 py-1.5 text-sm border border-stone-300 rounded mb-3"
+            />
+
+            {pwDialog.next && (
+              <>
+                <label className="block text-xs uppercase tracking-wider text-stone-600 mb-1.5">
+                  Confirm new password
+                </label>
+                <input
+                  type="password"
+                  value={pwDialog.confirm}
+                  onChange={(e) => setPwDialog({ ...pwDialog, confirm: e.target.value })}
+                  onKeyDown={(e) => { if (e.key === "Enter") do保存Password(); }}
+                  className="w-full px-2 py-1.5 text-sm border border-stone-300 rounded mb-3"
+                />
+              </>
+            )}
+
+            {error && (
+              <div className="text-xs text-red-700 bg-red-50 border border-red-200 rounded p-2 mb-3 whitespace-pre-wrap">
+                {error}
+              </div>
+            )}
+
+            <div className="flex gap-2 justify-end">
+              <button
+                onClick={() => { setPwDialog(null); setError(null); }}
+                disabled={busy}
+                className="px-4 py-1.5 text-xs border border-stone-300 hover:bg-stone-100 rounded disabled:opacity-60"
+              >
+                取消
+              </button>
+              <button
+                onClick={do保存Password}
+                disabled={busy || (pwDialog.hasExisting && !pwDialog.current) || (pwDialog.next && pwDialog.next !== pwDialog.confirm)}
+                className="px-4 py-1.5 text-xs bg-amber-600 hover:bg-amber-700 text-white rounded disabled:opacity-60"
+              >
+                {busy ? "Saving…" : pwDialog.next ? "保存 password" : "Remove password"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
+};
+
+
+function Root() {
+  const [phase, setPhase] = useState("loading"); // 'loading' | 'setup' | 'change' | 'ready'
+  const [storagePath, setStoragePath] = useState("");
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const s = await StorageAdapter.getSettings();
+        if (s.configured && s.exists && s.writable) {
+          setStoragePath(s.resolved_path);
+          setPhase("ready");
+        } else {
+          setPhase("setup");
+        }
+      } catch (e) {
+        console.error("Could not reach the DMS server:", e);
+        // Show the setup screen anyway — it has clearer error feedback
+        setPhase("setup");
+      }
+    })();
+  }, []);
+
+  const handle保存d = (resolvedPath) => {
+    setStoragePath(resolvedPath);
+    setPhase("ready");
+  };
+
+  const handleChange文件夹 = () => setPhase("change");
+  const cancelChange = () => setPhase("ready");
+
+  if (phase === "loading") {
+    return (
+      <div className="h-screen flex items-center justify-center bg-stone-50 text-stone-500 text-sm">
+        Connecting to DMS server…
+      </div>
+    );
+  }
+
+  if (phase === "setup") {
+    return <SettingsScreen isInitialSetup={true} on保存d={handle保存d} />;
+  }
+
+  if (phase === "change") {
+    return (
+      <SettingsScreen
+        isInitialSetup={false}
+        initialPath={storagePath}
+        currentPath={storagePath}
+        on保存d={handle保存d}
+        on取消={cancelChange}
+      />
+    );
+  }
+
+  return <DMS storagePath={storagePath} onChange文件夹={handleChange文件夹} />;
+}
+
+/* =============================================================================
+ * UI: LINK PICKER MODAL
+ * ---------------------------------------------------------------------------
+ * Lets the user link an existing document to the current node. Two tabs:
+ *   • 搜索 — type a query, see matches across all documents
+ *   • Browse — walk the tree and see what's attached to each node
+ * 文件s already linked to the current node are shown but disabled.
+ * =============================================================================
+ */
+const LinkPicker = ({
+  open, on关闭, onLink,
+  docIndex, tree, refMap, currentNodeId, currentNodeName,
+  formatBytes, getPathFor,
+}) => {
+  const [tab, setTab] = useState("search");
+  const [q, setQ] = useState("");
+  const [browseNodeId, setBrowseNodeId] = useState(null);
+  const [selectedIds, setSelectedIds] = useState(new Set());
+
+  useEffect(() => {
+    if (open) {
+      setQ("");
+      setBrowseNodeId(tree?.id || null);
+      setSelectedIds(new Set());
+      setTab("search");
+    }
+  }, [open, tree]);
+
+  if (!open) return null;
+
+  // 文件s already linked to the current node — shown but not selectable
+  const alreadyLinkedHere = new Set(
+    (findNode(tree, currentNodeId)?.documents || []).map((d) => d.id)
+  );
+
+  const matchesQuery = (entry, words) => {
+    if (!words.length) return true;
+    const haystack = [
+      entry.id,
+      entry.name || "",
+      ...Object.keys(entry.metadata || {}),
+      ...Object.values(entry.metadata || {}).map((v) => {
+        if (v && typeof v === "object") return `${v.design || ""} ${v.actual || ""}`;
+        return String(v);
+      }),
+    ].join(" ").toLowerCase();
+    return words.every((w) => haystack.includes(w));
+  };
+
+  const searchWords = q.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const searchResults = docIndex.filter((d) => matchesQuery(d, searchWords));
+
+  // Browse mode: docs attached to the currently-browsed node
+  const browseNode = browseNodeId ? findNode(tree, browseNodeId) : null;
+  const browseDocs = browseNode
+    ? (browseNode.documents || [])
+        .map((ref) => docIndex.find((e) => e.id === ref.id))
+        .filter(Boolean)
+    : [];
+
+  const toggleSelect = (id) => {
+    if (alreadyLinkedHere.has(id)) return;
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const commit = async () => {
+    for (const id of selectedIds) await onLink(id);
+    on关闭();
+  };
+
+  const renderRow = (doc) => {
+    const refs = refMap.get(doc.id) || [];
+    const linkedHere = alreadyLinkedHere.has(doc.id);
+    const selected = selectedIds.has(doc.id);
+    return (
+      <div
+        key={doc.id}
+        onClick={() => toggleSelect(doc.id)}
+        className={`flex items-center gap-2 p-2 border rounded text-xs cursor-pointer transition-colors ${
+          linkedHere
+            ? "border-stone-200 bg-stone-50 opacity-60 cursor-not-allowed"
+            : selected
+              ? "border-amber-500 bg-amber-50"
+              : "border-stone-200 hover:bg-stone-50 hover:border-stone-300"
+        }`}
+      >
+        <input
+          type="checkbox"
+          readOnly
+          disabled={linkedHere}
+          checked={selected || linkedHere}
+          className="shrink-0"
+        />
+        <div className="flex-1 min-w-0">
+          <div className="font-medium text-stone-900 truncate">{doc.name}</div>
+          <div className="text-[10px] font-mono text-stone-500 mt-0.5 flex flex-wrap gap-2">
+            <span>{doc.id}</span>
+            <span>· {formatBytes(doc.size)}</span>
+            {refs.length === 0 && <span className="text-amber-700">· unreferenced</span>}
+            {refs.length > 0 && <span>· linked from {refs.length} node{refs.length === 1 ? "" : "s"}</span>}
+            {linkedHere && <span className="text-stone-700 font-semibold">· already linked here</span>}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  // Recursive tree renderer for the Browse tab
+  const renderBrowseTree = (node, depth = 0) => {
+    const docCount = (node.documents || []).length;
+    const isCurrent = node.id === browseNodeId;
+    return (
+      <div key={node.id}>
+        <div
+          onClick={() => setBrowseNodeId(node.id)}
+          className={`flex items-center gap-1.5 py-1 px-2 cursor-pointer text-xs border-l-2 ${
+            isCurrent
+              ? "bg-amber-50 border-amber-600 text-stone-900"
+              : "border-transparent text-stone-700 hover:bg-stone-100"
+          }`}
+          style={{ paddingLeft: `${depth * 12 + 8}px` }}
+        >
+          <文件夹 size={12} className="text-amber-700 shrink-0" />
+          <span className="truncate flex-1">{node.name}</span>
+          {docCount > 0 && (
+            <span className="text-[9px] tabular-nums px-1 bg-stone-200 rounded">{docCount}</span>
+          )}
+        </div>
+        {(node.children || []).map((c) => renderBrowseTree(c, depth + 1))}
+      </div>
+    );
+  };
+
+  return (
+    <div
+      className="fixed inset-0 bg-stone-900/70 z-50 flex items-center justify-center p-4"
+      onClick={on关闭}
+    >
+      <div
+        className="bg-white w-full max-w-3xl h-[80vh] rounded shadow-2xl flex flex-col"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="px-4 py-3 border-b border-stone-200">
+          <div className="flex items-center justify-between">
+            <div>
+              <div className="text-sm font-semibold text-stone-900">Link existing document</div>
+              <div className="text-[11px] text-stone-500">
+                Adding to: <span className="font-mono">{currentNodeName}</span>
+              </div>
+            </div>
+            <button
+              onClick={on关闭}
+              className="text-stone-500 hover:text-stone-900 p-1"
+            >
+              <X size={16} />
+            </button>
+          </div>
+          <div className="flex gap-1 mt-3 text-xs">
+            <button
+              onClick={() => setTab("search")}
+              className={`px-3 py-1.5 rounded ${
+                tab === "search"
+                  ? "bg-stone-900 text-white"
+                  : "border border-stone-300 text-stone-700 hover:bg-stone-100"
+              }`}
+            >
+              搜索
+            </button>
+            <button
+              onClick={() => setTab("browse")}
+              className={`px-3 py-1.5 rounded ${
+                tab === "browse"
+                  ? "bg-stone-900 text-white"
+                  : "border border-stone-300 text-stone-700 hover:bg-stone-100"
+              }`}
+            >
+              Browse tree
+            </button>
+          </div>
+        </div>
+
+        <div className="flex-1 overflow-hidden flex">
+          {tab === "search" && (
+            <div className="flex-1 flex flex-col p-3 gap-2 overflow-hidden">
+              <div className="relative shrink-0">
+                <搜索
+                  size={14}
+                  className="absolute left-2.5 top-1/2 -translate-y-1/2 text-stone-400"
+                />
+                <input
+                  type="text"
+                  autoFocus
+                  value={q}
+                  onChange={(e) => setQ(e.target.value)}
+                  placeholder="搜索 by ID, filename, or metadata…"
+                  className="w-full pl-8 pr-3 py-1.5 text-xs border border-stone-300 rounded focus:outline-none focus:border-amber-600"
+                />
+              </div>
+              <div className="text-[11px] text-stone-500 shrink-0">
+                {searchResults.length} document{searchResults.length === 1 ? "" : "s"} in repository
+              </div>
+              <div className="flex-1 overflow-auto space-y-1.5">
+                {searchResults.length === 0 && (
+                  <div className="text-xs text-stone-500 italic text-center py-8">
+                    {docIndex.length === 0
+                      ? "No documents have been uploaded yet. 上传 one first, then come back here to link it elsewhere."
+                      : "No documents match your search."}
+                  </div>
+                )}
+                {searchResults.map(renderRow)}
+              </div>
+            </div>
+          )}
+
+          {tab === "browse" && (
+            <>
+              <div className="w-1/3 border-r border-stone-200 overflow-auto">
+                {tree && renderBrowseTree(tree)}
+              </div>
+              <div className="flex-1 p-3 overflow-auto">
+                {browseNode && (
+                  <>
+                    <div className="text-[11px] font-mono text-stone-500 mb-2">
+                      {getPathFor(browseNode.id)}
+                    </div>
+                    <div className="text-xs uppercase tracking-wider text-stone-600 mb-2">
+                      文件s attached
+                    </div>
+                    <div className="space-y-1.5">
+                      {browseDocs.length === 0 && (
+                        <div className="text-xs text-stone-500 italic">
+                          No documents attached to this node.
+                        </div>
+                      )}
+                      {browseDocs.map(renderRow)}
+                    </div>
+                  </>
+                )}
+              </div>
+            </>
+          )}
+        </div>
+
+        <div className="px-4 py-3 border-t border-stone-200 flex items-center justify-between">
+          <div className="text-xs text-stone-600">
+            {selectedIds.size > 0
+              ? `${selectedIds.size} document${selectedIds.size === 1 ? "" : "s"} selected`
+              : "Select one or more documents to link"}
+          </div>
+          <div className="flex gap-2">
+            <button
+              onClick={on关闭}
+              className="px-4 py-1.5 text-xs border border-stone-300 hover:bg-stone-100 rounded"
+            >
+              取消
+            </button>
+            <button
+              onClick={commit}
+              disabled={selectedIds.size === 0}
+              className="px-4 py-1.5 text-xs bg-amber-600 hover:bg-amber-700 text-white rounded disabled:opacity-40"
+            >
+              Link {selectedIds.size > 0 ? `(${selectedIds.size})` : ""}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+/* =============================================================================
+ * MAIN APP
+ * =============================================================================
+ */
+function DMS({ storagePath, onChange文件夹 }) {
+  const [tree, setTree] = useState(null);
+  const [docIndex, setDocIndex] = useState([]);
+  const [selectedId, setSelectedId] = useState(null);
+  const [expandedIds, setExpandedIds] = useState(new Set());
+  const [viewerDoc, setViewerDoc] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [editingNode, setEditingNode] = useState(false);
+  const [tab, setTab] = useState("tree");
+  const [sidebar打开, setSidebar打开] = useState(true);
+
+  // Resizable sidebar — width in pixels, persisted in localStorage.
+  // Min/max prevent absurdly small or huge sidebars.
+  const SIDEBAR_MIN = 220;
+  const SIDEBAR_MAX = 720;
+  const SIDEBAR_DEFAULT = 320;
+  const [sidebarWidth, setSidebarWidth] = useState(() => {
+    try {
+      const saved = parseInt(localStorage.getItem("dms:sidebar-width"), 10);
+      if (saved && saved >= SIDEBAR_MIN && saved <= SIDEBAR_MAX) return saved;
+    } catch {}
+    return SIDEBAR_DEFAULT;
+  });
+  const [resizing, setResizing] = useState(false);
+
+  // While dragging, listen on the window so movement outside the handle still works
+  useEffect(() => {
+    if (!resizing) return;
+    const onMove = (e) => {
+      const w = Math.max(SIDEBAR_MIN, Math.min(SIDEBAR_MAX, e.clientX));
+      setSidebarWidth(w);
+    };
+    const onUp = () => {
+      setResizing(false);
+      try { localStorage.setItem("dms:sidebar-width", String(sidebarWidth)); } catch {}
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    // Prevent text selection while dragging
+    document.body.style.userSelect = "none";
+    document.body.style.cursor = "col-resize";
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      document.body.style.userSelect = "";
+      document.body.style.cursor = "";
+    };
+  }, [resizing, sidebarWidth]);
+
+  // 保存 width on every change after dragging ends
+  useEffect(() => {
+    if (resizing) return;
+    try { localStorage.setItem("dms:sidebar-width", String(sidebarWidth)); } catch {}
+  }, [sidebarWidth, resizing]);
+
+  // Double-click on the handle resets to default width
+  const resetSidebarWidth = () => setSidebarWidth(SIDEBAR_DEFAULT);
+  const [renamingId, setRenamingId] = useState(null);
+  const [addingChildToId, setAddingChildToId] = useState(null);
+  const [contextMenu, setContextMenu] = useState(null);
+  const [showLinkPicker, setShowLinkPicker] = useState(false);
+  const [showProjectMenu, setShowProjectMenu] = useState(false);
+  const [showKeyParameters, setShowKeyParameters] = useState(false);
+  const [keyParameters, setKeyParameters] = useState(DEFAULT_KEY_PARAMETERS);
+  const ctx上传InputRef = useRef(null);
+  const ctx上传TargetRef = useRef(null);
+
+  // ---- MIGRATION ---------------------------------------------------------
+  // Older DMS data stored full document records inside each node's documents[]
+  // list. The new schema stores only {id} references in nodes, with the
+  // canonical record living in docIndex. Detect old-format data and convert
+  // it once on load.
+  const migrateIfNeeded = (loadedTree, loadedIndex) => {
+    if (!loadedTree) return { tree: loadedTree, index: loadedIndex, migrated: false };
+
+    let migrated = false;
+    const indexById = new Map(loadedIndex.map((e) => [e.id, e]));
+
+    const walkNode = (node) => {
+      const newDocs = [];
+      for (const d of (node.documents || [])) {
+        if (d && typeof d === "object" && d.id && Object.keys(d).length === 1) {
+          // Already in new format: just an {id} reference
+          newDocs.push(d);
+          continue;
+        }
+        if (d && d.id) {
+          // Old format: full record nested in node. Promote it to docIndex
+          // (if not already there) and replace with a bare reference.
+          migrated = true;
+          if (!indexById.has(d.id)) {
+            indexById.set(d.id, {
+              id: d.id,
+              name: d.name,
+              mime: d.mime,
+              size: d.size,
+              uploadedAt: d.uploadedAt,
+              originalNodeId: node.id,
+              metadata: d.metadata || {},
+            });
+          }
+          newDocs.push({ id: d.id });
+        }
+      }
+      return {
+        ...node,
+        documents: newDocs,
+        children: (node.children || []).map(walkNode),
+      };
+    };
+
+    const newTree = walkNode(loadedTree);
+    const newIndex = Array.from(indexById.values()).map((e) => {
+      // Strip stale fields the old index used to carry (nodeId, nodePath)
+      const { nodeId, nodePath, ...rest } = e;
+      return {
+        ...rest,
+        // Preserve originalNodeId if present, else derive from the old nodeId
+        originalNodeId: rest.originalNodeId || nodeId || null,
+      };
+    });
+
+    if (migrated) {
+      console.log("[DMS] Migrated existing data to linked-document schema.");
+    }
+    return { tree: newTree, index: newIndex, migrated };
+  };
+
+  useEffect(() => {
+    (async () => {
+      let t = await StorageAdapter.getTree();
+      if (!t) {
+        t = buildSeedTree();
+        await StorageAdapter.saveTree(t);
+      }
+      const rawIdx = await StorageAdapter.list文件Index();
+      const savedKeyParameters = await StorageAdapter.getKeyParameters();
+      setKeyParameters(savedKeyParameters);
+
+      const { tree: migratedTree, index: migratedIndex, migrated } =
+        migrateIfNeeded(t, rawIdx);
+
+      if (migrated) {
+        await StorageAdapter.saveTree(migratedTree);
+        await StorageAdapter.save文件Index(migratedIndex);
+      }
+
+      setTree(migratedTree);
+      setDocIndex(migratedIndex);
+      setSelectedId(migratedTree.id);
+      setExpandedIds(new Set([migratedTree.id]));
+      setLoading(false);
+    })();
+  }, []);
+
+  const persistTree = useCallback(async (newTree) => {
+    setTree(newTree);
+    await StorageAdapter.saveTree(newTree);
+  }, []);
+
+  const persistIndex = useCallback(async (newIndex) => {
+    setDocIndex(newIndex);
+    await StorageAdapter.save文件Index(newIndex);
+  }, []);
+
+  const persistKeyParameters = useCallback(async (newKeyParameters) => {
+    const clean = normalizeKeyParameters(newKeyParameters);
+    setKeyParameters(clean);
+    await StorageAdapter.saveKeyParameters(clean);
+  }, []);
+
+  const getNodePathFrom = (rootTree, nodeId) => {
+    if (!rootTree) return "";
+    const path = [];
+    const walk = (n, trail) => {
+      const t = [...trail, n.name];
+      if (n.id === nodeId) { path.push(...t); return true; }
+      for (const c of n.children || []) if (walk(c, t)) return true;
+      return false;
+    };
+    walk(rootTree, []);
+    return path.join(" / ");
+  };
+
+  const getNodePath = (nodeId) => getNodePathFrom(tree, nodeId);
+  const selectedNode = tree && selectedId ? findNode(tree, selectedId) : null;
+
+  const toggleExpand = (id) => {
+    setExpandedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+
+  const expandToNode = (nodeId) => {
+    if (!tree) return;
+    const ids = new Set(expandedIds);
+    const walk = (n, trail) => {
+      const t = [...trail, n.id];
+      if (n.id === nodeId) { t.forEach((x) => ids.add(x)); return true; }
+      for (const c of n.children || []) if (walk(c, t)) return true;
+      return false;
+    };
+    walk(tree, []);
+    setExpandedIds(ids);
+    setSelectedId(nodeId);
+    setTab("tree");
+  };
+
+  // Node operations
+  const startAddChildFromToolbar = () => {
+    if (!selectedNode) return;
+    setAddingChildToId(selectedId);
+    setExpandedIds((prev) => new Set([...prev, selectedId]));
+  };
+
+  const handleCommitAddChild = async (parentId, name) => {
+    const newNode = { id: genNodeId(), name, description: "", children: [], documents: [] };
+    const newTree = updateNodeInTree(tree, parentId, (n) => ({
+      ...n, children: [...(n.children || []), newNode],
+    }));
+    await persistTree(newTree);
+    setExpandedIds((prev) => new Set([...prev, parentId]));
+    setAddingChildToId(null);
+    setSelectedId(newNode.id);
+  };
+
+  const handleCommit重命名 = async (nodeId, newName) => {
+    const newTree = updateNodeInTree(tree, nodeId, (n) => ({ ...n, name: newName }));
+    await persistTree(newTree);
+    const refreshedIndex = docIndex.map((entry) => ({
+      ...entry, nodePath: getNodePathFrom(newTree, entry.nodeId),
+    }));
+    await persistIndex(refreshedIndex);
+    setRenamingId(null);
+  };
+
+  const handle删除Node = async (nodeId) => {
+    if (!tree || nodeId === tree.id) {
+      alert("Cannot delete the root node.");
+      return;
+    }
+    const target = findNode(tree, nodeId);
+    if (!target) return;
+    const childCount = (target.children || []).length;
+    const docCount = collectAllDocIds(target).length;
+    const detail = childCount || docCount
+      ? `\n\nThis will remove ${childCount} sub-node(s) and ${docCount} document link(s) under this node. 文件s that aren't linked anywhere else will be moved to the 'Unreferenced' list (their files stay on disk).`
+      : "";
+    if (!confirm(`删除 "${target.name}"?${detail}\n\nThis cannot be undone.`)) return;
+
+    // Just remove the subtree. Links die with their nodes, but the actual
+    // files and the docIndex stay intact — orphaned documents become
+    // "unreferenced" and are still searchable / re-linkable.
+    const newTree = removeNodeFromTree(tree, nodeId);
+    await persistTree(newTree);
+    if (selectedId === nodeId) setSelectedId(tree.id);
+  };
+
+  const updateNodeMeta = async (updates) => {
+    const newTree = updateNodeInTree(tree, selectedId, (n) => ({ ...n, ...updates }));
+    await persistTree(newTree);
+    // Note: we no longer maintain nodePath in docIndex (it was unreliable
+    // anyway — documents can be linked from many places). The search panel
+    // computes paths on the fly from the current tree.
+  };
+
+  // 文件 operations
+  const fileToDataUrl = (file) =>
+    new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+
+  const uploadFilesToNode = async (targetNodeId, files) => {
+    console.log(`[DMS] uploadFilesToNode called, target=${targetNodeId}, files=${files.length}`);
+    if (!files.length) return;
+    let workingTree = tree;
+    let workingIndex = [...docIndex];
+
+    for (const file of files) {
+      const docId = genDocId();
+      console.log(`[DMS] Processing file: ${file.name} (${file.size} bytes, ${file.type}) → ${docId}`);
+      let dataUrl;
+      try {
+        dataUrl = await fileToDataUrl(file);
+        console.log(`[DMS] ✓ File read into memory (${dataUrl.length} chars of base64)`);
+      } catch (e) {
+        console.error("[DMS] ✗ Failed to read file:", e);
+        alert("Could not read the file: " + e.message);
+        return;
+      }
+      const doc = {
+        id: docId, name: file.name, mime: file.type || "application/octet-stream",
+        size: file.size, uploadedAt: new Date().toISOString(),
+        dataUrl, nodeId: targetNodeId, metadata: {},
+      };
+      try {
+        console.log(`[DMS] Posting to /api/docs ...`);
+        await StorageAdapter.save文件(doc);
+      } catch (e) {
+        console.error("[DMS] ✗ save文件 failed:", e);
+        alert("上传 failed: " + e.message + "\n\nCheck the PyCharm Run window for the server-side error.");
+        return;
+      }
+
+      // Node entries now hold only a reference {id} — the canonical document
+      // record (with name, mime, size, metadata, etc.) lives in docIndex.
+      workingTree = updateNodeInTree(workingTree, targetNodeId, (n) => ({
+        ...n,
+        documents: [...(n.documents || []), { id: docId }],
+      }));
+
+      // If the filename contains "#", the part before it is the document SN.
+      // e.g.  "L3R198A-001#Drawing007.pdf"  →  sn = "L3R198A-001"
+      const hashIdx = file.name.indexOf("#");
+      const autoSn = hashIdx > 0 ? file.name.slice(0, hashIdx).trim() : undefined;
+
+      workingIndex = [
+        ...workingIndex,
+        {
+          id: docId,
+          name: file.name,
+          mime: file.type,
+          size: file.size,
+          uploadedAt: doc.uploadedAt,
+          originalNodeId: targetNodeId, // remembers where it was first uploaded
+          metadata: {},
+          ...(autoSn ? { sn: autoSn } : {}),
+        },
+      ];
+    }
+    try {
+      console.log("[DMS] Persisting updated tree and index ...");
+      await persistTree(workingTree);
+      await persistIndex(workingIndex);
+      console.log("[DMS] ✓ 上传 complete");
+    } catch (e) {
+      console.error("[DMS] ✗ Failed to persist tree/index after upload:", e);
+      alert("File uploaded, but could not save the index: " + e.message);
+    }
+  };
+
+  const handle上传 = async (e) => {
+    console.log("[DMS] handle上传 triggered, files=", e.target.files);
+    const files = Array.from(e.target.files || []);
+    if (!files.length) {
+      console.log("[DMS] No files in event, aborting");
+      return;
+    }
+    if (!selectedNode) {
+      console.warn("[DMS] No node selected, cannot upload");
+      alert("Please select a folder first by clicking it in the assembly tree.");
+      return;
+    }
+    console.log(`[DMS] 上传ing ${files.length} file(s) to selected node ${selectedId}`);
+    try {
+      await uploadFilesToNode(selectedId, files);
+    } catch (e) {
+      console.error("[DMS] ✗ Top-level upload error:", e);
+      alert("Unexpected error during upload: " + e.message);
+    }
+    e.target.value = "";
+  };
+
+  const handleTree上传 = async (nodeId, e) => {
+    console.log(`[DMS] handleTree上传 triggered for node ${nodeId}, files=`, e.target.files);
+    const files = Array.from(e.target.files || []);
+    if (!files.length) return;
+    try {
+      await uploadFilesToNode(nodeId, files);
+    } catch (e2) {
+      console.error("[DMS] ✗ Top-level tree upload error:", e2);
+      alert("Unexpected error during upload: " + e2.message);
+    }
+    setSelectedId(nodeId);
+    setExpandedIds((prev) => new Set([...prev, nodeId]));
+    e.target.value = "";
+  };
+
+  const openDoc = async (docId) => {
+    const doc = await StorageAdapter.get文件(docId);
+    if (doc) setViewerDoc(doc);
+  };
+
+  // ---- DOCUMENT LINKAGE HELPERS -----------------------------------------
+  // Compute, for every docId, the list of nodes that reference it.
+  // Used to show "linked from N other nodes" badges and to drive deletion logic.
+  const refMap = useMemo(() => {
+    const map = new Map(); // docId -> Array<nodeId>
+    if (!tree) return map;
+    const walk = (node) => {
+      for (const d of (node.documents || [])) {
+        if (!d || !d.id) continue;
+        if (!map.has(d.id)) map.set(d.id, []);
+        map.get(d.id).push(node.id);
+      }
+      (node.children || []).forEach(walk);
+    };
+    walk(tree);
+    return map;
+  }, [tree]);
+
+  // Given a node + a doc record from docIndex, return the rich object the
+  // 文件Card expects. (Card was designed for the old "full record"
+  // format; we synthesize that shape from canonical record + reference.)
+  const enrichDocsForNode = (node) => {
+    if (!node) return [];
+    return (node.documents || [])
+      .map((ref) => docIndex.find((e) => e.id === ref.id))
+      .filter(Boolean);
+  };
+
+  // 文件s that exist in the index but aren't referenced by any node.
+  // These show up in the search/picker so they can be re-linked.
+  const unreferencedDocs = useMemo(() => {
+    return docIndex.filter((d) => !refMap.has(d.id));
+  }, [docIndex, refMap]);
+
+  // Remove a link from a single node. If that was the last reference, the
+  // document stays in docIndex (and on disk) as "unreferenced" — the user's
+  // chosen behavior. They can re-link it later via the picker.
+  const unlinkDocFromNode = async (docId, nodeId) => {
+    const refs = refMap.get(docId) || [];
+    const otherRefs = refs.filter((id) => id !== nodeId);
+    let confirmMsg;
+    if (otherRefs.length === 0) {
+      confirmMsg =
+        "This is the only place this document is linked.\n\n" +
+        "Removing the link will move the document to the 'Unreferenced' list. " +
+        "It will stay in your repository and can be re-linked to any node later. " +
+        "The file is NOT deleted from disk.\n\nProceed?";
+    } else {
+      confirmMsg = `Remove this document's link from this node?\n\nIt will remain linked to ${otherRefs.length} other node${otherRefs.length === 1 ? "" : "s"}.`;
+    }
+    if (!confirm(confirmMsg)) return;
+
+    const newTree = updateNodeInTree(tree, nodeId, (n) => ({
+      ...n,
+      documents: (n.documents || []).filter((d) => d.id !== docId),
+    }));
+    await persistTree(newTree);
+  };
+
+  // Hard delete: removes file from disk AND removes all references from the tree.
+  // Used from the global "manage documents" view, not the per-node trash icon.
+  const purge文件 = async (docId) => {
+    const refs = refMap.get(docId) || [];
+    let confirmMsg;
+    if (refs.length === 0) {
+      confirmMsg = "Permanently delete this document from the repository?\n\nThe file will be removed from disk.";
+    } else {
+      confirmMsg =
+        `This document is linked from ${refs.length} node${refs.length === 1 ? "" : "s"}.\n\n` +
+        "Permanently delete it? All links will be removed and the file will be deleted from disk.";
+    }
+    if (!confirm(confirmMsg)) return;
+
+    await StorageAdapter.delete文件(docId);
+    // Remove every reference from the tree
+    const stripRefs = (node) => ({
+      ...node,
+      documents: (node.documents || []).filter((d) => d.id !== docId),
+      children: (node.children || []).map(stripRefs),
+    });
+    const newTree = stripRefs(tree);
+    await persistTree(newTree);
+    const newIndex = docIndex.filter((e) => e.id !== docId);
+    await persistIndex(newIndex);
+  };
+
+  // Add a link from an existing document to a node (idempotent — won't duplicate).
+  const linkDocToNode = async (docId, nodeId) => {
+    const target = findNode(tree, nodeId);
+    if (!target) return;
+    if ((target.documents || []).some((d) => d.id === docId)) {
+      // Already linked — silently no-op
+      return;
+    }
+    const newTree = updateNodeInTree(tree, nodeId, (n) => ({
+      ...n,
+      documents: [...(n.documents || []), { id: docId }],
+    }));
+    await persistTree(newTree);
+  };
+
+  // Update metadata GLOBALLY (the user's chosen behavior — one set per document).
+  const updateDocMetadata = async (docId, metadata) => {
+    // No tree change needed — metadata lives only in docIndex.
+    const fullDoc = await StorageAdapter.get文件(docId);
+    if (fullDoc) await StorageAdapter.save文件({ ...fullDoc, metadata });
+    const newIndex = docIndex.map((e) => (e.id === docId ? { ...e, metadata } : e));
+    await persistIndex(newIndex);
+  };
+
+  // Update document's own SN (empty string clears override → falls back to inheritance)
+  const updateDocSn = async (docId, newSn) => {
+    const trimmed = (newSn || "").trim();
+    const newIndex = docIndex.map((e) =>
+      e.id === docId ? { ...e, sn: trimmed || undefined } : e
+    );
+    await persistIndex(newIndex);
+  };
+
+  // Per-node trash button now means "unlink from this node only"
+  const deleteDoc = async (docId) => {
+    await unlinkDocFromNode(docId, selectedId);
+  };
+
+  const formatBytes = (n) => {
+    if (!n) return "—";
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+    return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  };
+
+  if (loading) {
+    return <div className="h-screen flex items-center justify-center bg-stone-50 text-stone-500 text-sm">Loading document repository…</div>;
+  }
+
+  return (
+    <div className="h-screen flex flex-col bg-stone-50 text-stone-900">
+      <header className="border-b border-stone-300 bg-white px-4 py-2.5 flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <button
+            onClick={() => setSidebar打开((s) => !s)}
+            className="text-stone-500 hover:text-stone-900 p-1"
+          >
+            {sidebar打开 ? <ChevronLeft size={16} /> : <ChevronRight size={16} />}
+          </button>
+          <div>
+            <div className="text-[10px] tracking-[0.2em] uppercase text-stone-500">工程文件</div>
+            <div className="text-sm font-semibold text-stone-900">QC 文件 Management System (QCDMS)</div>
+          </div>
+        </div>
+        <div className="flex items-center gap-3 text-[10px] text-stone-500">
+          <div className="relative">
+            <button
+              onClick={(e) => { e.stopPropagation(); setShowProjectMenu(!showProjectMenu); }}
+              className="flex items-center gap-1 px-2 py-1 border border-stone-300 hover:bg-amber-50 hover:border-amber-400 rounded text-stone-700"
+              title="Project actions: export, import, new"
+            >
+              <Book size={11} /> Project
+            </button>
+            <ProjectMenu
+              open={showProjectMenu}
+              on关闭={() => setShowProjectMenu(false)}
+              onProjectChanged={(newPath) => {
+                // Project-scoped UI caches must not carry into a newly-created project.
+                // The authoritative data is in the selected storage folder/index.json.
+                try {
+                  [
+                    "dms:databook-selection",
+                    "dms:databook-title",
+                    "dms:databook-subtitle",
+                  ].forEach((k) => localStorage.removeItem(k));
+                } catch {}
+                // Reliable refresh: reload the page so all React state restarts
+                // against the new storage folder.
+                window.location.reload();
+              }}
+              on打开KeyParameters={() => setShowKeyParameters(true)}
+            />
+          </div>
+          <button
+            onClick={onChange文件夹}
+            className="flex items-center gap-1 px-2 py-1 border border-stone-300 hover:bg-amber-50 hover:border-amber-400 rounded text-stone-700 max-w-[400px]"
+            title={`Click to change storage location\nCurrent: ${storagePath}`}
+          >
+            <HardDrive size={11} />
+            <span className="font-mono truncate">{storagePath || "—"}</span>
+          </button>
+          <span className="text-stone-300">|</span>
+          <span className="tabular-nums">{docIndex.length} doc{docIndex.length === 1 ? "" : "s"} indexed</span>
+          <span className="text-stone-300">|</span>
+          <button
+            onClick={async () => {
+              if (!confirm("Quit QCDMS? This will stop the server.")) return;
+              try { await fetch("/api/quit", { method: "POST" }); } catch {}
+              window.close();
+            }}
+            className="flex items-center gap-1 px-2 py-1 border border-red-300 hover:bg-red-50 hover:border-red-500 rounded text-red-600 font-medium"
+            title="Stop the DMS server and quit"
+          >
+            Quit DMS
+          </button>
+        </div>
+      </header>
+
+      <div className="flex-1 flex overflow-hidden">
+        {sidebar打开 && (
+          <>
+            <aside
+              style={{ width: `${sidebarWidth}px` }}
+              className="border-r border-stone-300 bg-white flex flex-col shrink-0"
+            >
+            <div className="flex border-b border-stone-200 text-xs">
+              <button
+                onClick={() => setTab("tree")}
+                className={`flex-1 py-2 px-2 flex items-center justify-center gap-1 ${
+                  tab === "tree" ? "border-b-2 border-amber-600 text-stone-900 font-medium" : "text-stone-500 hover:text-stone-900"
+                }`}
+              >
+                <文件夹 size={12} /> Tree
+              </button>
+              <button
+                onClick={() => setTab("search")}
+                className={`flex-1 py-2 px-2 flex items-center justify-center gap-1 ${
+                  tab === "search" ? "border-b-2 border-amber-600 text-stone-900 font-medium" : "text-stone-500 hover:text-stone-900"
+                }`}
+              >
+                <搜索 size={12} /> 搜索
+              </button>
+              <button
+                onClick={() => setTab("databook")}
+                className={`flex-1 py-2 px-2 flex items-center justify-center gap-1 ${
+                  tab === "databook" ? "border-b-2 border-amber-600 text-stone-900 font-medium" : "text-stone-500 hover:text-stone-900"
+                }`}
+              >
+                <Book size={12} /> Databook
+              </button>
+            </div>
+
+            {tab === "tree" && (
+              <>
+                <div className="flex flex-wrap gap-1 p-2 border-b border-stone-200">
+                  <button
+                    onClick={startAddChildFromToolbar}
+                    disabled={!selectedNode}
+                    className="text-[11px] px-2 py-1 border border-stone-300 hover:bg-amber-50 hover:border-amber-400 rounded flex items-center gap-1 disabled:opacity-40"
+                    title="Create a new sub-folder under the selected node"
+                  >
+                    <文件夹 size={11} /> Add folder
+                  </button>
+                  <label
+                    className={`text-[11px] px-2 py-1 border border-stone-300 rounded flex items-center gap-1 ${
+                      selectedNode ? "hover:bg-amber-50 hover:border-amber-400 cursor-pointer" : "opacity-40 cursor-not-allowed"
+                    }`}
+                    title="上传 one or more documents to the selected node"
+                  >
+                    <上传 size={11} /> 添加文件
+                    <input
+                      type="file" multiple accept="application/pdf,image/*"
+                      className="hidden" disabled={!selectedNode}
+                      onChange={handle上传}
+                    />
+                  </label>
+                  <button
+                    onClick={() => selectedId && setRenamingId(selectedId)}
+                    disabled={!selectedNode}
+                    className="text-[11px] px-2 py-1 border border-stone-300 hover:bg-amber-50 hover:border-amber-400 rounded flex items-center gap-1 disabled:opacity-40"
+                    title="重命名 the selected node"
+                  >
+                    <Edit2 size={11} /> 重命名
+                  </button>
+                  <button
+                    onClick={() => selectedId && handle删除Node(selectedId)}
+                    disabled={!selectedNode || selectedId === tree?.id}
+                    className="text-[11px] px-2 py-1 border border-stone-300 hover:bg-red-50 hover:border-red-400 hover:text-red-700 rounded flex items-center gap-1 disabled:opacity-40"
+                    title="删除 the selected node and its subtree"
+                  >
+                    <Trash2 size={11} /> 删除
+                  </button>
+                </div>
+                <div className="px-3 py-1.5 text-[10px] text-stone-500 border-b border-stone-100 bg-stone-50/50">
+                  Hover a node for quick actions · Double-click to rename · Right-click for menu
+                </div>
+                <div className="flex-1 overflow-auto py-1">
+                  {tree && (
+                    <TreeNode
+                      node={tree} depth={0} isRoot={true}
+                      selectedId={selectedId} expandedIds={expandedIds}
+                      renamingId={renamingId} addingChildToId={addingChildToId}
+                      onToggle={toggleExpand} onSelect={setSelectedId}
+                      onStart重命名={(id) => setRenamingId(id)}
+                      onCommit重命名={handleCommit重命名}
+                      on取消重命名={() => setRenamingId(null)}
+                      onStartAddChild={(id) => {
+                        setAddingChildToId(id);
+                        setExpandedIds((prev) => new Set([...prev, id]));
+                      }}
+                      onCommitAddChild={handleCommitAddChild}
+                      on取消AddChild={() => setAddingChildToId(null)}
+                      on删除={handle删除Node}
+                      onContextMenu={(x, y, nodeId) => setContextMenu({ x, y, nodeId })}
+                      on上传ToNode={handleTree上传}
+                    />
+                  )}
+                </div>
+              </>
+            )}
+
+            {tab === "search" && (
+              <搜索Panel
+                index={docIndex}
+                refMap={refMap}
+                getPathFor={(id) => getNodePathFrom(tree, id)}
+                on打开Doc={openDoc}
+                onJumpToNode={expandToNode}
+              />
+            )}
+
+            {tab === "databook" && (
+              <DatabookPanel
+                tree={tree}
+                docIndex={docIndex}
+                getPathFor={(id) => getNodePathFrom(tree, id)}
+                formatBytes={formatBytes}
+              />
+            )}
+          </aside>
+            {/* Drag handle — narrow strip with wider invisible hit area for easier grabbing */}
+            <div
+              onMouseDown={(e) => {
+                e.preventDefault();
+                setResizing(true);
+              }}
+              onDoubleClick={resetSidebarWidth}
+              title="Drag to resize sidebar · Double-click to reset"
+              className={`relative w-1 shrink-0 cursor-col-resize group ${
+                resizing ? "bg-amber-500" : "bg-stone-300 hover:bg-amber-400"
+              }`}
+              style={{ marginLeft: "-1px", zIndex: 10 }}
+            >
+              {/* Invisible wider hit area so the user doesn't have to be pixel-perfect */}
+              <div className="absolute inset-y-0 -left-1 -right-1" />
+            </div>
+          </>
+        )}
+
+        <main className="flex-1 overflow-auto">
+          {selectedNode ? (
+            <div className="max-w-4xl mx-auto p-6">
+              <div className="text-[11px] text-stone-500 mb-3 font-mono">{getNodePath(selectedId)}</div>
+
+              <div className="border-b border-stone-300 pb-4 mb-5">
+                {editingNode ? (
+                  <div className="space-y-2">
+                    <input
+                      type="text" value={selectedNode.name}
+                      onChange={(e) => updateNodeMeta({ name: e.target.value })}
+                      placeholder="Node name"
+                      className="w-full text-xl font-semibold border border-stone-300 rounded px-2 py-1"
+                    />
+                    <div>
+                      <label className="text-[10px] uppercase tracking-wider text-stone-500 block mb-0.5">
+                        Serial Number (SN)
+                      </label>
+                      <input
+                        type="text"
+                        value={selectedNode.sn || ""}
+                        onChange={(e) => updateNodeMeta({ sn: e.target.value })}
+                        placeholder="e.g. SN-2026-04-001 (optional)"
+                        className="w-full text-sm border border-stone-300 rounded px-2 py-1 font-mono"
+                      />
+                    </div>
+                    <textarea
+                      value={selectedNode.description || ""}
+                      onChange={(e) => updateNodeMeta({ description: e.target.value })}
+                      placeholder="Description"
+                      className="w-full text-sm border border-stone-300 rounded px-2 py-1"
+                      rows={2}
+                    />
+                    <button onClick={() => setEditingNode(false)} className="text-xs px-3 py-1 bg-amber-600 hover:bg-amber-700 text-white rounded">
+                      Done
+                    </button>
+                  </div>
+                ) : (
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0 flex-1">
+                      <h1 className="text-xl font-semibold text-stone-900">{selectedNode.name}</h1>
+                      {selectedNode.sn && (
+                        <div className="text-sm text-amber-700 font-mono mt-0.5">
+                          SN · {selectedNode.sn}
+                        </div>
+                      )}
+                      {selectedNode.description && (
+                        <p className="text-sm text-stone-600 mt-1">{selectedNode.description}</p>
+                      )}
+                      <div className="flex gap-3 mt-2 text-[11px] text-stone-500 font-mono">
+                        <span>{selectedNode.id}</span>
+                        <span>•</span>
+                        <span>
+                          {(selectedNode.children || []).length} sub-assembl{(selectedNode.children || []).length === 1 ? "y" : "ies"}
+                        </span>
+                        <span>•</span>
+                        <span>
+                          {(selectedNode.documents || []).length} document{(selectedNode.documents || []).length === 1 ? "" : "s"}
+                        </span>
+                      </div>
+                    </div>
+                    <button onClick={() => setEditingNode(true)} className="text-stone-500 hover:text-stone-900 p-1" title="Edit name, SN, and description">
+                      <Edit2 size={14} />
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              <section>
+                <div className="flex items-center justify-between mb-3">
+                  <h2 className="text-xs font-semibold uppercase tracking-wider text-stone-700">Attached documents</h2>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => setShowLinkPicker(true)}
+                      className="text-xs px-3 py-1.5 border border-stone-300 hover:bg-amber-50 hover:border-amber-400 text-stone-700 rounded cursor-pointer flex items-center gap-1.5"
+                      title="Link an existing document from another node (no duplicate file is stored)"
+                    >
+                      <Tag size={12} /> Link existing
+                    </button>
+                    <label className="text-xs px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white rounded cursor-pointer flex items-center gap-1.5">
+                      <上传 size={12} /> 上传 files
+                      <input type="file" multiple accept="application/pdf,image/*" onChange={handle上传} className="hidden" />
+                    </label>
+                  </div>
+                </div>
+
+                {(selectedNode.documents || []).length === 0 && (
+                  <div className="border border-dashed border-stone-300 rounded p-8 text-center text-sm text-stone-500">
+                    No documents attached. 上传 new files or use “Link existing” to attach a document already in the repository.
+                  </div>
+                )}
+
+                <div className="space-y-3">
+                  {enrichDocsForNode(selectedNode).map((doc) => {
+                    const refs = refMap.get(doc.id) || [];
+                    const otherRefs = refs.filter((id) => id !== selectedId).length;
+                    return (
+                      <文件Card
+                        key={doc.id}
+                        doc={doc}
+                        otherRefCount={otherRefs}
+                        nodeSn={selectedNode.sn || ""}
+                        on打开={() => openDoc(doc.id)}
+                        on删除={() => deleteDoc(doc.id)}
+                        onUpdateMeta={(m) => updateDocMetadata(doc.id, m)}
+                        onUpdateSn={(newSn) => updateDocSn(doc.id, newSn)}
+                        keyParameters={keyParameters}
+                        formatBytes={formatBytes}
+                      />
+                    );
+                  })}
+                </div>
+              </section>
+            </div>
+          ) : (
+            <div className="h-full flex items-center justify-center text-stone-500 text-sm">
+              Select a node from the assembly tree
+            </div>
+          )}
+        </main>
+      </div>
+
+      <文件Viewer doc={viewerDoc} on关闭={() => setViewerDoc(null)} />
+
+      <KeyParametersDialog
+        open={showKeyParameters}
+        keyParameters={keyParameters}
+        on关闭={() => setShowKeyParameters(false)}
+        on保存={async (items) => {
+          await persistKeyParameters(items);
+          setShowKeyParameters(false);
+        }}
+      />
+
+      <LinkPicker
+        open={showLinkPicker}
+        on关闭={() => setShowLinkPicker(false)}
+        onLink={(docId) => linkDocToNode(docId, selectedId)}
+        docIndex={docIndex}
+        tree={tree}
+        refMap={refMap}
+        currentNodeId={selectedId}
+        currentNodeName={selectedNode?.name || ""}
+        formatBytes={formatBytes}
+        getPathFor={(id) => getNodePathFrom(tree, id)}
+      />
+
+      {contextMenu && (
+        <ContextMenu
+          x={contextMenu.x} y={contextMenu.y}
+          isRoot={contextMenu.nodeId === tree?.id}
+          on关闭={() => setContextMenu(null)}
+          on重命名={() => setRenamingId(contextMenu.nodeId)}
+          onAddChild={() => {
+            setAddingChildToId(contextMenu.nodeId);
+            setExpandedIds((prev) => new Set([...prev, contextMenu.nodeId]));
+          }}
+          on上传={() => {
+            ctx上传TargetRef.current = contextMenu.nodeId;
+            ctx上传InputRef.current?.click();
+          }}
+          on删除={() => handle删除Node(contextMenu.nodeId)}
+        />
+      )}
+
+      <input
+        ref={ctx上传InputRef}
+        type="file" multiple accept="application/pdf,image/*"
+        className="hidden"
+        onChange={(e) => {
+          const targetId = ctx上传TargetRef.current;
+          if (targetId) handleTree上传(targetId, e);
+          ctx上传TargetRef.current = null;
+        }}
+      />
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<Root />);
+
+// Startup banner
+console.log("%c[DMS] 文件 Management System loaded — build 2026-05-07-key-parameters","color:#b45309;font-weight:bold;font-size:14px");
+console.log("[DMS] Storage backend: REST API (Python server)");
+console.log("[DMS] To diagnose storage, run: dmsDiag()");
+
+// Global diagnostic helper — type dmsDiag() in console to inspect state
+window.dmsDiag = async function() {
+  console.group("[DMS] Diagnostic report");
+  try {
+    const settings = await StorageAdapter.getSettings();
+    console.log("Settings:", settings);
+    const res = await fetch("/api/diag");
+    const diag = await res.json();
+    console.log("Server diagnostic:", diag);
+    if (diag.files_in_root && diag.files_in_root.length) {
+      console.log("Files in storage root:", diag.files_in_root);
+    }
+    if (diag.files_in_docs && diag.files_in_docs.length) {
+      console.log(`Files in docs/ subfolder (${diag.files_in_docs.length}):`, diag.files_in_docs);
+    }
+  } catch (e) {
+    console.error("Diagnostic failed:", e);
+  }
+  console.groupEnd();
+};
+</script>
+</body>
+</html>

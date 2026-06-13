@@ -1,0 +1,579 @@
+{
+  "tree": {
+    "children": [
+      {
+        "children": [
+          {
+            "id": "NODE-25FQYG",
+            "name": "Part 1001",
+            "description": "",
+            "children": [],
+            "documents": []
+          },
+          {
+            "id": "NODE-220AZY",
+            "name": "Part 1010",
+            "description": "",
+            "children": [],
+            "documents": []
+          }
+        ],
+        "description": "Pump volute and inlet/outlet flanges",
+        "documents": [
+          {
+            "id": "DOC-20260501-I6PJFQ"
+          }
+        ],
+        "id": "NODE-IOS5RL",
+        "name": "SA-100 Casing assembly SN Tu653"
+      },
+      {
+        "children": [
+          {
+            "id": "NODE-YNWM2P",
+            "name": "SSA-200-100",
+            "description": "",
+            "children": [
+              {
+                "id": "NODE-05OEA4",
+                "name": "Part 200-100-P1",
+                "description": "Top Cylinder",
+                "children": [],
+                "documents": [
+                  {
+                    "id": "DOC-20260501-P5P3NW"
+                  },
+                  {
+                    "id": "DOC-20260501-25568Q"
+                  },
+                  {
+                    "id": "DOC-20260501-NOSEET"
+                  }
+                ],
+                "sn": "SN HYrte867373"
+              },
+              {
+                "id": "NODE-O1F5VF",
+                "name": "Part 200-100-P2",
+                "description": "Rod",
+                "children": [],
+                "documents": [
+                  {
+                    "id": "DOC-20260501-XKE5KB"
+                  }
+                ],
+                "sn": "SN Teii82873"
+              }
+            ],
+            "documents": [
+              {
+                "id": "DOC-20260501-ORDZ08"
+              }
+            ]
+          },
+          {
+            "id": "NODE-0VIQTX",
+            "name": "Part 200-200A",
+            "description": "",
+            "children": [],
+            "documents": [
+              {
+                "id": "DOC-20260501-MUJROE"
+              }
+            ]
+          }
+        ],
+        "description": "Cylinder, Working Pressure 3000 psi, Testing Pressure 5000 psi",
+        "documents": [
+          {
+            "id": "DOC-20260501-9S3RRF"
+          }
+        ],
+        "id": "NODE-QX1TBY",
+        "name": "SA-200 Cylinder",
+        "sn": "SN T6379866"
+      },
+      {
+        "id": "NODE-18PXIE",
+        "name": "SA-300 Cap",
+        "description": "Cap",
+        "children": [
+          {
+            "id": "NODE-DVZ8KO",
+            "name": "Part SA-300-A",
+            "description": "",
+            "children": [],
+            "documents": [
+              {
+                "id": "DOC-20260501-9REBOS"
+              }
+            ]
+          },
+          {
+            "id": "NODE-70763N",
+            "name": "Part SA-300-B",
+            "description": "",
+            "children": [],
+            "documents": [
+              {
+                "id": "DOC-20260501-Q0DXEW"
+              }
+            ]
+          }
+        ],
+        "documents": [
+          {
+            "id": "DOC-20260501-7N99GB"
+          }
+        ],
+        "sn": "SN hfieru674"
+      }
+    ],
+    "description": "Top-level general assembly drawing saved on /Users/david/DMS",
+    "documents": [
+      {
+        "id": "DOC-20260501-SIHBEW"
+      },
+      {
+        "id": "DOC-20260501-7PQT9D"
+      },
+      {
+        "id": "DOC-20260501-Y1VHPZ"
+      }
+    ],
+    "id": "NODE-I8XW7T",
+    "name": "GA-001 BOP",
+    "sn": "SN-YT635R0267"
+  },
+  "docIndex": [
+    {
+      "id": "DOC-20260429-FNF47O",
+      "metadata": {},
+      "mime": "application/pdf",
+      "name": "Free Sofa – Charlestown.pdf",
+      "originalNodeId": "NODE-I8XW7T",
+      "nodePath": ""
+    },
+    {
+      "id": "DOC-20260429-UO6EAF",
+      "metadata": {
+        "Pressure": "3000 psi",
+        "temperature": "2 to 30 F"
+      },
+      "mime": "image/jpeg",
+      "name": "sofa.jpg",
+      "originalNodeId": "NODE-I8XW7T",
+      "nodePath": ""
+    },
+    {
+      "id": "DOC-20260429-J1FEKD",
+      "metadata": {},
+      "mime": "application/pdf",
+      "name": "20260331-statements-6265- copy.pdf",
+      "originalNodeId": "NODE-IOS5RL",
+      "nodePath": ""
+    },
+    {
+      "id": "DOC-20260429-MFTIZS",
+      "metadata": {},
+      "mime": "application/pdf",
+      "name": "20260331-statements-6265-.pdf",
+      "originalNodeId": "NODE-IOS5RL",
+      "size": 134373,
+      "uploadedAt": "2026-04-29T20:29:12.658Z",
+      "nodePath": ""
+    },
+    {
+      "id": "DOC-20260429-3R5H3S",
+      "metadata": {},
+      "mime": "application/pdf",
+      "name": "20260331-statements-6265- copy.pdf",
+      "originalNodeId": "NODE-3XTCDC",
+      "size": 207653,
+      "uploadedAt": "2026-04-29T20:31:17.256Z",
+      "nodePath": ""
+    },
+    {
+      "id": "DOC-20260429-DNUDXB",
+      "metadata": {},
+      "mime": "application/pdf",
+      "name": "2020 Calendar MBTA.pdf",
+      "originalNodeId": "NODE-WM6Q6D",
+      "size": 21016,
+      "uploadedAt": "2026-04-29T20:42:06.538Z",
+      "nodePath": ""
+    },
+    {
+      "id": "DOC-20260429-IOPT2I",
+      "metadata": {},
+      "mime": "application/pdf",
+      "name": "Powell Industries 10615-BF-104.0 DZZ-9640 vendor databook.pdf",
+      "originalNodeId": "NODE-WM6Q6D",
+      "size": 49290960,
+      "uploadedAt": "2026-04-29T23:17:25.216Z",
+      "nodePath": ""
+    },
+    {
+      "id": "DOC-20260429-QJLK93",
+      "metadata": {
+        "Certificate of Conformity": "SN-T9276GY5"
+      },
+      "mime": "application/pdf",
+      "name": "COCn00488USA09 -15593 2 In A.pdf",
+      "originalNodeId": "NODE-I8XW7T",
+      "size": 202304,
+      "sn": "SN Test001",
+      "uploadedAt": "2026-04-30T00:34:41.110Z",
+      "nodePath": ""
+    },
+    {
+      "id": "DOC-20260429-AD3C99",
+      "metadata": {},
+      "mime": "application/pdf",
+      "name": "Welding Procedure Qualifications.pdf",
+      "originalNodeId": "NODE-I8XW7T",
+      "size": 552081,
+      "uploadedAt": "2026-04-30T00:53:06.653Z",
+      "nodePath": ""
+    },
+    {
+      "id": "DOC-20260429-GXFN9H",
+      "metadata": {},
+      "mime": "application/pdf",
+      "name": "Crash Frame Material MTR - TUBING AND PLATE.pdf",
+      "originalNodeId": "NODE-I8XW7T",
+      "size": 274309,
+      "uploadedAt": "2026-04-30T00:53:57.643Z",
+      "nodePath": ""
+    },
+    {
+      "id": "DOC-20260429-V2I962",
+      "metadata": {},
+      "mime": "application/pdf",
+      "name": "IR - 01 foR DBT-TT- 6500-5.pdf",
+      "originalNodeId": "NODE-I8XW7T",
+      "size": 1855240,
+      "uploadedAt": "2026-04-30T00:58:32.044Z",
+      "nodePath": ""
+    },
+    {
+      "id": "DOC-20260429-1HO03F",
+      "metadata": {
+        "Design Review Certificate": ""
+      },
+      "mime": "application/pdf",
+      "name": "IR06-18309-100066.50 Texas Oil Tools.pdf",
+      "originalNodeId": "NODE-I8XW7T",
+      "size": 226242,
+      "uploadedAt": "2026-04-30T01:20:36.062Z",
+      "nodePath": ""
+    },
+    {
+      "id": "DOC-20260429-AP6546",
+      "metadata": {
+        "Assembly Drawing": ""
+      },
+      "mime": "application/pdf",
+      "name": "6-3-8 15 k Subsea Safety Tree.pdf",
+      "originalNodeId": "NODE-I8XW7T",
+      "size": 555672,
+      "uploadedAt": "2026-04-30T01:31:17.506Z",
+      "nodePath": ""
+    },
+    {
+      "id": "DOC-20260429-5OO6Q6",
+      "metadata": {
+        "Photo": ""
+      },
+      "mime": "image/jpeg",
+      "name": "DSC07733.JPG",
+      "originalNodeId": "NODE-I8XW7T",
+      "size": 769272,
+      "uploadedAt": "2026-04-30T01:36:16.689Z",
+      "nodePath": ""
+    },
+    {
+      "id": "DOC-20260429-3CIB8V",
+      "metadata": {
+        "Gauge calobration": ""
+      },
+      "mime": "image/jpeg",
+      "name": "DSC07738.JPG",
+      "originalNodeId": "NODE-I8XW7T",
+      "size": 790155,
+      "uploadedAt": "2026-04-30T01:36:31.784Z",
+      "nodePath": ""
+    },
+    {
+      "id": "DOC-20260429-ZHHHHG",
+      "metadata": {
+        "Pressure record": ""
+      },
+      "mime": "image/jpeg",
+      "name": "DSC07739.JPG",
+      "originalNodeId": "NODE-I8XW7T",
+      "size": 917150,
+      "uploadedAt": "2026-04-30T01:38:50.288Z",
+      "nodePath": ""
+    },
+    {
+      "id": "DOC-20260429-LMFUOG",
+      "metadata": {
+        "Drawing01": ""
+      },
+      "mime": "application/pdf",
+      "name": "2000-1112 rev.A.pdf",
+      "originalNodeId": "NODE-IOS5RL",
+      "size": 161351,
+      "uploadedAt": "2026-04-30T01:42:06.033Z",
+      "nodePath": ""
+    },
+    {
+      "id": "DOC-20260429-F27OPD",
+      "metadata": {},
+      "mime": "application/pdf",
+      "name": "3 In. Iron Rack.PDF",
+      "originalNodeId": "NODE-IOS5RL",
+      "size": 4571857,
+      "uploadedAt": "2026-04-30T01:45:38.718Z",
+      "nodePath": ""
+    },
+    {
+      "id": "DOC-20260429-SH624F",
+      "metadata": {
+        "Vendor Certificate and databook": ""
+      },
+      "mime": "application/pdf",
+      "name": "3 In. Iron Rack.PDF",
+      "originalNodeId": "NODE-IOS5RL",
+      "size": 4571857,
+      "uploadedAt": "2026-04-30T01:46:20.955Z",
+      "nodePath": ""
+    },
+    {
+      "id": "DOC-20260429-8MSEIC",
+      "metadata": {
+        "Design certificate": ""
+      },
+      "mime": "application/pdf",
+      "name": "IR06-18309-100066.50 Texas Oil Tools.pdf",
+      "originalNodeId": "NODE-IOS5RL",
+      "size": 226242,
+      "uploadedAt": "2026-04-30T01:46:32.360Z",
+      "nodePath": ""
+    },
+    {
+      "id": "DOC-20260429-YDSHEI",
+      "metadata": {
+        "MTR": ""
+      },
+      "mime": "application/pdf",
+      "name": "2 In Iron Rack - A - 2.PDF",
+      "originalNodeId": "NODE-IOS5RL",
+      "size": 2246790,
+      "uploadedAt": "2026-04-30T01:49:51.801Z",
+      "nodePath": ""
+    },
+    {
+      "id": "DOC-20260429-SNS1Y1",
+      "metadata": {
+        "Drawing": "Drawing No eue6, SN hdiy679"
+      },
+      "mime": "application/pdf",
+      "name": "2005-0407 Rev.A.pdf",
+      "originalNodeId": "NODE-QX1TBY",
+      "size": 173194,
+      "uploadedAt": "2026-04-30T01:55:15.135Z",
+      "nodePath": ""
+    },
+    {
+      "id": "DOC-20260501-G3I8DQ",
+      "name": "BOP-Assembly.jpeg",
+      "mime": "image/jpeg",
+      "size": 11027,
+      "uploadedAt": "2026-05-02T00:54:19.271Z",
+      "originalNodeId": "NODE-I8XW7T",
+      "metadata": {
+        "Drawing No.": "BOP0001"
+      },
+      "sn": "SN YT635R0267",
+      "nodePath": ""
+    },
+    {
+      "id": "DOC-20260501-BJ3A03",
+      "name": "BOP-Photo.jpeg",
+      "mime": "image/jpeg",
+      "size": 10931,
+      "uploadedAt": "2026-05-02T00:54:19.280Z",
+      "originalNodeId": "NODE-I8XW7T",
+      "metadata": {
+        "Drawing No": "BOP-0001P"
+      },
+      "nodePath": ""
+    },
+    {
+      "id": "DOC-20260501-SIHBEW",
+      "name": "BOP drawing 04.avif",
+      "mime": "image/avif",
+      "size": 55155,
+      "uploadedAt": "2026-05-02T01:12:52.006Z",
+      "originalNodeId": "NODE-I8XW7T",
+      "metadata": {}
+    },
+    {
+      "id": "DOC-20260501-N4M4MU",
+      "name": "BOP drawing 04.avif",
+      "mime": "image/avif",
+      "size": 55155,
+      "uploadedAt": "2026-05-02T01:23:00.730Z",
+      "originalNodeId": "NODE-I8XW7T",
+      "metadata": {}
+    },
+    {
+      "id": "DOC-20260501-7PQT9D",
+      "name": "Design Review bureau-veritas-9309.jpg",
+      "mime": "image/jpeg",
+      "size": 79201,
+      "uploadedAt": "2026-05-02T01:23:43.737Z",
+      "originalNodeId": "NODE-I8XW7T",
+      "metadata": {}
+    },
+    {
+      "id": "DOC-20260501-Y1VHPZ",
+      "name": "COC example_v_13_5e6251f58a.webp",
+      "mime": "image/webp",
+      "size": 42418,
+      "uploadedAt": "2026-05-02T01:24:13.508Z",
+      "originalNodeId": "NODE-I8XW7T",
+      "metadata": {}
+    },
+    {
+      "id": "DOC-20260501-I6PJFQ",
+      "name": "Drawing007.png",
+      "mime": "image/png",
+      "size": 221502,
+      "uploadedAt": "2026-05-02T01:27:43.752Z",
+      "originalNodeId": "NODE-IOS5RL",
+      "metadata": {}
+    },
+    {
+      "id": "DOC-20260501-RIKPHP",
+      "name": "Drawing Pressure-Vessel-1-320.webp",
+      "mime": "image/webp",
+      "size": 12856,
+      "uploadedAt": "2026-05-02T01:28:24.084Z",
+      "originalNodeId": "NODE-YNWM2P",
+      "metadata": {}
+    },
+    {
+      "id": "DOC-20260501-ORDZ08",
+      "name": "406-652.pdf",
+      "mime": "application/pdf",
+      "size": 404396,
+      "uploadedAt": "2026-05-02T01:29:42.916Z",
+      "originalNodeId": "NODE-YNWM2P",
+      "metadata": {},
+      "sn": "SN-387363"
+    },
+    {
+      "id": "DOC-20260501-9S3RRF",
+      "name": "Drawing007.png",
+      "mime": "image/png",
+      "size": 221502,
+      "uploadedAt": "2026-05-02T01:35:45.888Z",
+      "originalNodeId": "NODE-QX1TBY",
+      "metadata": {
+        "Working Pressure": "3000 psi",
+        "Testing Pressure": "5000 psi"
+      }
+    },
+    {
+      "id": "DOC-20260501-P5P3NW",
+      "name": "6-3-8 15 k Subsea Safety Tree.pdf",
+      "mime": "application/pdf",
+      "size": 555672,
+      "uploadedAt": "2026-05-02T01:43:30.486Z",
+      "originalNodeId": "NODE-05OEA4",
+      "metadata": {},
+      "sn": "SN UIyu632"
+    },
+    {
+      "id": "DOC-20260501-25568Q",
+      "name": "Databook for M60WH-JU742743L_OCR_replaced_OCR_replaced_OCR_replaced_page_13.pdf",
+      "mime": "application/pdf",
+      "size": 198183,
+      "uploadedAt": "2026-05-02T01:44:22.144Z",
+      "originalNodeId": "NODE-05OEA4",
+      "metadata": {
+        "Material Testing Report": ""
+      },
+      "sn": "SN hrury64"
+    },
+    {
+      "id": "DOC-20260501-NOSEET",
+      "name": "Databook for M60WH-JU742743L_OCR_replaced_OCR_replaced_OCR_replaced_page_19.pdf",
+      "mime": "application/pdf",
+      "size": 2137441,
+      "uploadedAt": "2026-05-02T01:46:11.870Z",
+      "originalNodeId": "NODE-05OEA4",
+      "metadata": {
+        "Heat Treating Report": ""
+      }
+    },
+    {
+      "id": "DOC-20260501-XKE5KB",
+      "name": "2000-3412 Rev. D.pdf",
+      "mime": "application/pdf",
+      "size": 477347,
+      "uploadedAt": "2026-05-02T01:47:55.033Z",
+      "originalNodeId": "NODE-O1F5VF",
+      "metadata": {
+        "MTR": ""
+      }
+    },
+    {
+      "id": "DOC-20260501-MUJROE",
+      "name": "Databook for M60WH-JU742743L_OCR_replaced_OCR_replaced_OCR_replaced_page_25.pdf",
+      "mime": "application/pdf",
+      "size": 1713248,
+      "uploadedAt": "2026-05-02T01:49:58.157Z",
+      "originalNodeId": "NODE-0VIQTX",
+      "metadata": {}
+    },
+    {
+      "id": "DOC-20260501-7N99GB",
+      "name": "MTR 03.webp",
+      "mime": "image/webp",
+      "size": 69958,
+      "uploadedAt": "2026-05-02T01:50:17.620Z",
+      "originalNodeId": "NODE-18PXIE",
+      "metadata": {}
+    },
+    {
+      "id": "DOC-20260501-9REBOS",
+      "name": "Databook for M60WH-JU742743L_OCR_replaced_OCR_replaced_OCR_replaced_page_39.pdf",
+      "mime": "application/pdf",
+      "size": 174914,
+      "uploadedAt": "2026-05-02T01:50:56.229Z",
+      "originalNodeId": "NODE-DVZ8KO",
+      "metadata": {}
+    },
+    {
+      "id": "DOC-20260501-Q0DXEW",
+      "name": "Databook for M60WH-JU742743L_OCR_replaced_OCR_replaced_OCR_replaced_page_53.pdf",
+      "mime": "application/pdf",
+      "size": 175576,
+      "uploadedAt": "2026-05-02T01:51:15.762Z",
+      "originalNodeId": "NODE-70763N",
+      "metadata": {}
+    }
+  ],
+  "keyParameters": [
+    "人物",
+    "事件",
+    "单位",
+    "家人",
+    "朋友",
+    "旅游"
+  ]
+}
