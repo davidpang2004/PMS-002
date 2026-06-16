@@ -3,7 +3,7 @@ from PyInstaller.utils.hooks import collect_submodules
 from PyInstaller.utils.hooks import copy_metadata
 
 datas = [('dms.html', '.')]
-hiddenimports = ['fitz', 'qrcode', 'pyngrok', 'pyngrok.ngrok', 'pyngrok.conf', 'tkinter', 'tkinter.ttk', 'tkinter.scrolledtext', 'tkinter.font', 'tkinter.messagebox', 'flask', 'dms_server', 'databook', 'pdf_extraction', '_dms_trial']
+hiddenimports = ['tkinter', 'tkinter.ttk', 'tkinter.scrolledtext', 'tkinter.font', 'tkinter.messagebox', 'flask', 'dms_server', 'databook', 'pdf_extraction', '_dms_trial']
 datas += copy_metadata('Pillow')
 hiddenimports += collect_submodules('tkinter')
 hiddenimports += collect_submodules('tkinter.ttk')
@@ -20,13 +20,10 @@ hiddenimports += collect_submodules('waitress')
 hiddenimports += collect_submodules('pypdf')
 hiddenimports += collect_submodules('reportlab')
 hiddenimports += collect_submodules('PIL')
-hiddenimports += collect_submodules('fitz')
-hiddenimports += collect_submodules('qrcode')
-hiddenimports += collect_submodules('pyngrok')
 
 
 a = Analysis(
-    ['/Users/david/PMS/dms_launcher.py'],
+    ['/Users/david/Desktop/PMS/dms_launcher.py'],
     pathex=[],
     binaries=[],
     datas=datas,
