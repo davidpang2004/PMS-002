@@ -52,11 +52,11 @@ WIN_ICON = HERE / "icon.ico"
 
 
 def ensure_venv():
-    """If not running inside a venv, create one, install deps, and re-exec."""
-    if sys.prefix != sys.base_prefix:
-        return  # already in a venv
-
+    """If not running inside .build_venv, create it, install deps, and re-exec."""
     venv_dir = HERE / ".build_venv"
+    if Path(sys.prefix).resolve() == venv_dir.resolve():
+        return  # already inside .build_venv
+
     venv_python = venv_dir / "bin" / "python3"
     if sys.platform.startswith("win"):
         venv_python = venv_dir / "Scripts" / "python.exe"
@@ -68,7 +68,7 @@ def ensure_venv():
         subprocess.run(
             [str(venv_python), "-m", "pip", "install", "--quiet", "--upgrade",
              "pip", "pyinstaller", "flask", "waitress", "pypdf", "reportlab", "Pillow",
-             "PyMuPDF", "qrcode"],
+             "pillow-heif", "PyMuPDF", "qrcode"],
             check=True,
         )
 
@@ -300,6 +300,18 @@ def build_pyinstaller_command() -> list[str]:
         cmd.extend(["--collect-submodules", pkg])
     # PIL data files (fonts, image format plugins) still need to be present.
     cmd.extend(["--copy-metadata", "Pillow"])
+
+    # pillow_heif is OPTIONAL — enables HEIC/HEIF photo preview in the browser.
+    # Without it, HEIC files return a 500 error from the /api/docs/<id>/preview route.
+    try:
+        import pillow_heif  # noqa: F401  # type: ignore
+        cmd.extend(["--collect-submodules", "pillow_heif"])
+        cmd.extend(["--collect-all", "pillow_heif"])
+        cmd.extend(["--hidden-import", "pillow_heif"])
+        print("  pillow_heif found — HEIC/HEIF photo preview will work in the build.")
+    except ImportError:
+        print("  pillow_heif not installed — HEIC photo preview unavailable. "
+              "Run: pip install pillow-heif")
 
     # PyMuPDF (fitz) is OPTIONAL — it lets OCR rasterize scanned PDFs. Image
     # OCR and text-layer PDF extraction work without it, so we only bundle it
