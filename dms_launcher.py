@@ -46,54 +46,50 @@ os.environ["DMS_RESOURCE_DIR"] = str(resource_path())
 # ---------------------------------------------------------------------------
 # Trial period check — runs before anything else starts
 # ---------------------------------------------------------------------------
-def check_trial_expiry() -> None:
-    """If the trial has expired show an info window and exit; otherwise return."""
+_TRIAL_CONFIG = Path.home() / ".pms_dms_trial.json"
+
+
+def _load_trial_state() -> dict:
     try:
-        from _dms_trial import EXPIRY
-    except ImportError:
-        return  # no trial module = dev / no-restriction build
+        import json
+        return json.loads(_TRIAL_CONFIG.read_text())
+    except Exception:
+        return {}
 
-    if not EXPIRY:
-        return  # explicit no-expiry build
 
-    if date.today() <= date.fromisoformat(EXPIRY):
-        return  # still within trial period
+def _save_trial_state(state: dict) -> None:
+    import json
+    try:
+        _TRIAL_CONFIG.write_text(json.dumps(state))
+    except Exception:
+        pass
 
-    # ── Expired — show info window ──────────────────────────────────────────
+
+def _show_trial_ended_window(message: str) -> None:
     root = tk.Tk()
-    root.title("QCDMS – Trial Period Ended")
+    root.title("QCDMS – Trial Limit Reached")
     root.resizable(False, False)
 
     BG  = "#fafaf9"
     FG  = "#1c1917"
-    SUB = "#78716c"
     BLU = "#0064c8"
-    RED = "#dc2626"
 
     root.configure(bg=BG)
 
     tk.Label(
-        root, text="Trial Period Ended",
-        font=("Helvetica", 16, "bold"), bg=BG, fg=RED,
-    ).pack(padx=40, pady=(28, 6))
+        root, text=message,
+        font=("Helvetica", 12), bg=BG, fg=FG, justify="center",
+    ).pack(padx=40, pady=(28, 8))
 
-    tk.Frame(root, bg="#e7e5e4", height=1).pack(fill="x", padx=30, pady=4)
+    email = "aatbinc@yahoo.com"
+    lbl = tk.Label(
+        root, text=email,
+        font=("Helvetica", 12, "bold"), bg=BG, fg=BLU, cursor="hand2",
+    )
+    lbl.pack()
+    lbl.bind("<Button-1>", lambda _e: webbrowser.open(f"mailto:{email}"))
 
-    tk.Label(
-        root,
-        text="The trial period has ended.\nTo obtain the latest version, please contact:",
-        font=("Helvetica", 11), bg=BG, fg=FG, justify="center",
-    ).pack(padx=40, pady=(12, 6))
-
-    for email in ("dpang@myyahoo.com", "aatbinc@yahoo.com"):
-        lbl = tk.Label(
-            root, text=email,
-            font=("Helvetica", 11, "bold"), bg=BG, fg=BLU, cursor="hand2",
-        )
-        lbl.pack()
-        lbl.bind("<Button-1>", lambda _e, addr=email: webbrowser.open(f"mailto:{addr}"))
-
-    tk.Frame(root, bg="#e7e5e4", height=1).pack(fill="x", padx=30, pady=12)
+    tk.Frame(root, bg="#e7e5e4", height=1).pack(fill="x", padx=30, pady=16)
 
     tk.Button(
         root, text="OK", command=lambda: os._exit(0),
@@ -102,7 +98,6 @@ def check_trial_expiry() -> None:
 
     root.protocol("WM_DELETE_WINDOW", lambda: os._exit(0))
 
-    # Centre the window on screen
     root.update_idletasks()
     w = root.winfo_reqwidth()
     h = root.winfo_reqheight()
@@ -114,7 +109,47 @@ def check_trial_expiry() -> None:
     os._exit(0)
 
 
-check_trial_expiry()   # exits here if expired
+def check_trial_expiry() -> None:
+    """If the date-based trial has expired, show a message and exit."""
+    try:
+        from _dms_trial import EXPIRY
+    except ImportError:
+        return
+
+    if not EXPIRY:
+        return
+
+    if date.today() <= date.fromisoformat(EXPIRY):
+        return
+
+    _show_trial_ended_window(
+        "Trial Limit Reached.\nContact for latest version:"
+    )
+
+
+def check_trial_launches() -> None:
+    """If the launch-count limit has been reached, show a message and exit."""
+    try:
+        from _dms_trial import MAX_LAUNCHES
+    except ImportError:
+        return
+
+    if not MAX_LAUNCHES:
+        return
+
+    state = _load_trial_state()
+    count = state.get("launches", 0) + 1
+    state["launches"] = count
+    _save_trial_state(state)
+
+    if count > MAX_LAUNCHES:
+        _show_trial_ended_window(
+            "Trial Limit Reached.\nContact for latest version:"
+        )
+
+
+check_trial_expiry()    # exits here if date expired
+check_trial_launches()  # exits here if launch count exceeded
 
 
 # ---------------------------------------------------------------------------

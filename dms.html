@@ -1108,6 +1108,14 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
   const isText = doc?.mime?.startsWith("text/") || doc?.mime === "application/json";
   const ocrEligible = isImage || isPdf;
 
+  // HEIC/HEIF files need server-side conversion to be viewable in the browser
+  const _ext = (doc?.name || "").split(".").pop().toLowerCase();
+  const isHeic = doc?.mime === "image/heic" || doc?.mime === "image/heif"
+    || _ext === "heic" || _ext === "heif";
+  const viewUrl = isHeic
+    ? `${API_BASE}/api/docs/${doc.id}/preview`
+    : doc?.dataUrl;
+
   // OCR state
   const [ocrStatus, setOcrStatus] = useState(null);   // capability report
   const [ocrRunning, setOcrRunning] = useState(false);
@@ -1391,7 +1399,7 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
           <div className={"min-h-0 overflow-auto bg-stone-100 " + (panelOpen ? "flex-1 border-r border-stone-200" : "flex-1")}>
             {isImage && (
               <div className="h-full flex items-center justify-center p-4">
-                <img src={doc.dataUrl} alt={doc.name} className="max-w-full max-h-full object-contain" />
+                <img src={viewUrl} alt={doc.name} className="max-w-full max-h-full object-contain" />
               </div>
             )}
             {isPdf && (
@@ -1755,7 +1763,7 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
  * =============================================================================
  */
 /* Duplicate upload warning dialog */
-const DuplicateDialog = ({ duplicates, totalCount, onSkip, onUploadAll, onCancel, formatBytes, getPathFor }) => (
+const DuplicateDialog = ({ duplicates, totalCount, onSkip, onUploadAll, onLink, onCancel, formatBytes, getPathFor }) => (
   <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
     <div className="bg-white rounded-lg shadow-xl w-[520px] max-h-[80vh] flex flex-col">
       <div className="px-5 py-4 border-b border-stone-200">
@@ -1778,9 +1786,12 @@ const DuplicateDialog = ({ duplicates, totalCount, onSkip, onUploadAll, onCancel
           </div>
         ))}
       </div>
-      <div className="px-5 py-4 border-t border-stone-200 flex gap-2 justify-end">
+      <div className="px-5 py-4 border-t border-stone-200 flex gap-2 justify-end flex-wrap">
         <button onClick={onCancel} className="px-3 py-1.5 text-xs rounded border border-stone-300 hover:bg-stone-50">取消</button>
         <button onClick={onUploadAll} className="px-3 py-1.5 text-xs rounded border border-stone-300 hover:bg-stone-50">全部上传</button>
+        <button onClick={onLink} className="px-3 py-1.5 text-xs rounded border border-amber-400 text-amber-800 bg-amber-50 hover:bg-amber-100">
+          <Tag size={11} className="inline mr-1" />链接重复，上传其余 {totalCount - duplicates.length} 个
+        </button>
         <button onClick={onSkip} className="px-3 py-1.5 text-xs rounded bg-amber-600 text-white hover:bg-amber-700">
           跳过重复，上传其余 {totalCount - duplicates.length} 个
         </button>
@@ -5800,8 +5811,46 @@ function DMS({ storagePath, onChangeFolder }) {
           onUploadAll={() => {
             const { allFiles, targetNodeId } = dupDialog;
             setDupDialog(null);
-            // Pass skipDuplicates:true so the scan is bypassed — user chose to upload all
             uploadFilesToNode(targetNodeId, allFiles, { skipDuplicates: true });
+          }}
+          onLink={async () => {
+            const { duplicates, allFiles, targetNodeId } = dupDialog;
+            setDupDialog(null);
+            // Build all links in one tree update so no call reads stale state.
+            // Mirror the upload routing: if the original doc lived in a year/month
+            // node, create the same year/month subfolder under the target and link there.
+            let newTree = tree;
+            for (const { existing } of duplicates) {
+              let linkNodeId = targetNodeId;
+              if (existing.originalNodeId) {
+                const origPath = getNodePathFrom(newTree, existing.originalNodeId);
+                const parts = origPath.split(" / ").map((s) => s.trim());
+                const n = parts.length;
+                if (
+                  n >= 2 &&
+                  /^\d{4}$/.test(parts[n - 2]) &&
+                  /^\d{1,2}$/.test(parts[n - 1])
+                ) {
+                  const year = parts[n - 2];
+                  const month = parts[n - 1].padStart(2, "0");
+                  [newTree, linkNodeId] = getOrCreateChild(newTree, targetNodeId, year);
+                  [newTree, linkNodeId] = getOrCreateChild(newTree, linkNodeId, month);
+                }
+              }
+              const target = findNode(newTree, linkNodeId);
+              if (!target) continue;
+              if ((target.documents || []).some((d) => d.id === existing.id)) continue;
+              newTree = updateNodeInTree(newTree, linkNodeId, (n) => ({
+                ...n,
+                documents: [...(n.documents || []), { id: existing.id }],
+              }));
+            }
+            await persistTree(newTree);
+            // Upload any non-duplicate files normally
+            const nonDups = allFiles.filter((f) => !duplicates.some((d) => d.file === f));
+            if (nonDups.length) {
+              uploadFilesToNode(targetNodeId, nonDups, { skipDuplicates: true });
+            }
           }}
           onSkip={() => {
             const { duplicates, allFiles, targetNodeId } = dupDialog;

@@ -1631,6 +1631,50 @@ def post_doc():
                     "path": str(out_path), "location": location})
 
 
+@app.route("/api/docs/<doc_id>/preview", methods=["GET"])
+def get_doc_preview(doc_id):
+    """Return a browser-viewable image, converting HEIC/HEIF to JPEG on the fly."""
+    docs_dir = get_docs_dir()
+    if not docs_dir:
+        return jsonify({"error": "Storage path not configured"}), 503
+
+    if "/" in doc_id or "\\" in doc_id or ".." in doc_id:
+        return jsonify({"error": "Invalid doc_id"}), 400
+
+    matches = list(docs_dir.rglob(f"{doc_id}__*")) or list(docs_dir.rglob(f"{doc_id}*"))
+    if not matches:
+        abort(404)
+    file_path = matches[0]
+
+    ext = file_path.suffix.lower().lstrip(".")
+    if ext in ("heic", "heif"):
+        try:
+            try:
+                import pillow_heif
+                pillow_heif.register_heif_opener()
+            except ImportError:
+                pass
+            from PIL import Image
+            from io import BytesIO
+            img = Image.open(file_path).convert("RGB")
+            buf = BytesIO()
+            img.save(buf, format="JPEG", quality=88)
+            buf.seek(0)
+            return Response(buf.read(), mimetype="image/jpeg")
+        except Exception as e:
+            print(f"[DMS] HEIC preview conversion failed: {e}")
+            return jsonify({"error": f"Cannot preview HEIC: {e}. Install pillow-heif: pip install pillow-heif"}), 500
+
+    # Non-HEIC: serve the file directly
+    idx = read_index()
+    meta = next((d for d in idx.get("docIndex", []) if d.get("id") == doc_id), None)
+    download_name = meta["name"] if meta else file_path.name
+    stored_mime = meta.get("mime") if meta else None
+    mime = (stored_mime if stored_mime and stored_mime != "application/octet-stream"
+            else mimetypes.guess_type(str(file_path))[0] or "application/octet-stream")
+    return send_file(file_path, mimetype=mime, download_name=download_name, as_attachment=False)
+
+
 @app.route("/api/docs/<doc_id>", methods=["DELETE"])
 def delete_doc(doc_id):
     docs_dir = get_docs_dir()
