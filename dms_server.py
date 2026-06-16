@@ -256,6 +256,19 @@ def _find_node_by_name(root: dict, name: str) -> "dict | None":
     return None
 
 
+def _find_node_by_id(root: dict, node_id: str) -> "dict | None":
+    """Return the first node in the tree whose id matches node_id."""
+    if not root or not node_id:
+        return None
+    if root.get("id") == node_id:
+        return root
+    for child in (root.get("children") or []):
+        found = _find_node_by_id(child, node_id)
+        if found:
+            return found
+    return None
+
+
 def _get_or_create_child_node(parent_node: dict, child_name: str) -> dict:
     """Return the direct child named child_name, creating it in-place if absent."""
     for child in (parent_node.get("children") or []):
@@ -311,6 +324,10 @@ def _get_node_path_parts(tree: dict, node_id: str) -> list:
     return _walk(tree, node_id, []) or []
 
 
+def _path_exists_for_node(tree: dict | None, node_id: str | None) -> bool:
+    return bool(tree and node_id and _get_node_path_parts(tree, node_id))
+
+
 def _get_node_docs_dir(node_id: str | None, tree: dict | None = None) -> "Path | None":
     """Return (and create) the docs subdirectory for a given tree node."""
     docs_dir = get_docs_dir()
@@ -326,6 +343,72 @@ def _get_node_docs_dir(node_id: str | None, tree: dict | None = None) -> "Path |
     subdir = docs_dir.joinpath(*parts)
     subdir.mkdir(parents=True, exist_ok=True)
     return subdir
+
+
+_PHOTO_EXTS = {"jpg", "jpeg", "png", "heic", "heif", "tif", "tiff", "webp", "gif", "bmp"}
+
+
+def _is_photo_file(ext: str, mime: str) -> bool:
+    return (ext or "").lower() in _PHOTO_EXTS or (mime or "").startswith("image/")
+
+
+def _valid_photo_year_month(year: str | None, month: str | None) -> bool:
+    return bool(
+        year and month
+        and len(year) == 4 and year.isdigit()
+        and len(month) == 2 and month.isdigit()
+        and 1 <= int(month) <= 12
+    )
+
+
+def _photo_year_month_dir(
+    docs_dir: Path,
+    tree: dict | None,
+    year: str,
+    month: str,
+    base_node_id: str | None = None,
+) -> Path:
+    """Return docs/<base>/<year>/<month>, creating folders as needed.
+
+    Resolution order for the base:
+      1. base_node_id if supplied and found in tree
+      2. tree root
+    """
+    base_dir = docs_dir
+    if tree:
+        base_node = None
+        if base_node_id:
+            base_node = _find_node_by_id(tree, base_node_id)
+        if base_node is None:
+            base_node = tree
+        parts = _get_node_path_parts(tree, base_node.get("id"))
+        if parts:
+            base_dir = docs_dir.joinpath(*parts)
+    out_dir = base_dir / _safe_folder_name(year) / _safe_folder_name(month)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir
+
+
+def _find_or_create_photo_month_node(
+    tree: dict | None,
+    base_node_id: str | None,
+    year: str,
+    month: str,
+) -> "str | None":
+    """Ensure the tree contains year/month children and return the month node id.
+
+    Resolution order for the base:
+      1. base_node_id if supplied and found in tree
+      2. tree root
+    """
+    if not tree:
+        return base_node_id
+    base_node = _find_node_by_id(tree, base_node_id or "") if base_node_id else None
+    if base_node is None:
+        base_node = tree
+    year_node = _get_or_create_child_node(base_node, year)
+    month_node = _get_or_create_child_node(year_node, month)
+    return month_node.get("id")
 
 
 def _prune_empty_legacy_photo_dirs(docs_dir: Path) -> None:
@@ -387,7 +470,12 @@ def _migrate_legacy_photo_files(docs_dir: Path, tree: dict | None) -> None:
 
 
 def _create_local_folder_structure(tree: dict | None) -> "Path | None":
-    """Create the on-disk folder hierarchy that mirrors the imported tree."""
+    """Create the on-disk folder hierarchy that mirrors the current tree.
+
+    Do not delete general folders here. Users may have files in folders that
+    are no longer represented by the tree, and root renames can temporarily
+    leave old folders behind until indexed files are moved.
+    """
     docs_dir = get_docs_dir()
     if not docs_dir:
         return None
@@ -410,6 +498,52 @@ def _create_local_folder_structure(tree: dict | None) -> "Path | None":
 
     _prune_empty_legacy_photo_dirs(docs_dir)
     return docs_dir
+
+
+def _sync_doc_files_to_tree_paths(tree: dict | None) -> None:
+    """Move indexed files into the folder path for their current tree node.
+
+    This repairs root/folder renames on disk. For example, if files were under
+    docs/Old Root/2024/05 and the root is renamed to Family Photo, the files
+    move to docs/Family Photo/2024/05. Files that are not in index.json are
+    never moved or deleted.
+    """
+    if not tree:
+        return
+    docs_dir = get_docs_dir()
+    if not docs_dir:
+        return
+    idx = read_index()
+    for entry in (idx.get("docIndex") or []):
+        doc_id = entry.get("id") or ""
+        node_id = entry.get("originalNodeId") or entry.get("nodeId") or ""
+        if not doc_id or not node_id:
+            continue
+        target_dir = _get_node_docs_dir(node_id, tree) or docs_dir
+        try:
+            matches = list(docs_dir.rglob(f"{doc_id}__*"))
+            if not matches:
+                matches = list(docs_dir.rglob(f"{doc_id}*"))
+            if not matches:
+                continue
+            current = matches[0]
+            if current.parent.resolve() == target_dir.resolve():
+                continue
+            target_dir.mkdir(parents=True, exist_ok=True)
+            destination = target_dir / current.name
+            if destination.exists():
+                stem = current.stem
+                suffix = current.suffix
+                counter = 1
+                while True:
+                    candidate = target_dir / f"{stem}-{counter}{suffix}"
+                    if not candidate.exists():
+                        destination = candidate
+                        break
+                    counter += 1
+            current.rename(destination)
+        except OSError as e:
+            print(f"[DMS] Warning: could not move {doc_id} into current folder path: {e}")
 
 
 def _migrate_flat_docs() -> None:
@@ -1069,9 +1203,8 @@ def mobile_upload():
     node_id = token_node_id or (request.form.get("node_id") or "").strip()
     idx = read_index()
     tree = idx.get("tree")
+    photo_root_node_id = idx.get("photoRootNodeId", "") or node_id or ""
     names: list[str] = []
-
-    _photo_exts = {"jpg", "jpeg", "png", "heic", "heif", "tif", "tiff", "webp", "gif", "bmp"}
 
     for f in all_files:
         doc_id = "DOC-" + datetime.now().strftime("%Y%m%d") + "-" + secrets.token_hex(4).upper()
@@ -1089,16 +1222,28 @@ def mobile_upload():
             safe_name = f"{safe_name}.{ext}"
 
         data = f.read()
-        _is_photo = ext.lower() in _photo_exts or mime.startswith("image/")
+        is_photo = _is_photo_file(ext, mime)
+        photo_year, photo_month = (None, None)
+        if is_photo:
+            photo_year, photo_month = _read_photo_date(data, mime)
 
-        if node_id and tree is not None:
-            out_dir = _get_node_docs_dir(node_id, tree) or docs_dir
-            target_node = None
+        if is_photo and _valid_photo_year_month(photo_year, photo_month):
+            attach_node_id = _find_or_create_photo_month_node(
+                tree, photo_root_node_id or None, photo_year, photo_month)
+            out_dir = (
+                _get_node_docs_dir(attach_node_id, tree)
+                if tree and _path_exists_for_node(tree, attach_node_id)
+                else _photo_year_month_dir(
+                    docs_dir, tree, photo_year, photo_month,
+                    base_node_id=photo_root_node_id or None,
+                )
+            ) or docs_dir
+        elif node_id and tree is not None:
             attach_node_id = node_id
+            out_dir = _get_node_docs_dir(attach_node_id, tree) or docs_dir
         else:
-            out_dir = docs_dir
-            target_node = None
             attach_node_id = node_id
+            out_dir = docs_dir
 
         out_path = out_dir / f"{doc_id}__{safe_name}"
         out_path.write_bytes(data)
@@ -1114,9 +1259,7 @@ def mobile_upload():
         }
         idx.setdefault("docIndex", []).append(doc_entry)
 
-        if target_node is not None:
-            target_node.setdefault("documents", []).append({"id": doc_id})
-        elif attach_node_id and idx.get("tree"):
+        if attach_node_id and idx.get("tree"):
             def _attach(node, _doc_id=doc_id, _node_id=attach_node_id):
                 if node.get("id") == _node_id:
                     node.setdefault("documents", []).append({"id": _doc_id})
@@ -1282,7 +1425,7 @@ def get_tree():
     if not get_storage_root():
         return jsonify({"error": "Storage path not configured"}), 503
     idx = read_index()
-    return jsonify({"tree": idx.get("tree")})
+    return jsonify({"tree": idx.get("tree"), "photoRootNodeId": idx.get("photoRootNodeId", "")})
 
 
 @app.route("/api/tree", methods=["PUT"])
@@ -1294,7 +1437,27 @@ def put_tree():
     idx["tree"] = data.get("tree")
     write_index(idx)
     _create_local_folder_structure(idx.get("tree"))
+    _sync_doc_files_to_tree_paths(idx.get("tree"))
     return jsonify({"ok": True})
+
+
+@app.route("/api/photo-root", methods=["PUT"])
+def put_photo_root():
+    """Set or clear the photo root node id.
+
+    Body: { "node_id": "NODE-XXXX" }  — empty string clears the setting.
+    """
+    if not get_storage_root():
+        return jsonify({"error": "Storage path not configured"}), 503
+    data = request.get_json(force=True) or {}
+    node_id = (data.get("node_id") or "").strip()
+    idx = read_index()
+    if node_id:
+        idx["photoRootNodeId"] = node_id
+    else:
+        idx.pop("photoRootNodeId", None)
+    write_index(idx)
+    return jsonify({"ok": True, "photoRootNodeId": node_id})
 
 
 # ---- Document index --------------------------------------------------------
@@ -1408,19 +1571,36 @@ def post_doc():
 
     photo_year = request.form.get("photo_year", "").strip() or None
     photo_month = request.form.get("photo_month", "").strip() or None
+    route_mode = request.form.get("route_mode", "year-month").strip() or "year-month"
+    photo_base_node_id = request.form.get("photo_base_node_id", "").strip() or None
     file_data = f.read()
 
-    _valid_date = (
-        photo_year and photo_month
-        and len(photo_year) == 4 and photo_year.isdigit()
-        and len(photo_month) == 2 and photo_month.isdigit()
-    )
+    is_photo = _is_photo_file(ext, mime)
+    _valid_date = _valid_photo_year_month(photo_year, photo_month)
+    if is_photo and not _valid_date and route_mode != "current-folder":
+        photo_year, photo_month = _read_photo_date(file_data, mime)
+        _valid_date = _valid_photo_year_month(photo_year, photo_month)
     photo_lat = request.form.get("photo_lat", "").strip() or None
     photo_lon = request.form.get("photo_lon", "").strip() or None
 
-    print(f"[DMS] upload: {orig_name!r} mime={mime!r} photo={photo_year}/{photo_month} valid={_valid_date} node={node_id!r}")
-    if node_id:
-        out_dir = _get_node_docs_dir(node_id) or docs_dir
+    print(
+        f"[DMS] upload: {orig_name!r} mime={mime!r} photo={photo_year}/{photo_month} "
+        f"valid={_valid_date} route={route_mode!r} node={node_id!r} base={photo_base_node_id!r}"
+    )
+    tree = read_index().get("tree")
+    if is_photo and _valid_date and route_mode != "current-folder":
+        node_parts = _get_node_path_parts(tree, node_id) if tree and node_id else []
+        date_parts = [_safe_folder_name(photo_year), _safe_folder_name(photo_month)]
+        if len(node_parts) >= 2 and node_parts[-2:] == date_parts:
+            out_dir = docs_dir.joinpath(*node_parts)
+            out_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            out_dir = _photo_year_month_dir(
+                docs_dir, tree, photo_year, photo_month,
+                base_node_id=photo_base_node_id or node_id,
+            )
+    elif node_id:
+        out_dir = _get_node_docs_dir(node_id, tree) or docs_dir
     else:
         out_dir = docs_dir
 

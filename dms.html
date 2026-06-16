@@ -203,6 +203,15 @@ const ListTree = (p) => (
   </I>
 );
 
+const Camera = (p) => (
+  <I {...p}>
+    <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" />
+    <circle cx="12" cy="13" r="4" />
+  </I>
+);
+
+const isDateNode = (name) => /^\d{4}$/.test(name) || /^\d{1,2}$/.test(name);
+
 /* =============================================================================
  * STORAGE ADAPTER LAYER (REST API implementation)
  * ---------------------------------------------------------------------------
@@ -377,8 +386,15 @@ const StorageAdapter = {
   },
 
   async getTree() {
-    const r = await this._json("/api/tree");
-    return r.tree;
+    return this._json("/api/tree");  // returns { tree, photoRootNodeId }
+  },
+
+  async savePhotoRootNodeId(nodeId) {
+    await this._json("/api/photo-root", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ node_id: nodeId || "" }),
+    });
   },
 
   async saveTree(tree) {
@@ -428,10 +444,12 @@ const StorageAdapter = {
     form.append("doc_id", doc.id);
     const _nodeId = doc.originalNodeId || doc.nodeId;
     if (_nodeId) form.append("node_id", _nodeId);
+    if (doc.routeMode) form.append("route_mode", doc.routeMode);
     if (doc.photoYear) form.append("photo_year", doc.photoYear);
     if (doc.photoMonth) form.append("photo_month", doc.photoMonth);
     if (doc.photoLat != null) form.append("photo_lat", String(doc.photoLat));
     if (doc.photoLon != null) form.append("photo_lon", String(doc.photoLon));
+    if (doc.photoBaseNodeId) form.append("photo_base_node_id", doc.photoBaseNodeId);
     const res = await fetch(API_BASE + "/api/docs", { method: "POST", body: form });
     let resData = {};
     try { resData = await res.json(); } catch {}
@@ -739,6 +757,7 @@ const TreeNode = ({
   node, depth, selectedId, expandedIds, isRoot,
   siblingIndex, siblingCount, parentLines,
   renamingId, addingChildToId,
+  photoRootNodeId,
   onToggle, onSelect,
   onStartRename, onCommitRename, onCancelRename,
   onStartAddChild, onCommitAddChild, onCancelAddChild,
@@ -752,6 +771,7 @@ const TreeNode = ({
   const hasChildren = (node.children || []).length > 0;
   const docCount = (node.documents || []).length;
   const isLast = siblingIndex === siblingCount - 1;
+  const isPhotoRoot = node.id === photoRootNodeId;
   const currentParentLines = parentLines || [];
   const isDragging = draggingId === node.id;
   const isDropTarget = dropInfo?.targetId === node.id;
@@ -865,6 +885,9 @@ const TreeNode = ({
         ) : (
           <span className="truncate flex-1" title="双击重命名">
             {node.name}
+            {isPhotoRoot && (
+              <Camera size={11} className="inline ml-1.5 text-amber-600 shrink-0" title="照片根目录" />
+            )}
             {node.sn && (
               <span className="ml-1.5 text-[10px] text-amber-700 font-mono">· {node.sn}</span>
             )}
@@ -971,6 +994,7 @@ const TreeNode = ({
           parentLines={isRoot ? [] : [...currentParentLines, !isLast]}
           renamingId={renamingId}
           addingChildToId={addingChildToId}
+          photoRootNodeId={photoRootNodeId}
           onToggle={onToggle}
           onSelect={onSelect}
           onStartRename={onStartRename}
@@ -999,7 +1023,11 @@ const TreeNode = ({
  * UI: CONTEXT MENU
  * =============================================================================
  */
-const ContextMenu = ({ x, y, isRoot, onClose, onRename, onAddChild, onUpload, onDelete }) => {
+const ContextMenu = ({
+  x, y, isRoot, nodeName, isPhotoRoot, isDateFolder,
+  onClose, onRename, onAddChild, onUpload, onDelete,
+  onSetPhotoRoot, onClearPhotoRoot,
+}) => {
   useEffect(() => {
     const close = () => onClose();
     window.addEventListener("click", close);
@@ -1013,7 +1041,7 @@ const ContextMenu = ({ x, y, isRoot, onClose, onRename, onAddChild, onUpload, on
   return (
     <div
       style={{ position: "fixed", left: x, top: y, zIndex: 60 }}
-      className="bg-white border border-stone-300 rounded shadow-lg py-1 min-w-[180px] text-sm"
+      className="bg-white border border-stone-300 rounded shadow-lg py-1 min-w-[190px] text-sm"
       onClick={(e) => e.stopPropagation()}
     >
       <button
@@ -1035,6 +1063,26 @@ const ContextMenu = ({ x, y, isRoot, onClose, onRename, onAddChild, onUpload, on
       >
         <Edit2 size={13} /> 重命名
       </button>
+      {!isDateFolder && (
+        <>
+          <div className="border-t border-stone-200 my-1" />
+          {isPhotoRoot ? (
+            <button
+              onClick={() => { onClearPhotoRoot(); onClose(); }}
+              className="w-full text-left px-3 py-1.5 hover:bg-amber-50 flex items-center gap-2 text-amber-700"
+            >
+              <Camera size={13} /> 取消照片根目录
+            </button>
+          ) : (
+            <button
+              onClick={() => { onSetPhotoRoot(); onClose(); }}
+              className="w-full text-left px-3 py-1.5 hover:bg-amber-50 flex items-center gap-2 text-stone-700"
+            >
+              <Camera size={13} /> 设为照片根目录
+            </button>
+          )}
+        </>
+      )}
       {!isRoot && (
         <>
           <div className="border-t border-stone-200 my-1" />
@@ -4391,6 +4439,7 @@ function DMS({ storagePath, onChangeFolder }) {
 
   const [tree, setTree] = useState(null);
   const [docIndex, setDocIndex] = useState([]);
+  const [photoRootNodeId, setPhotoRootNodeId] = useState("");
   const [selectedId, setSelectedId] = useState(null);
   const [expandedIds, setExpandedIds] = useState(new Set());
   const [viewerDoc, setViewerDoc] = useState(null);
@@ -4530,11 +4579,14 @@ function DMS({ storagePath, onChangeFolder }) {
 
   useEffect(() => {
     (async () => {
-      let t = await StorageAdapter.getTree();
+      const treeResp = await StorageAdapter.getTree();
+      let t = treeResp.tree;
       if (!t) {
         t = buildSeedTree();
         await StorageAdapter.saveTree(t);
       }
+      setPhotoRootNodeId(treeResp.photoRootNodeId || "");
+
       const rawIdx = await StorageAdapter.listDocumentIndex();
       const savedKeyParameters = await StorageAdapter.getKeyParameters();
       setKeyParameters(savedKeyParameters);
@@ -4840,12 +4892,13 @@ function DMS({ storagePath, onChangeFolder }) {
       const photoDate = _isPhoto ? await readPhotoDate(file) : null;
       if (photoDate) console.log(`[DMS] Photo date: ${photoDate.year}/${photoDate.month} lat=${photoDate.lat} lon=${photoDate.lon} for ${file.name}`);
 
-      // For photos, keep the existing year/month layout unless the caller explicitly
-      // requests the current-folder upload mode.
+      // For photos, create year/month subfolders under the designated photo root
+      // (or the upload target folder if no root is set), unless uploading to current folder.
       let finalNodeId = effectiveNodeId;
+      let photoBaseNodeId = null;
       if (photoDate && routeMode !== "current-folder") {
-        const myPhotoNode = findNodeByName(workingTree, "MyPhoto");
-        const baseId = myPhotoNode ? myPhotoNode.id : workingTree.id;
+        const baseId = photoRootNodeId || effectiveNodeId || workingTree.id;
+        photoBaseNodeId = baseId;
         [workingTree, finalNodeId] = getOrCreateChild(workingTree, baseId, photoDate.year);
         [workingTree, finalNodeId] = getOrCreateChild(workingTree, finalNodeId, photoDate.month);
       }
@@ -4853,11 +4906,12 @@ function DMS({ storagePath, onChangeFolder }) {
       const doc = {
         id: docId, name: file.name, mime: file.type || "application/octet-stream",
         size: file.size, uploadedAt: new Date().toISOString(),
-        dataUrl, nodeId: finalNodeId, metadata: {},
+        dataUrl, nodeId: finalNodeId, routeMode, metadata: {},
         ...(photoDate ? {
           photoYear: photoDate.year, photoMonth: photoDate.month,
           ...(photoDate.lat != null ? { photoLat: photoDate.lat, photoLon: photoDate.lon } : {}),
         } : {}),
+        ...(photoBaseNodeId ? { photoBaseNodeId } : {}),
       };
       let uploadResult = {};
       try {
@@ -5339,6 +5393,7 @@ function DMS({ storagePath, onChangeFolder }) {
                       siblingIndex={0} siblingCount={1}
                       selectedId={selectedId} expandedIds={expandedIds}
                       renamingId={renamingId} addingChildToId={addingChildToId}
+                      photoRootNodeId={photoRootNodeId}
                       onToggle={toggleExpand} onSelect={setSelectedId}
                       onStartRename={(id) => setRenamingId(id)}
                       onCommitRename={handleCommitRename}
@@ -5414,8 +5469,23 @@ function DMS({ storagePath, onChangeFolder }) {
                 {editingNode ? (
                   <div className="space-y-2">
                     <input
-                      type="text" value={selectedNode.name}
-                      onChange={(e) => updateNodeMeta({ name: e.target.value })}
+                      type="text"
+                      defaultValue={selectedNode.name}
+                      onBlur={(e) => {
+                        const nextName = e.target.value.trim();
+                        if (nextName && nextName !== selectedNode.name) {
+                          handleCommitRename(selectedNode.id, nextName);
+                        } else {
+                          e.target.value = selectedNode.name;
+                        }
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") e.currentTarget.blur();
+                        if (e.key === "Escape") {
+                          e.currentTarget.value = selectedNode.name;
+                          e.currentTarget.blur();
+                        }
+                      }}
                       placeholder="节点名称"
                       className="w-full text-xl font-semibold border border-stone-300 rounded px-2 py-1"
                     />
@@ -5652,7 +5722,8 @@ function DMS({ storagePath, onChangeFolder }) {
         onClose={() => setShowHierarchyImport(false)}
         onImported={async () => {
           // Reload tree from server so the new nodes are visible immediately
-          const t = await StorageAdapter.getTree();
+          const r = await StorageAdapter.getTree();
+          const t = r.tree;
           if (t) {
             setTree(t);
             setExpandedIds(new Set([t.id]));
@@ -5667,30 +5738,46 @@ function DMS({ storagePath, onChangeFolder }) {
         onClose={() => setShowZipImport(false)}
         onImported={async () => {
           // Reload tree + doc index so newly allocated documents appear immediately
-          const t = await StorageAdapter.getTree();
-          if (t) setTree(t);
+          const r = await StorageAdapter.getTree();
+          if (r.tree) setTree(r.tree);
           const idx = await StorageAdapter.listDocumentIndex();
           setDocIndex(idx);
         }}
       />
 
-      {contextMenu && (
-        <ContextMenu
-          x={contextMenu.x} y={contextMenu.y}
-          isRoot={contextMenu.nodeId === tree?.id}
-          onClose={() => setContextMenu(null)}
-          onRename={() => setRenamingId(contextMenu.nodeId)}
-          onAddChild={() => {
-            setAddingChildToId(contextMenu.nodeId);
-            setExpandedIds((prev) => new Set([...prev, contextMenu.nodeId]));
-          }}
-          onUpload={() => {
-            ctxUploadTargetRef.current = contextMenu.nodeId;
-            ctxUploadInputRef.current?.click();
-          }}
-          onDelete={() => handleDeleteNode(contextMenu.nodeId)}
-        />
-      )}
+      {contextMenu && (() => {
+        const ctxNode = findNode(tree, contextMenu.nodeId);
+        const ctxName = ctxNode?.name || "";
+        return (
+          <ContextMenu
+            x={contextMenu.x} y={contextMenu.y}
+            isRoot={contextMenu.nodeId === tree?.id}
+            nodeName={ctxName}
+            isPhotoRoot={contextMenu.nodeId === photoRootNodeId}
+            isDateFolder={isDateNode(ctxName)}
+            onClose={() => setContextMenu(null)}
+            onRename={() => setRenamingId(contextMenu.nodeId)}
+            onAddChild={() => {
+              setAddingChildToId(contextMenu.nodeId);
+              setExpandedIds((prev) => new Set([...prev, contextMenu.nodeId]));
+            }}
+            onUpload={() => {
+              ctxUploadTargetRef.current = contextMenu.nodeId;
+              ctxUploadInputRef.current?.click();
+            }}
+            onDelete={() => handleDeleteNode(contextMenu.nodeId)}
+            onSetPhotoRoot={async () => {
+              const newId = contextMenu.nodeId;
+              await StorageAdapter.savePhotoRootNodeId(newId);
+              setPhotoRootNodeId(newId);
+            }}
+            onClearPhotoRoot={async () => {
+              await StorageAdapter.savePhotoRootNodeId("");
+              setPhotoRootNodeId("");
+            }}
+          />
+        );
+      })()}
 
       <input
         ref={ctxUploadInputRef}
@@ -5733,8 +5820,8 @@ function DMS({ storagePath, onChangeFolder }) {
           onClose={() => setShowCombineModal(false)}
           onSaved={async () => {
             setShowCombineModal(false);
-            const t = await StorageAdapter.getTree();
-            if (t) setTree(t);
+            const r = await StorageAdapter.getTree();
+            if (r.tree) setTree(r.tree);
             const idx = await StorageAdapter.listDocumentIndex();
             setDocIndex(idx);
           }}
