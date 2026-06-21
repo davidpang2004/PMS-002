@@ -250,15 +250,16 @@ def get_local_ip() -> str:
         return "127.0.0.1"
 
 
-PORT       = find_free_port()
+PORT       = 8765  # fixed port so ngrok tunnel always forwards to the right place
 URL        = f"http://127.0.0.1:{PORT}"
 LOCAL_IP   = get_local_ip()
 MOBILE_URL = f"http://{LOCAL_IP}:{PORT}/mobile"
 
 # ---------------------------------------------------------------------------
-# ngrok tunnel state — one tunnel per session, reused across dialog opens
+# Tunnel state — one cloudflared tunnel per session, reused across dialogs
 # ---------------------------------------------------------------------------
-_ngrok_tunnel = None  # pyngrok tunnel object
+_tunnel_proc   = None   # subprocess.Popen for cloudflared
+_tunnel_url    = None   # public HTTPS URL
 
 
 def _load_ngrok_token() -> str:
@@ -274,59 +275,129 @@ def _save_ngrok_token(token: str) -> None:
 
 
 def _get_or_start_tunnel() -> str:
-    """Return the public ngrok HTTPS URL, reusing any already-running tunnel."""
-    global _ngrok_tunnel
-    from pyngrok import ngrok as _pyngrok, conf as _pyngrok_conf  # type: ignore
+    """Return a public HTTPS URL via cloudflared, starting it if needed."""
+    global _tunnel_proc, _tunnel_url
+    import subprocess, re as _re, threading
 
-    auth = _load_ngrok_token()
-    if auth:
-        _pyngrok_conf.get_default().auth_token = auth
+    # Reuse existing tunnel if the process is still alive.
+    if _tunnel_proc is not None and _tunnel_proc.poll() is None and _tunnel_url:
+        return _tunnel_url
 
-    # 1. Reuse in-process tunnel object if still alive
-    if _ngrok_tunnel is not None:
+    # Kill any stale cloudflared left from a previous session.
+    subprocess.run(["/usr/bin/pkill", "-f", "cloudflared"], capture_output=True)
+    time.sleep(0.5)
+
+    _tunnel_url = None
+    collected = []
+
+    # Use full path — app bundles don't inherit the user's shell PATH.
+    _cf = next(
+        (p for p in ["/opt/homebrew/bin/cloudflared", "/usr/local/bin/cloudflared"] if __import__("os").path.exists(p)),
+        "cloudflared",
+    )
+    proc = subprocess.Popen(
+        [_cf, "tunnel", "--url", f"http://localhost:{PORT}", "--no-autoupdate"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    _tunnel_proc = proc
+
+    # Read output lines until we find the public URL (printed within ~5 s).
+    import queue as _queue
+    q = _queue.Queue()
+
+    def _reader():
+        for line in proc.stdout:
+            q.put(line)
+
+    threading.Thread(target=_reader, daemon=True).start()
+
+    deadline = time.time() + 15
+    while time.time() < deadline:
         try:
-            return _ngrok_tunnel.public_url
-        except Exception:
-            _ngrok_tunnel = None
+            line = q.get(timeout=0.3)
+            m = _re.search(r'https://[a-z0-9\-]+\.trycloudflare\.com', line)
+            if m:
+                _tunnel_url = m.group(0)
+                break
+        except _queue.Empty:
+            if proc.poll() is not None:
+                raise RuntimeError("cloudflared exited unexpectedly. Is it installed? Run: brew install cloudflare/cloudflare/cloudflared")
 
-    # 2. ngrok process may already be running (e.g. from a prior session that
-    #    didn't fully clean up) — grab its existing tunnel rather than starting
-    #    a duplicate, which causes ERR_NGROK_334.
-    try:
-        for t in _pyngrok.get_tunnels():
-            if t.proto == "https":
-                _ngrok_tunnel = t
-                return t.public_url
-    except Exception:
-        pass
+    if not _tunnel_url:
+        proc.kill()
+        raise RuntimeError("cloudflared did not produce a URL within 15 seconds.")
 
-    # 3. No existing tunnel — start one fresh. If it still conflicts, kill the
-    #    stale ngrok process and retry once.
-    try:
-        _ngrok_tunnel = _pyngrok.connect(PORT, "http")
-    except Exception as exc:
-        if "ERR_NGROK_334" in str(exc) or "already online" in str(exc):
-            _pyngrok.kill()
-            time.sleep(1)
-            _ngrok_tunnel = _pyngrok.connect(PORT, "http")
-        else:
-            raise
-    return _ngrok_tunnel.public_url
+    return _tunnel_url
 
 
 def _send_imessage(phone: str, url: str) -> None:
     """Send *url* to *phone* via the Mac Messages app using AppleScript."""
     import subprocess
-    for service_type in ("iMessage", "SMS"):
-        script = (
-            f'tell application "Messages" to send "{url}" '
-            f'to buddy "{phone}" of '
-            f'(first service whose service type = {service_type})'
+
+    # Normalise to E.164 (+1XXXXXXXXXX) so Messages can match the number.
+    normalised = phone.strip()
+    if not normalised.startswith("+"):
+        normalised = "+" + normalised
+    # Digits-only suffix for partial matching (handles +1XXXXXXXXXX vs XXXXXXXXXX)
+    digits_suffix = normalised.lstrip("+")
+
+    # Escape the URL for embedding in an AppleScript string literal.
+    safe_url = url.replace("\\", "\\\\").replace('"', '\\"')
+
+    # Strategy 1: find an existing chat containing this number and send to it.
+    # Strategy 2: fall back to the buddy approach with normalised +phone.
+    script = f"""
+tell application "Messages"
+    set _url to "{safe_url}"
+    set _digits to "{digits_suffix}"
+    set _norm to "{normalised}"
+    set _sent to false
+
+    -- Strategy 1: search existing chats for a participant matching the number
+    repeat with c in chats
+        try
+            repeat with p in (participants of c)
+                set h to handle of p
+                if h ends with _digits or h is _norm then
+                    send _url to c
+                    set _sent to true
+                    exit repeat
+                end if
+            end repeat
+        end try
+        if _sent then exit repeat
+    end repeat
+
+    -- Strategy 2: buddy lookup (works when the number is in contacts)
+    if not _sent then
+        repeat with svc in services
+            set sType to service type of svc as string
+            if sType is in {{"iMessage", "SMS", "RCS"}} then
+                try
+                    send _url to buddy _norm of svc
+                    set _sent to true
+                    exit repeat
+                end try
+                try
+                    send _url to buddy _digits of svc
+                    set _sent to true
+                    exit repeat
+                end try
+            end if
+        end repeat
+    end if
+
+    if not _sent then
+        error "No Messages conversation found for " & _norm & ". Open Messages and start a conversation with this number first."
+    end if
+end tell
+"""
+    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            result.stderr.strip() or "Messages app could not send the link. "
+            "Is your iPhone linked to this Mac via Handoff/SMS Forwarding?"
         )
-        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
-        if result.returncode == 0:
-            return
-    raise RuntimeError("Messages app could not send the link. Is your iPhone linked to this Mac?")
 
 
 # ---------------------------------------------------------------------------
@@ -680,49 +751,6 @@ class LauncherWindow:
 
         tk.Frame(dlg, bg="#e7e5e4", height=1).pack(fill="x", padx=18, pady=10)
 
-        # ── ngrok auth token ─────────────────────────────────────────────────
-        ngrok_status_var = tk.StringVar()
-
-        def _refresh_ngrok_status():
-            t = _load_ngrok_token()
-            if t:
-                ngrok_status_var.set(f"✓  Auth token saved  ({t[:8]}…)")
-                ngrok_status_lbl.config(fg="#15803d")
-                ngrok_entry_frame.pack_forget()
-            else:
-                ngrok_status_var.set("No auth token — enter one below (free at ngrok.com)")
-                ngrok_status_lbl.config(fg=WARN)
-                ngrok_entry_frame.pack(fill="x", padx=24, pady=(2, 6))
-
-        tk.Label(dlg, text="ngrok Auth Token", font=("Helvetica", 10, "bold"),
-                 bg=BG, fg=FG).pack(padx=24, anchor="w")
-
-        ngrok_status_lbl = tk.Label(dlg, textvariable=ngrok_status_var,
-                                    font=("Helvetica", 9), bg=BG, wraplength=340, justify="left")
-        ngrok_status_lbl.pack(padx=24, anchor="w")
-
-        ngrok_entry_frame = tk.Frame(dlg, bg=BG)
-        ngrok_token_var = tk.StringVar()
-        tk.Entry(ngrok_entry_frame, textvariable=ngrok_token_var,
-                 width=32, show="").pack(side="left")
-
-        def _save_ngrok_clicked():
-            t = ngrok_token_var.get().strip()
-            if t:
-                _save_ngrok_token(t)
-                _refresh_ngrok_status()
-
-        tk.Button(ngrok_entry_frame, text="Save", command=_save_ngrok_clicked,
-                  relief="groove", padx=8).pack(side="left", padx=(6, 0))
-        tk.Label(ngrok_entry_frame, text="Change",
-                 font=("Helvetica", 9, "underline"), fg=ACCENT, bg=BG,
-                 cursor="hand2").pack(side="left", padx=(8, 0))
-
-        _refresh_ngrok_status()
-
-        tk.Label(dlg, text="Get a free token: ngrok.com → Your Authtoken",
-                 font=("Helvetica", 9), bg=BG, fg=SUB).pack(padx=24, anchor="w", pady=(0, 6))
-
         tk.Frame(dlg, bg="#e7e5e4", height=1).pack(fill="x", padx=18, pady=(4, 8))
 
         # ── Phone number ─────────────────────────────────────────────────────
@@ -808,21 +836,22 @@ class LauncherWindow:
         status_lbl.pack(padx=24, pady=(0, 4))
 
         def _generate():
-            if not _load_ngrok_token():
-                status_var.set("Please save your ngrok auth token first.")
-                status_lbl.config(fg=WARN)
-                return
 
-            status_var.set("Starting ngrok tunnel…")
+            status_var.set("Starting tunnel…")
             status_lbl.config(fg=SUB)
             dlg.update_idletasks()
 
             try:
                 public_url = _get_or_start_tunnel()
             except Exception as exc:
-                status_var.set(f"ngrok error: {exc}")
+                status_var.set(f"Tunnel error: {exc}")
                 status_lbl.config(fg="#dc2626")
                 return
+
+            # Let the Flask server know the public tunnel URL so it can use
+            # it for document download links sent to the phone.
+            import dms_server as _dms_srv
+            _dms_srv._tunnel_base_url = public_url
 
             # Determine selected node_id
             chosen_label = folder_combo.get()

@@ -7,7 +7,7 @@
 <script src="https://cdn.tailwindcss.com"></script>
 <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
 <style>
   html, body, #root { height: 100%; margin: 0; }
   body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
@@ -209,6 +209,17 @@ const Camera = (p) => (
     <circle cx="12" cy="13" r="4" />
   </I>
 );
+const Phone = (p) => (
+  <I {...p}>
+    <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 4.69 13a19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 3.62 2h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L7.91 9.91a16 16 0 0 0 6.08 6.08l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z" />
+  </I>
+);
+const Mail = (p) => (
+  <I {...p}>
+    <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z" />
+    <polyline points="22,6 12,13 2,6" />
+  </I>
+);
 
 const isDateNode = (name) => /^\d{4}$/.test(name) || /^\d{1,2}$/.test(name);
 
@@ -377,11 +388,16 @@ const StorageAdapter = {
     return this._json("/api/settings");
   },
 
-  async saveSettings(storagePath) {
+  async checkStoragePath(path) {
+    const encoded = encodeURIComponent(path);
+    return this._json(`/api/settings/check?path=${encoded}`);
+  },
+
+  async saveSettings(storagePath, copyCurrentData = false) {
     return this._json("/api/settings", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ storage_path: storagePath }),
+      body: JSON.stringify({ storage_path: storagePath, copy_current: copyCurrentData }),
     });
   },
 
@@ -692,6 +708,40 @@ const moveNodeToPosition = (root, dragId, targetId, position) => {
   return next;
 };
 
+// Deep-merge `dragged` node into `existing` node (same name).
+// Returns { mergedNode, docRemap: Map<docId, newNodeId> } where docRemap
+// holds every doc whose originalNodeId must be updated in the index.
+const mergeNodesDeep = (existing, dragged) => {
+  const docRemap = new Map();
+
+  // dragged's direct documents move to existing
+  const existingDocIds = new Set((existing.documents || []).map((d) => d.id));
+  for (const d of (dragged.documents || [])) docRemap.set(d.id, existing.id);
+  const addedDocs = (dragged.documents || []).filter((d) => !existingDocIds.has(d.id));
+
+  // Merge children: recurse on name conflicts, append the rest
+  const mergedChildren = [...(existing.children || [])];
+  for (const dc of (dragged.children || [])) {
+    const conflictIdx = mergedChildren.findIndex((c) => c.name === dc.name);
+    if (conflictIdx >= 0) {
+      const { mergedNode, docRemap: childRemap } = mergeNodesDeep(mergedChildren[conflictIdx], dc);
+      mergedChildren[conflictIdx] = mergedNode;
+      for (const [docId, nodeId] of childRemap) docRemap.set(docId, nodeId);
+    } else {
+      mergedChildren.push(dc);
+    }
+  }
+
+  return {
+    mergedNode: {
+      ...existing,
+      documents: [...(existing.documents || []), ...addedDocs],
+      children: mergedChildren,
+    },
+    docRemap,
+  };
+};
+
 /* =============================================================================
  * SEED DATA
  * =============================================================================
@@ -761,7 +811,7 @@ const TreeNode = ({
   onToggle, onSelect,
   onStartRename, onCommitRename, onCancelRename,
   onStartAddChild, onCommitAddChild, onCancelAddChild,
-  onDelete, onMoveNode, onContextMenu, onUploadToNode,
+  onDelete, onMoveNode, onContextMenu, onUploadToNode, onFileDrop,
   draggingId, dropInfo, onDragStart, onDragOver, onDragEnd, onDrop,
 }) => {
   const isExpanded = expandedIds.has(node.id);
@@ -776,12 +826,19 @@ const TreeNode = ({
   const isDragging = draggingId === node.id;
   const isDropTarget = dropInfo?.targetId === node.id;
   const dropPosition = isDropTarget ? dropInfo.position : null;
+  const [isFileDragOver, setIsFileDragOver] = useState(false);
 
   const [draftName, setDraftName] = useState(node.name);
   const [newChildName, setNewChildName] = useState("");
+  const newChildInputRef = useRef(null);
 
   useEffect(() => { if (isRenaming) setDraftName(node.name); }, [isRenaming, node.name]);
-  useEffect(() => { if (isAddingChild) setNewChildName(""); }, [isAddingChild]);
+  useEffect(() => {
+    if (isAddingChild) {
+      setNewChildName("");
+      setTimeout(() => newChildInputRef.current?.focus(), 0);
+    }
+  }, [isAddingChild]);
 
   const commitRename = () => {
     const trimmed = draftName.trim();
@@ -816,22 +873,40 @@ const TreeNode = ({
         onDragOver={(e) => {
           e.preventDefault();
           e.stopPropagation();
-          const rect = e.currentTarget.getBoundingClientRect();
-          const y = e.clientY - rect.top;
-          const h = rect.height;
-          const pos = isRoot ? "into" : (y < h * 0.3 ? "before" : y > h * 0.7 ? "after" : "into");
-          onDragOver(node.id, pos);
-          e.dataTransfer.dropEffect = "move";
+          if (e.dataTransfer.types.includes("Files")) {
+            setIsFileDragOver(true);
+            e.dataTransfer.dropEffect = "copy";
+          } else {
+            const rect = e.currentTarget.getBoundingClientRect();
+            const y = e.clientY - rect.top;
+            const h = rect.height;
+            const pos = isRoot ? "into" : (y < h * 0.3 ? "before" : y > h * 0.7 ? "after" : "into");
+            onDragOver(node.id, pos);
+            e.dataTransfer.dropEffect = "move";
+          }
         }}
         onDragLeave={(e) => {
-          if (!e.currentTarget.contains(e.relatedTarget)) onDragOver(null, null);
+          if (!e.currentTarget.contains(e.relatedTarget)) {
+            setIsFileDragOver(false);
+            onDragOver(null, null);
+          }
         }}
-        onDrop={(e) => { e.preventDefault(); e.stopPropagation(); onDrop(); }}
+        onDrop={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          setIsFileDragOver(false);
+          if (e.dataTransfer.files.length !== 0) {
+            onFileDrop(node.id, e.dataTransfer.files);
+          } else {
+            onDrop();
+          }
+        }}
         onDragEnd={() => onDragEnd()}
         className={`group relative flex items-center gap-1.5 py-1.5 px-2 cursor-pointer text-sm border-l-2 transition-colors ${
           isDragging ? "opacity-40" :
+          isFileDragOver ? "bg-amber-100 border-amber-500 text-stone-900" :
           isDropTarget && dropPosition === "into" ? "bg-blue-50 border-blue-400 text-stone-900" :
-          isSelected ? "bg-amber-50 border-amber-600 text-stone-900"
+          isSelected ? "bg-amber-200 border-amber-600 text-stone-900 font-medium"
             : "border-transparent text-stone-700 hover:bg-stone-100"
         }`}
       >
@@ -966,11 +1041,12 @@ const TreeNode = ({
           <span className="w-4" />
           <Folder size={15} className="text-amber-400 shrink-0" />
           <input
-            autoFocus
+            ref={newChildInputRef}
             type="text"
             value={newChildName}
             placeholder="新文件夹 / 子组件名称…"
             onChange={(e) => setNewChildName(e.target.value)}
+            onClick={(e) => e.stopPropagation()}
             onBlur={commitAddChild}
             onKeyDown={(e) => {
               if (e.key === "Enter") commitAddChild();
@@ -1007,6 +1083,7 @@ const TreeNode = ({
           onMoveNode={onMoveNode}
           onContextMenu={onContextMenu}
           onUploadToNode={onUploadToNode}
+          onFileDrop={onFileDrop}
           draggingId={draggingId}
           dropInfo={dropInfo}
           onDragStart={onDragStart}
@@ -2716,13 +2793,424 @@ const CombineFolderModal = ({ node, docIndex, formatBytes, onClose, onSaved }) =
 };
 
 
+const SendToPhoneDialog = ({ doc, onClose }) => {
+  const saved = typeof localStorage !== "undefined" ? localStorage.getItem("pms_last_phone") || "" : "";
+  const [phone, setPhone] = useState(saved);
+  const [status, setStatus] = useState(null); // null | {ok, msg}
+  const [busy, setBusy] = useState(false);
+
+  const send = async () => {
+    const p = phone.trim();
+    if (!p) { setStatus({ ok: false, msg: "请输入手机号码。" }); return; }
+    setBusy(true); setStatus(null);
+    try {
+      const r = await fetch("/api/send-to-phone", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ doc_id: doc.id, phone: p }),
+      });
+      const data = await r.json();
+      if (data.ok) {
+        localStorage.setItem("pms_last_phone", p);
+        setStatus({ ok: true, msg: `已通过 Messages 发送至 ${p}` });
+      } else {
+        setStatus({ ok: false, msg: data.error || "发送失败。" });
+      }
+    } catch (e) {
+      setStatus({ ok: false, msg: "网络错误：" + e.message });
+    } finally { setBusy(false); }
+  };
+
+  return (
+    <div className="fixed inset-0 bg-stone-900/60 z-50 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-white rounded shadow-2xl w-full max-w-sm p-5" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-2 text-stone-800">
+            <Phone size={15} className="text-amber-600" />
+            <span className="text-sm font-semibold">发送至手机</span>
+          </div>
+          <button onClick={onClose} className="text-stone-400 hover:text-stone-700"><X size={15} /></button>
+        </div>
+        <div className="text-xs text-stone-500 mb-3 truncate" title={doc.name}>{doc.name}</div>
+        <label className="block text-[10px] uppercase tracking-wider text-stone-600 mb-1">手机号码</label>
+        <input
+          autoFocus
+          type="tel"
+          value={phone}
+          onChange={(e) => setPhone(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") send(); if (e.key === "Escape") onClose(); }}
+          placeholder="+1 555 123 4567"
+          className="w-full px-3 py-2 border border-stone-300 rounded text-sm focus:outline-none focus:border-amber-500 mb-3"
+        />
+        {status && (
+          <div className={`text-xs rounded px-3 py-2 mb-3 ${status.ok ? "bg-green-50 text-green-800 border border-green-200" : "bg-red-50 text-red-700 border border-red-200"}`}>
+            {status.msg}
+          </div>
+        )}
+        <div className="text-[10px] text-stone-400 mb-3">
+          通过 Mac「信息」App 以 iMessage 或短信发送下载链接。手机须与此 Mac 在同一 Wi-Fi 网络内。
+        </div>
+        <div className="flex gap-2">
+          <button onClick={onClose} className="flex-1 px-3 py-1.5 text-xs border border-stone-300 hover:bg-stone-100 rounded">取消</button>
+          <button
+            onClick={send}
+            disabled={busy}
+            className="flex-1 px-3 py-1.5 text-xs bg-amber-600 hover:bg-amber-700 text-white rounded disabled:opacity-50 flex items-center justify-center gap-1.5"
+          >
+            <Phone size={11} /> {busy ? "发送中…" : "发送链接"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const SendEmailDialog = ({ doc, onClose, onOpenEmailSettings }) => {
+  const savedTo = typeof localStorage !== "undefined" ? localStorage.getItem("pms_last_email") || "" : "";
+  const [to, setTo] = useState(savedTo);
+  const [subject, setSubject] = useState(doc?.name || "");
+  const [body, setBody] = useState("");
+  const [status, setStatus] = useState(null); // null | {ok, msg}
+  const [busy, setBusy] = useState(false);
+  const [smtpConfigured, setSmtpConfigured] = useState(null); // null=loading, true/false
+  const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform);
+
+  useEffect(() => {
+    fetch("/api/email-settings")
+      .then((r) => r.json())
+      .then((d) => setSmtpConfigured(!!d.configured))
+      .catch(() => setSmtpConfigured(false));
+  }, []);
+
+  const send = async () => {
+    const addr = to.trim();
+    if (!addr) { setStatus({ ok: false, msg: "请输入收件人邮箱地址。" }); return; }
+    if (!addr.includes("@")) { setStatus({ ok: false, msg: "邮箱地址格式不正确。" }); return; }
+    setBusy(true); setStatus(null);
+    try {
+      const r = await fetch("/api/send-email", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ doc_id: doc.id, to: addr, subject: subject.trim(), body: body.trim() }),
+      });
+      const data = await r.json();
+      if (data.ok) {
+        localStorage.setItem("pms_last_email", addr);
+        const successMsg = data.method === "smtp"
+          ? "邮件已成功发送。"
+          : "已在 Mail 应用中打开新邮件，请检查并发送。";
+        setStatus({ ok: true, msg: successMsg });
+      } else {
+        setStatus({ ok: false, msg: data.error || "发送失败。" });
+      }
+    } catch (e) {
+      setStatus({ ok: false, msg: "网络错误：" + e.message });
+    } finally { setBusy(false); }
+  };
+
+  const methodNote = smtpConfigured === null
+    ? "正在检查邮件设置…"
+    : smtpConfigured
+      ? "邮件将通过 SMTP 直接发送至收件人。"
+      : isMac
+        ? "未配置 SMTP，将在 Mail 应用中打开一封带附件的新邮件，您可以检查后手动发送。"
+        : "未配置 SMTP 邮件设置，无法在 Windows 上发送邮件。";
+
+  const buttonLabel = smtpConfigured
+    ? (busy ? "正在发送…" : "发送邮件")
+    : (busy ? "正在准备…" : isMac ? "通过 Mail App 准备" : "发送邮件");
+
+  return (
+    <div className="fixed inset-0 bg-stone-900/60 z-50 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-white rounded shadow-2xl w-full max-w-sm p-5" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-2 text-stone-800">
+            <Mail size={15} className="text-amber-600" />
+            <span className="text-sm font-semibold">通过邮件发送</span>
+          </div>
+          <button onClick={onClose} className="text-stone-400 hover:text-stone-700"><X size={15} /></button>
+        </div>
+        <div className="text-xs text-stone-500 mb-3 truncate" title={doc.name}>{doc.name}</div>
+
+        <label className="block text-[10px] uppercase tracking-wider text-stone-600 mb-1">收件人</label>
+        <input
+          autoFocus
+          type="email"
+          value={to}
+          onChange={(e) => setTo(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") send(); if (e.key === "Escape") onClose(); }}
+          placeholder="example@email.com"
+          className="w-full px-3 py-2 border border-stone-300 rounded text-sm focus:outline-none focus:border-amber-500 mb-2"
+        />
+
+        <label className="block text-[10px] uppercase tracking-wider text-stone-600 mb-1">主题</label>
+        <input
+          type="text"
+          value={subject}
+          onChange={(e) => setSubject(e.target.value)}
+          placeholder="邮件主题"
+          className="w-full px-3 py-2 border border-stone-300 rounded text-sm focus:outline-none focus:border-amber-500 mb-2"
+        />
+
+        <label className="block text-[10px] uppercase tracking-wider text-stone-600 mb-1">正文（可选）</label>
+        <textarea
+          value={body}
+          onChange={(e) => setBody(e.target.value)}
+          placeholder="请见附件。"
+          rows={2}
+          className="w-full px-3 py-2 border border-stone-300 rounded text-sm focus:outline-none focus:border-amber-500 mb-3 resize-none"
+        />
+
+        {status && (
+          <div className={`text-xs rounded px-3 py-2 mb-3 ${status.ok ? "bg-green-50 text-green-800 border border-green-200" : "bg-red-50 text-red-700 border border-red-200"}`}>
+            {status.msg}
+          </div>
+        )}
+        <div className="text-[10px] text-stone-400 mb-3 flex items-center justify-between gap-2">
+          <span>{methodNote}</span>
+          {!smtpConfigured && onOpenEmailSettings && (
+            <button
+              onClick={() => { onClose(); onOpenEmailSettings(); }}
+              className="text-amber-600 hover:underline whitespace-nowrap"
+            >
+              配置 SMTP
+            </button>
+          )}
+        </div>
+        <div className="flex gap-2">
+          <button onClick={onClose} className="flex-1 px-3 py-1.5 text-xs border border-stone-300 hover:bg-stone-100 rounded">取消</button>
+          <button
+            onClick={send}
+            disabled={busy || (!smtpConfigured && !isMac)}
+            className="flex-1 px-3 py-1.5 text-xs bg-amber-600 hover:bg-amber-700 text-white rounded disabled:opacity-50 flex items-center justify-center gap-1.5"
+          >
+            <Mail size={11} /> {buttonLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const EmailSettingsDialog = ({ onClose }) => {
+  const [settings, setSettings] = useState({
+    smtp_host: "", smtp_port: 587, smtp_user: "", smtp_pass: "",
+    email_from: "", email_ssl: false,
+  });
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [status, setStatus] = useState(null); // null | {ok, msg}
+
+  useEffect(() => {
+    fetch("/api/email-settings")
+      .then((r) => r.json())
+      .then((d) => {
+        setSettings({
+          smtp_host: d.smtp_host || "",
+          smtp_port: d.smtp_port || 587,
+          smtp_user: d.smtp_user || "",
+          smtp_pass: "",
+          email_from: d.email_from || "",
+          email_ssl: d.email_ssl || false,
+        });
+        setLoading(false);
+      })
+      .catch(() => setLoading(false));
+  }, []);
+
+  const save = async () => {
+    setSaving(true); setStatus(null);
+    try {
+      const r = await fetch("/api/email-settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(settings),
+      });
+      const d = await r.json();
+      setStatus({ ok: !!d.ok, msg: d.ok ? "设置已保存。" : (d.error || "保存失败。") });
+    } catch (e) {
+      setStatus({ ok: false, msg: "网络错误：" + e.message });
+    } finally { setSaving(false); }
+  };
+
+  const test = async () => {
+    setTesting(true); setStatus(null);
+    try {
+      const r = await fetch("/api/email-settings/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(settings),
+      });
+      const d = await r.json();
+      setStatus({
+        ok: !!d.ok,
+        msg: d.ok
+          ? `测试邮件已发送至 ${settings.smtp_user}，请检查收件箱。`
+          : (d.error || "测试失败。"),
+      });
+    } catch (e) {
+      setStatus({ ok: false, msg: "网络错误：" + e.message });
+    } finally { setTesting(false); }
+  };
+
+  const presets = {
+    Gmail:   { smtp_host: "smtp.gmail.com",         smtp_port: 587, email_ssl: false },
+    Yahoo:   { smtp_host: "smtp.mail.yahoo.com",    smtp_port: 587, email_ssl: false },
+    Outlook: { smtp_host: "smtp.office365.com",     smtp_port: 587, email_ssl: false },
+    iCloud:  { smtp_host: "smtp.mail.me.com",       smtp_port: 587, email_ssl: false },
+    QQ邮箱:  { smtp_host: "smtp.qq.com",            smtp_port: 587, email_ssl: false },
+    网易163: { smtp_host: "smtp.163.com",           smtp_port: 465, email_ssl: true  },
+  };
+
+  const set = (key, val) => setSettings((s) => ({ ...s, [key]: val }));
+
+  return (
+    <div className="fixed inset-0 bg-stone-900/70 z-50 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-white w-full max-w-md rounded shadow-2xl p-5" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-2">
+            <Mail size={15} className="text-amber-600" />
+            <span className="text-sm font-semibold text-stone-900">邮件发送设置（SMTP）</span>
+          </div>
+          <button onClick={onClose} className="text-stone-400 hover:text-stone-700"><X size={15} /></button>
+        </div>
+
+        <div className="mb-3">
+          <div className="text-[10px] uppercase tracking-wider text-stone-500 mb-1.5">快速选择邮件服务商</div>
+          <div className="flex flex-wrap gap-1.5">
+            {Object.entries(presets).map(([name, preset]) => (
+              <button
+                key={name}
+                onClick={() => setSettings((s) => ({ ...s, ...preset }))}
+                className="px-2.5 py-1 text-xs border border-stone-300 rounded hover:bg-amber-50 hover:border-amber-400 text-stone-700"
+              >
+                {name}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {loading ? (
+          <div className="text-center text-stone-400 text-sm py-4">加载中…</div>
+        ) : (
+          <>
+            <div className="grid grid-cols-2 gap-2 mb-2">
+              <div>
+                <label className="block text-[10px] uppercase tracking-wider text-stone-600 mb-1">SMTP 服务器</label>
+                <input
+                  type="text"
+                  value={settings.smtp_host}
+                  onChange={(e) => set("smtp_host", e.target.value)}
+                  placeholder="smtp.gmail.com"
+                  className="w-full px-2 py-1.5 text-sm border border-stone-300 rounded focus:outline-none focus:border-amber-500"
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] uppercase tracking-wider text-stone-600 mb-1">端口</label>
+                <input
+                  type="number"
+                  value={settings.smtp_port}
+                  onChange={(e) => set("smtp_port", parseInt(e.target.value) || 587)}
+                  className="w-full px-2 py-1.5 text-sm border border-stone-300 rounded focus:outline-none focus:border-amber-500"
+                />
+              </div>
+            </div>
+
+            <label className="flex items-center gap-2 text-xs text-stone-700 mb-3 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={settings.email_ssl}
+                onChange={(e) => {
+                  const ssl = e.target.checked;
+                  setSettings((s) => ({ ...s, email_ssl: ssl, smtp_port: ssl ? 465 : 587 }));
+                }}
+              />
+              使用 SSL/TLS（端口 465）；不勾选则使用 STARTTLS（端口 587）
+            </label>
+
+            <label className="block text-[10px] uppercase tracking-wider text-stone-600 mb-1">用户名（邮箱地址）</label>
+            <input
+              type="email"
+              value={settings.smtp_user}
+              onChange={(e) => set("smtp_user", e.target.value)}
+              placeholder="you@gmail.com"
+              className="w-full px-2 py-1.5 text-sm border border-stone-300 rounded focus:outline-none focus:border-amber-500 mb-2"
+            />
+
+            <label className="block text-[10px] uppercase tracking-wider text-stone-600 mb-1">
+              密码{" "}
+              <span className="text-stone-400 normal-case tracking-normal">
+                （Gmail 需使用"应用专用密码"；留空则保持原密码不变）
+              </span>
+            </label>
+            <input
+              type="password"
+              value={settings.smtp_pass}
+              onChange={(e) => set("smtp_pass", e.target.value)}
+              placeholder="留空则不更改现有密码"
+              className="w-full px-2 py-1.5 text-sm border border-stone-300 rounded focus:outline-none focus:border-amber-500 mb-2"
+            />
+
+            <label className="block text-[10px] uppercase tracking-wider text-stone-600 mb-1">
+              发件人地址{" "}
+              <span className="text-stone-400 normal-case tracking-normal">（可选，默认与用户名相同）</span>
+            </label>
+            <input
+              type="email"
+              value={settings.email_from}
+              onChange={(e) => set("email_from", e.target.value)}
+              placeholder="可选"
+              className="w-full px-2 py-1.5 text-sm border border-stone-300 rounded focus:outline-none focus:border-amber-500 mb-3"
+            />
+          </>
+        )}
+
+        {status && (
+          <div className={`text-xs rounded px-3 py-2 mb-3 ${status.ok ? "bg-green-50 text-green-800 border border-green-200" : "bg-red-50 text-red-700 border border-red-200"}`}>
+            {status.msg}
+          </div>
+        )}
+
+        <div className="flex gap-2 flex-wrap">
+          <button onClick={onClose} className="px-3 py-1.5 text-xs border border-stone-300 hover:bg-stone-100 rounded">关闭</button>
+          <a
+            href="/api/download-smtp-guide"
+            download
+            className="px-3 py-1.5 text-xs border border-stone-300 hover:bg-stone-50 text-stone-600 rounded flex items-center gap-1"
+          >
+            下载设置指南 (.docx)
+          </a>
+          <button
+            onClick={test}
+            disabled={testing || saving || !settings.smtp_host || !settings.smtp_user}
+            className="px-3 py-1.5 text-xs border border-amber-300 text-amber-800 bg-amber-50 hover:bg-amber-100 rounded disabled:opacity-40"
+          >
+            {testing ? "测试中…" : "发送测试邮件"}
+          </button>
+          <button
+            onClick={save}
+            disabled={saving || loading}
+            className="flex-1 px-3 py-1.5 text-xs bg-amber-600 hover:bg-amber-700 text-white rounded disabled:opacity-40"
+          >
+            {saving ? "保存中…" : "保存设置"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 const DocumentCard = ({
   doc, otherRefCount = 0, nodeSn = "",
   onOpen, onDelete, onUpdateMeta, onUpdateSn, formatBytes, keyParameters = [],
+  onOpenEmailSettings,
 }) => {
   const [showMeta, setShowMeta] = useState(() => Object.keys(doc.metadata || {}).length > 0);
   const [editingSn, setEditingSn] = useState(false);
   const [snDraft, setSnDraft] = useState("");
+  const [showSendPhone, setShowSendPhone] = useState(false);
+  const [showSendEmail, setShowSendEmail] = useState(false);
   const isImage = doc.mime?.startsWith("image/");
   const Icon = isImage ? ImageIcon : FileText;
 
@@ -2824,6 +3312,20 @@ const DocumentCard = ({
           <Tag size={11} /> {Object.keys(doc.metadata || {}).length || ""}
         </button>
         <button
+          onClick={() => setShowSendPhone(true)}
+          className="text-stone-400 hover:text-amber-600 p-1"
+          title="发送至手机（iMessage / 短信）"
+        >
+          <Phone size={14} />
+        </button>
+        <button
+          onClick={() => setShowSendEmail(true)}
+          className="text-stone-400 hover:text-amber-600 p-1"
+          title="通过邮件发送（附件）"
+        >
+          <Mail size={14} />
+        </button>
+        <button
           onClick={onDelete}
           className="text-stone-400 hover:text-red-600 p-1"
           title={
@@ -2835,6 +3337,9 @@ const DocumentCard = ({
           <Trash2 size={14} />
         </button>
       </div>
+
+      {showSendPhone && <SendToPhoneDialog doc={doc} onClose={() => setShowSendPhone(false)} />}
+      {showSendEmail && <SendEmailDialog doc={doc} onClose={() => setShowSendEmail(false)} onOpenEmailSettings={onOpenEmailSettings} />}
 
       {/* SN editor row */}
       {editingSn && (
@@ -2921,7 +3426,23 @@ const SettingsScreen = ({ initialPath, currentPath, isInitialSetup, onSaved, onC
     try {
       const trimmed = pathValue.trim();
       if (!trimmed) throw new Error("请输入路径。");
-      const r = await StorageAdapter.saveSettings(trimmed);
+
+      let copyCurrentData = false;
+      if (!isInitialSetup) {
+        const check = await StorageAdapter.checkStoragePath(trimmed);
+        if (check.has_data) {
+          const ok = window.confirm(
+            `该文件夹已存在 DMS 数据（${check.doc_count} 份文档）。\n\n` +
+            `切换后将显示该文件夹中的内容，当前工作内容不会丢失（仍保存在原文件夹）。\n\n` +
+            `是否继续切换？`
+          );
+          if (!ok) { setBusy(false); return; }
+        } else {
+          copyCurrentData = true;
+        }
+      }
+
+      const r = await StorageAdapter.saveSettings(trimmed, copyCurrentData);
       onSaved(r.resolved_path);
     } catch (e) {
       setError(e.message);
@@ -3350,10 +3871,17 @@ const HierarchyImportDialog = ({ open, onClose, onImported }) => {
     if (!file) return;
     const reader = new FileReader();
     reader.onload = (e) => {
-      setText(e.target.result);
+      const buf = e.target.result;
+      let decoded;
+      try {
+        decoded = new TextDecoder('utf-8', { fatal: true }).decode(buf);
+      } catch {
+        decoded = new TextDecoder('gbk').decode(buf);
+      }
+      setText(decoded);
       setErrors([]); setPreview(null); setResult(null);
     };
-    reader.readAsText(file);
+    reader.readAsArrayBuffer(file);
   };
 
   const handleDrop = (e) => {
@@ -3458,10 +3986,11 @@ const HierarchyImportDialog = ({ open, onClose, onImported }) => {
             </label>
             <textarea
               className="w-full h-36 text-xs font-mono border border-stone-300 rounded px-2.5 py-2 resize-y focus:outline-none focus:border-amber-600"
-              placeholder={"BOP001\nLMRP9#B001 BOP001\nStackBody92 BOP001\nFlexJoint01 LMRP9#B001\nControlPod65 LMRP9#B001\nBlueP01 ControlPod65"}
+              placeholder={"根文件夹\n子文件夹A, 根文件夹\n子文件夹B, 根文件夹\n孙文件夹, 子文件夹A"}
               value={text}
               onChange={(e) => { setText(e.target.value); setErrors([]); setPreview(null); setResult(null); }}
             />
+            <div className="mt-1 text-[10px] text-stone-400">格式：CSV，每行 2–3 列：文件夹名, 父文件夹名, 说明。第一行是根文件夹。</div>
           </div>
 
           {/* Error messages */}
@@ -3530,7 +4059,7 @@ const HierarchyImportDialog = ({ open, onClose, onImported }) => {
   );
 };
 
-const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onOpenHierarchyImport, onOpenZipImport, onTriggerImport }) => {
+const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onOpenHierarchyImport, onOpenZipImport, onTriggerImport, onOpenEmailSettings }) => {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const [importDialog, setImportDialog] = useState(null); // { file, mode, target }
@@ -3793,6 +4322,33 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
               </div>
             </div>
           </button>
+          <button
+            onClick={() => { onOpenEmailSettings?.(); onClose(); }}
+            disabled={busy}
+            className="w-full text-left px-3 py-2 hover:bg-amber-50 flex items-start gap-2 disabled:opacity-50"
+          >
+            <Mail size={14} className="text-stone-600 mt-0.5 shrink-0" />
+            <div>
+              <div className="text-stone-900">邮件发送设置</div>
+              <div className="text-[11px] text-stone-500 mt-0.5">
+                配置 SMTP 服务器，支持直接发送邮件附件（Mac / Windows）
+              </div>
+            </div>
+          </button>
+          <a
+            href="/api/download-user-manual"
+            download
+            onClick={() => onClose()}
+            className="w-full text-left px-3 py-2 hover:bg-amber-50 flex items-start gap-2 block"
+          >
+            <FileText size={14} className="text-stone-600 mt-0.5 shrink-0" />
+            <div>
+              <div className="text-stone-900">下载用户手册 (.docx)</div>
+              <div className="text-[11px] text-stone-500 mt-0.5">
+                完整操作指南，包含所有功能说明与示例
+              </div>
+            </div>
+          </a>
           <div className="border-t border-stone-200 my-1" />
           <button
             onClick={() => setNewDialog({ target: "" })}
@@ -4428,23 +4984,79 @@ function DMS({ storagePath, onChangeFolder }) {
     }
   };
 
+  const isMacDMS = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform);
+
+  const [dmsImportDialog, setDmsImportDialog] = useState(null);
+  // { file, sourcePath, currentPath, chosenPathMode, customPath, mode }
+  // chosenPathMode: "source" | "current" | "custom"
+  const [dmsImportBusy, setDmsImportBusy] = useState(false);
+  const [dmsImportError, setDmsImportError] = useState(null);
+
   const onImportFileChosen = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
     e.target.value = "";
-    if (!window.confirm(`导入 "${file.name}" 并替换当前项目内容？`)) return;
+
+    let sourcePath = "";
+    try {
+      const inspectForm = new FormData();
+      inspectForm.append("file", file);
+      const inspectRes = await fetch("/api/project/inspect-dms", { method: "POST", body: inspectForm });
+      if (inspectRes.ok) {
+        const inspectData = await inspectRes.json();
+        sourcePath = inspectData.source_path || "";
+      }
+    } catch {}
+
+    const currentPath = storagePath || "";
+    const pathsDiffer = sourcePath && sourcePath !== currentPath;
+    setDmsImportError(null);
+    setDmsImportDialog({
+      file,
+      sourcePath,
+      currentPath,
+      chosenPathMode: pathsDiffer ? "source" : "current",
+      customPath: "",
+      mode: "overwrite",
+    });
+  };
+
+  const doImportFromDialog = async () => {
+    if (!dmsImportDialog) return;
+    const { file, sourcePath, currentPath, chosenPathMode, customPath, mode } = dmsImportDialog;
+
+    let targetPath = "";
+    if (chosenPathMode === "source") targetPath = sourcePath;
+    else if (chosenPathMode === "current") targetPath = currentPath;
+    else targetPath = customPath;
+
+    if (!targetPath.trim()) {
+      setDmsImportError("请输入目标路径。");
+      return;
+    }
+
+    setDmsImportBusy(true);
+    setDmsImportError(null);
     try {
       const form = new FormData();
       form.append("file", file);
+      form.append("target_path", targetPath.trim());
+      form.append("mode", mode);
       const res = await fetch("/api/project/import", { method: "POST", body: form });
       const data = await res.json();
       if (data.ok) {
+        setDmsImportDialog(null);
+        try {
+          ["dms:databook-selection", "dms:databook-title", "dms:databook-subtitle"].forEach((k) => localStorage.removeItem(k));
+        } catch {}
         window.location.reload();
       } else {
-        window.alert("导入失败：" + (data.error || "未知错误"));
+        setDmsImportError(data.error || "导入失败。");
       }
     } catch (err) {
-      window.alert("导入失败：" + err.message);
+      setDmsImportError(err.message || "导入失败。");
+    } finally {
+      setDmsImportBusy(false);
     }
   };
 
@@ -4518,6 +5130,7 @@ function DMS({ storagePath, onChangeFolder }) {
   const [showKeyParameters, setShowKeyParameters] = useState(false);
   const [showHierarchyImport, setShowHierarchyImport] = useState(false);
   const [showZipImport, setShowZipImport] = useState(false);
+  const [showEmailSettings, setShowEmailSettings] = useState(false);
   const [showCombineModal, setShowCombineModal] = useState(false);
   const [keyParameters, setKeyParameters] = useState(DEFAULT_KEY_PARAMETERS);
   const ctxUploadInputRef = useRef(null);
@@ -4694,8 +5307,12 @@ function DMS({ storagePath, onChangeFolder }) {
 
   const handleCommitAddChild = async (parentId, name) => {
     const parentNode = findNode(tree, parentId);
-    if ((parentNode?.children || []).some(c => c.name === name)) {
-      alert(`同级节点下已存在名为"${name}"的文件夹。`);
+    const existing = (parentNode?.children || []).find(c => c.name === name);
+    if (existing) {
+      // Folder with this name already exists — navigate to it instead of creating a duplicate.
+      setExpandedIds((prev) => new Set([...prev, parentId]));
+      setAddingChildToId(null);
+      setSelectedId(existing.id);
       return;
     }
     const newNode = { id: genNodeId(), name, description: "", children: [], documents: [] };
@@ -4737,16 +5354,27 @@ function DMS({ storagePath, onChangeFolder }) {
     const childCount = (target.children || []).length;
     const docCount = collectAllDocIds(target).length;
     const detail = childCount || docCount
-      ? `\n\n此操作将删除该节点下的 ${childCount} 个子节点及 ${docCount} 个文档链接。未在其他位置链接的文档将移至"未引用"列表（文件保留在磁盘上）。`
-      : "";
-    if (!confirm(`确定删除"${target.name}"？${detail}\n\n此操作无法撤销。`)) return;
+      ? `\n\n该文件夹包含 ${childCount} 个子文件夹、${docCount} 个文档。\n该文件夹及其下所有子文件夹和文件将从硬盘永久删除，无法恢复。`
+      : "\n\n该文件夹及其在硬盘上对应的目录将被永久删除。";
+    if (!confirm(`确定删除文件夹"${target.name}"？${detail}\n\n此操作无法撤销。`)) return;
 
-    // Just remove the subtree. Links die with their nodes, but the actual
-    // files and the docIndex stay intact — orphaned documents become
-    // "unreferenced" and are still searchable / re-linkable.
-    const newTree = removeNodeFromTree(tree, nodeId);
-    await persistTree(newTree);
-    if (selectedId === nodeId) setSelectedId(tree.id);
+    try {
+      const res = await fetch(`/api/nodes/${nodeId}`, { method: "DELETE" });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        alert("删除失败：" + (err.error || res.status));
+        return;
+      }
+    } catch (e) {
+      alert("删除失败：" + e.message);
+      return;
+    }
+    // Reload tree and index from server after server-side deletion.
+    const { tree: freshTree } = await StorageAdapter.getTree();
+    const freshIndex = await StorageAdapter.listDocumentIndex();
+    setTree(freshTree);
+    setDocIndex(freshIndex);
+    if (selectedId === nodeId) setSelectedId(freshTree?.id);
   };
 
   const handleMoveNode = async (nodeId, direction) => {
@@ -4787,6 +5415,36 @@ function DMS({ storagePath, onChangeFolder }) {
     const info = dropInfoRef.current;
     handleDragEnd();
     if (!dragId || !info) return;
+
+    // When dropping "into" a target, check for a same-named sibling and merge
+    if (info.position === "into") {
+      const dragged = findNode(tree, dragId);
+      const target = findNode(tree, info.targetId);
+      if (dragged && target) {
+        const conflict = (target.children || []).find(
+          (c) => c.name === dragged.name && c.id !== dragId
+        );
+        if (conflict) {
+          const { mergedNode, docRemap } = mergeNodesDeep(conflict, dragged);
+          let next = removeNodeFromTree(tree, dragId);
+          next = updateNodeInTree(next, conflict.id, () => mergedNode);
+
+          // Update originalNodeId in docIndex for all moved docs BEFORE saving
+          // the tree, so the server's _sync_doc_files_to_tree_paths sees the
+          // correct node IDs when it moves the files on disk.
+          if (docRemap.size > 0) {
+            const newDocIndex = docIndex.map((e) =>
+              docRemap.has(e.id) ? { ...e, originalNodeId: docRemap.get(e.id) } : e
+            );
+            await persistIndex(newDocIndex);
+          }
+          await persistTree(next);
+          setSelectedId(conflict.id);
+          return;
+        }
+      }
+    }
+
     const newTree = moveNodeToPosition(tree, dragId, info.targetId, info.position);
     await persistTree(newTree);
     setSelectedId(dragId);
@@ -5041,6 +5699,24 @@ function DMS({ storagePath, onChangeFolder }) {
     e.target.value = "";
   };
 
+  const handlePanelDragOver = (e) => {
+    if (e.dataTransfer.types.includes('Files')) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+    }
+  };
+
+  const handlePanelDrop = (e) => {
+    if (e.dataTransfer.files.length !== 0) {
+      e.preventDefault();
+      if (!selectedId) {
+        alert("请先在左侧目录树中点击选择一个文件夹，再拖入文件。");
+        return;
+      }
+      uploadFilesToNode(selectedId, Array.from(e.dataTransfer.files), { routeMode: "current-folder" });
+    }
+  };
+
   const openDoc = async (docId) => {
     const doc = await StorageAdapter.getDocument(docId);
     if (doc) setViewerDoc(doc);
@@ -5083,26 +5759,72 @@ function DMS({ storagePath, onChangeFolder }) {
   // Remove a link from a single node. If that was the last reference, the
   // document stays in docIndex (and on disk) as "unreferenced" — the user's
   // chosen behavior. They can re-link it later via the picker.
+  const NOT_SHOW_FOLDER = "Not Show in Tree";
+
+  // Find or create the "Not Show in Tree" folder directly under root.
+  const getOrCreateNotShowNode = (currentTree) => {
+    const existing = (currentTree.children || []).find(c => c.name === NOT_SHOW_FOLDER);
+    if (existing) return [currentTree, existing.id];
+    const newId = genNodeId();
+    const newNode = { id: newId, name: NOT_SHOW_FOLDER, children: [], documents: [] };
+    const updated = { ...currentTree, children: [...(currentTree.children || []), newNode] };
+    return [updated, newId];
+  };
+
   const unlinkDocFromNode = async (docId, nodeId) => {
+    // If deleting from "Not Show in Tree", permanently delete from disk.
+    const notShowNode = (tree.children || []).find(c => c.name === NOT_SHOW_FOLDER);
+    if (notShowNode && notShowNode.id === nodeId) {
+      if (!confirm(`此文档已在"${NOT_SHOW_FOLDER}"文件夹中。\n\n确定从磁盘永久删除？此操作无法撤销。`)) return;
+      await StorageAdapter.deleteDocument(docId);
+      const { tree: freshTree } = await StorageAdapter.getTree();
+      const freshIndex = await StorageAdapter.listDocumentIndex();
+      setTree(freshTree);
+      setDocIndex(freshIndex);
+      return;
+    }
+
     const refs = refMap.get(docId) || [];
     const otherRefs = refs.filter((id) => id !== nodeId);
     let confirmMsg;
     if (otherRefs.length === 0) {
       confirmMsg =
-        "此文档仅在此处链接。\n\n" +
-        "移除链接后，文档将移至\"未引用\"列表。" +
-        "它仍保留在文件库中，之后可重新链接到任意节点。" +
-        "文件不会从磁盘上删除。\n\n确定继续？";
+        `确定从此文件夹移除此文档？\n\n` +
+        `文档将被移至根目录下的"${NOT_SHOW_FOLDER}"文件夹，文件保留在磁盘上。`;
     } else {
-      confirmMsg = `确定从此节点移除此文档的链接？\n\n它仍将链接至其他 ${otherRefs.length} 个节点。`;
+      confirmMsg = `确定从此文件夹移除此文档的链接？\n\n该文档仍链接至其他 ${otherRefs.length} 个文件夹，文件不会从磁盘删除。`;
     }
     if (!confirm(confirmMsg)) return;
 
-    const newTree = updateNodeInTree(tree, nodeId, (n) => ({
+    // Remove from current node.
+    let workingTree = updateNodeInTree(tree, nodeId, (n) => ({
       ...n,
       documents: (n.documents || []).filter((d) => d.id !== docId),
     }));
-    await persistTree(newTree);
+
+    let updatedIndex = docIndex;
+    if (otherRefs.length === 0) {
+      // Last reference — move to "Not Show in Tree" instead of leaving orphaned.
+      let notShowId;
+      [workingTree, notShowId] = getOrCreateNotShowNode(workingTree);
+      workingTree = updateNodeInTree(workingTree, notShowId, (n) => ({
+        ...n,
+        documents: [...(n.documents || []), { id: docId }],
+      }));
+      // Update originalNodeId so the server moves the physical file to the "Not Show in Tree" folder.
+      updatedIndex = docIndex.map((e) =>
+        e.id === docId ? { ...e, originalNodeId: notShowId } : e
+      );
+      // Save docIndex first so the server's file-sync reads the updated originalNodeId.
+      await StorageAdapter.saveDocumentIndex(updatedIndex);
+    }
+
+    await StorageAdapter.saveTree(workingTree);
+    // Reload from server to ensure UI reflects the saved state.
+    const { tree: freshTree } = await StorageAdapter.getTree();
+    const freshIndex = await StorageAdapter.listDocumentIndex();
+    setTree(freshTree);
+    setDocIndex(freshIndex);
   };
 
   // Hard delete: removes file from disk AND removes all references from the tree.
@@ -5214,7 +5936,11 @@ function DMS({ storagePath, onChangeFolder }) {
   }
 
   return (
-    <div className="h-screen flex flex-col bg-stone-50 text-stone-900">
+    <div
+      className="h-screen flex flex-col bg-stone-50 text-stone-900"
+      onDragOver={(e) => { if (e.dataTransfer.types.includes('Files')) e.preventDefault(); }}
+      onDrop={(e) => { if (e.dataTransfer.files.length !== 0) e.preventDefault(); }}
+    >
       {uploadStatus && (
         <div className="fixed top-0 left-0 right-0 z-50 bg-amber-600 text-white text-xs px-4 py-2 flex items-center gap-3 shadow-md">
           <svg className="animate-spin h-3.5 w-3.5 shrink-0" viewBox="0 0 24 24" fill="none">
@@ -5284,6 +6010,7 @@ function DMS({ storagePath, onChangeFolder }) {
               onOpenKeyParameters={() => setShowKeyParameters(true)}
               onOpenHierarchyImport={() => setShowHierarchyImport(true)}
               onOpenZipImport={() => setShowZipImport(true)}
+              onOpenEmailSettings={() => setShowEmailSettings(true)}
             />
           </div>
           <button
@@ -5419,6 +6146,11 @@ function DMS({ storagePath, onChangeFolder }) {
                       onMoveNode={handleMoveNode}
                       onContextMenu={(x, y, nodeId) => setContextMenu({ x, y, nodeId })}
                       onUploadToNode={handleTreeUpload}
+                      onFileDrop={(nodeId, files) => {
+                        setSelectedId(nodeId);
+                        setExpandedIds((prev) => new Set([...prev, nodeId]));
+                        uploadFilesToNode(nodeId, Array.from(files), { routeMode: "current-folder" });
+                      }}
                       draggingId={draggingId}
                       dropInfo={dropInfo}
                       onDragStart={handleDragStart}
@@ -5471,7 +6203,7 @@ function DMS({ storagePath, onChangeFolder }) {
           </>
         )}
 
-        <main className="flex-1 overflow-auto">
+        <main className="flex-1 overflow-auto" onDragOver={handlePanelDragOver} onDrop={handlePanelDrop}>
           {selectedNode ? (
             <div className="max-w-4xl mx-auto p-6">
               <div className="text-[11px] text-stone-500 mb-3 font-mono">{getNodePath(selectedId)}</div>
@@ -5609,6 +6341,7 @@ function DMS({ storagePath, onChangeFolder }) {
                         onUpdateSn={(newSn) => updateDocSn(doc.id, newSn)}
                         keyParameters={keyParameters}
                         formatBytes={formatBytes}
+                        onOpenEmailSettings={() => setShowEmailSettings(true)}
                       />
                     );
                   })}
@@ -5756,6 +6489,10 @@ function DMS({ storagePath, onChangeFolder }) {
         }}
       />
 
+      {showEmailSettings && (
+        <EmailSettingsDialog onClose={() => setShowEmailSettings(false)} />
+      )}
+
       {contextMenu && (() => {
         const ctxNode = findNode(tree, contextMenu.nodeId);
         const ctxName = ctxNode?.name || "";
@@ -5875,6 +6612,123 @@ function DMS({ storagePath, onChangeFolder }) {
             setDocIndex(idx);
           }}
         />
+      )}
+
+      {dmsImportDialog && (
+        <div
+          className="fixed inset-0 bg-stone-900/70 z-50 flex items-center justify-center p-4"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="bg-white w-full max-w-md rounded shadow-2xl p-5">
+            <div className="text-[10px] tracking-[0.2em] uppercase text-stone-500 mb-1">
+              导入项目
+            </div>
+            <h2 className="text-lg font-semibold text-stone-900 mb-2">
+              请选择文件保存位置
+            </h2>
+            <p className="text-xs text-stone-600 mb-4">
+              正在导入 <strong className="font-mono">{dmsImportDialog.file.name}</strong>
+              （{Math.round(dmsImportDialog.file.size / 1024)} KB）
+            </p>
+
+            <div className="space-y-3 mb-4">
+              {dmsImportDialog.sourcePath && dmsImportDialog.sourcePath !== dmsImportDialog.currentPath && (
+                <label className="flex items-start gap-2.5 cursor-pointer p-2.5 rounded border border-transparent hover:bg-stone-50 hover:border-stone-200">
+                  <input
+                    type="radio"
+                    name="dmsPathMode"
+                    value="source"
+                    checked={dmsImportDialog.chosenPathMode === "source"}
+                    onChange={() => setDmsImportDialog({ ...dmsImportDialog, chosenPathMode: "source" })}
+                    className="mt-0.5 accent-amber-600"
+                  />
+                  <div>
+                    <div className="text-xs font-medium text-stone-800">使用 .dms 文件中的原始路径</div>
+                    <div className="text-[11px] font-mono text-amber-700 break-all mt-0.5">
+                      {dmsImportDialog.sourcePath}
+                    </div>
+                    <div className="text-[10px] text-stone-400 mt-0.5">还原此项目至其原来保存的位置</div>
+                  </div>
+                </label>
+              )}
+
+              <label className="flex items-start gap-2.5 cursor-pointer p-2.5 rounded border border-transparent hover:bg-stone-50 hover:border-stone-200">
+                <input
+                  type="radio"
+                  name="dmsPathMode"
+                  value="current"
+                  checked={dmsImportDialog.chosenPathMode === "current"}
+                  onChange={() => setDmsImportDialog({ ...dmsImportDialog, chosenPathMode: "current" })}
+                  className="mt-0.5 accent-amber-600"
+                />
+                <div>
+                  <div className="text-xs font-medium text-stone-800">
+                    {dmsImportDialog.sourcePath && dmsImportDialog.sourcePath !== dmsImportDialog.currentPath
+                      ? "保留当前路径" : "保存到当前路径"}
+                  </div>
+                  <div className="text-[11px] font-mono text-stone-500 break-all mt-0.5">
+                    {dmsImportDialog.currentPath || "（未配置）"}
+                  </div>
+                </div>
+              </label>
+
+              <label className="flex items-start gap-2.5 cursor-pointer p-2.5 rounded border border-transparent hover:bg-stone-50 hover:border-stone-200">
+                <input
+                  type="radio"
+                  name="dmsPathMode"
+                  value="custom"
+                  checked={dmsImportDialog.chosenPathMode === "custom"}
+                  onChange={() => setDmsImportDialog({ ...dmsImportDialog, chosenPathMode: "custom" })}
+                  className="mt-0.5 accent-amber-600"
+                />
+                <div className="flex-1 min-w-0">
+                  <div className="text-xs font-medium text-stone-800 mb-1">自定义路径</div>
+                  <input
+                    type="text"
+                    placeholder={isMacDMS ? "/Users/yourname/DMS_Imported" : "C:\\DMS_Imported"}
+                    value={dmsImportDialog.customPath}
+                    onClick={() => setDmsImportDialog({ ...dmsImportDialog, chosenPathMode: "custom" })}
+                    onChange={(e) => setDmsImportDialog({ ...dmsImportDialog, chosenPathMode: "custom", customPath: e.target.value })}
+                    className="w-full px-2 py-1 text-xs border border-stone-300 rounded font-mono focus:outline-none focus:border-amber-500"
+                  />
+                </div>
+              </label>
+            </div>
+
+            <label className="flex items-center gap-2 text-xs text-stone-700 mb-4">
+              <input
+                type="checkbox"
+                checked={dmsImportDialog.mode === "overwrite"}
+                onChange={(e) => setDmsImportDialog({ ...dmsImportDialog, mode: e.target.checked ? "overwrite" : "new" })}
+              />
+              如目标文件夹非空则覆盖
+              <span className="text-stone-400">（将删除现有内容）</span>
+            </label>
+
+            {dmsImportError && (
+              <div className="text-xs text-red-700 bg-red-50 border border-red-200 rounded p-2 mb-3 whitespace-pre-wrap">
+                {dmsImportError}
+              </div>
+            )}
+
+            <div className="flex gap-2 justify-end">
+              <button
+                onClick={() => { setDmsImportDialog(null); setDmsImportError(null); }}
+                disabled={dmsImportBusy}
+                className="px-4 py-1.5 text-xs border border-stone-300 hover:bg-stone-100 rounded disabled:opacity-60"
+              >
+                取消
+              </button>
+              <button
+                onClick={doImportFromDialog}
+                disabled={dmsImportBusy || (dmsImportDialog.chosenPathMode === "custom" && !dmsImportDialog.customPath.trim())}
+                className="px-4 py-1.5 text-xs bg-amber-600 hover:bg-amber-700 text-white rounded disabled:opacity-60"
+              >
+                {dmsImportBusy ? "导入中…" : "导入并切换"}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

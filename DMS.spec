@@ -1,9 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_all
 from PyInstaller.utils.hooks import copy_metadata
 
 datas = [('dms.html', '.')]
-hiddenimports = ['tkinter', 'tkinter.ttk', 'tkinter.scrolledtext', 'tkinter.font', 'tkinter.messagebox', 'flask', 'dms_server', 'databook', 'pdf_extraction', '_dms_trial']
+binaries = []
+hiddenimports = ['pillow_heif', 'fitz', 'qrcode', 'pyngrok', 'pyngrok.ngrok', 'pyngrok.conf', 'tkinter', 'tkinter.ttk', 'tkinter.scrolledtext', 'tkinter.font', 'tkinter.messagebox', 'flask', 'dms_server', 'databook', 'pdf_extraction', '_dms_trial']
 datas += copy_metadata('Pillow')
 hiddenimports += collect_submodules('tkinter')
 hiddenimports += collect_submodules('tkinter.ttk')
@@ -20,12 +22,18 @@ hiddenimports += collect_submodules('waitress')
 hiddenimports += collect_submodules('pypdf')
 hiddenimports += collect_submodules('reportlab')
 hiddenimports += collect_submodules('PIL')
+hiddenimports += collect_submodules('pillow_heif')
+hiddenimports += collect_submodules('fitz')
+hiddenimports += collect_submodules('qrcode')
+hiddenimports += collect_submodules('pyngrok')
+tmp_ret = collect_all('pillow_heif')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
-    ['/Users/david/Desktop/PMS/dms_launcher.py'],
+    ['/Users/david/PMS/dms_launcher.py'],
     pathex=[],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
