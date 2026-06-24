@@ -30,6 +30,7 @@ import mimetypes
 import os
 import secrets
 import shutil
+import stat
 import sys
 import tempfile
 import webbrowser
@@ -173,6 +174,66 @@ def write_index(idx: dict) -> None:
         raise RuntimeError("Storage path is not configured")
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(idx, indent=2))
+
+
+def _get_lan_ip() -> str:
+    """Return the best LAN IP for phone access.
+
+    On macOS, prefers physical Wi-Fi/Ethernet interfaces (en0, en1, en2 …)
+    over VPN tunnels (utun*, ppp*, tun*).  A VPN IP is unreachable from a
+    phone on the same Wi-Fi, so the simple UDP-trick approach is unreliable
+    when a VPN is active.
+    """
+    import subprocess as _sp
+    if sys.platform == "darwin":
+        try:
+            out = _sp.check_output(["ifconfig", "-a"], text=True, stderr=_sp.DEVNULL)
+            physical, all_ips = [], []
+            iface = ""
+            for line in out.splitlines():
+                if line and line[0] not in (" ", "\t"):
+                    iface = line.split(":")[0]
+                elif "inet " in line:
+                    parts = line.split()
+                    try:
+                        ip = parts[parts.index("inet") + 1]
+                    except (ValueError, IndexError):
+                        continue
+                    # Filter by the IP itself, not the whole line (broadcast can contain "127.")
+                    if ip and not ip.startswith("127."):
+                        all_ips.append(ip)
+                        if iface.startswith("en"):   # en0/en1 = Wi-Fi or Ethernet
+                            physical.append(ip)
+            candidates = physical or all_ips
+            if candidates:
+                return candidates[0]
+        except Exception:
+            pass
+    elif sys.platform.startswith("win"):
+        try:
+            out = _sp.check_output(
+                ["powershell", "-Command",
+                 "(Get-NetIPAddress -AddressFamily IPv4 | "
+                 "Where-Object { $_.IPAddress -notmatch '^127\\.' -and "
+                 "$_.PrefixOrigin -ne 'WellKnown' } | "
+                 "Sort-Object InterfaceMetric | "
+                 "Select-Object -First 1).IPAddress"],
+                text=True, stderr=_sp.DEVNULL,
+            ).strip()
+            if out:
+                return out
+        except Exception:
+            pass
+    # Fallback: route-based detection (may return VPN IP)
+    import socket as _sock
+    try:
+        s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
 
 
 def _safe_filename_part(name: str) -> str:
@@ -522,6 +583,18 @@ def _sync_doc_files_to_tree_paths(tree: dict | None) -> None:
     if not docs_dir:
         return
     idx = read_index()
+
+    # Build a single file map (one rglob) so we don't rglob once per document.
+    file_map: dict[str, Path] = {}
+    for f in docs_dir.rglob("*"):
+        if not f.is_file():
+            continue
+        name = f.name
+        sep = name.find("__")
+        key = name[:sep] if sep != -1 else f.stem
+        if key not in file_map:
+            file_map[key] = f
+
     for entry in (idx.get("docIndex") or []):
         doc_id = entry.get("id") or ""
         node_id = entry.get("originalNodeId") or entry.get("nodeId") or ""
@@ -529,12 +602,9 @@ def _sync_doc_files_to_tree_paths(tree: dict | None) -> None:
             continue
         target_dir = _get_node_docs_dir(node_id, tree) or docs_dir
         try:
-            matches = list(docs_dir.rglob(f"{doc_id}__*"))
-            if not matches:
-                matches = list(docs_dir.rglob(f"{doc_id}*"))
-            if not matches:
+            current = file_map.get(doc_id)
+            if not current or not current.exists():
                 continue
-            current = matches[0]
             if current.parent.resolve() == target_dir.resolve():
                 continue
             target_dir.mkdir(parents=True, exist_ok=True)
@@ -550,6 +620,7 @@ def _sync_doc_files_to_tree_paths(tree: dict | None) -> None:
                         break
                     counter += 1
             current.rename(destination)
+            file_map[doc_id] = destination
         except OSError as e:
             print(f"[DMS] Warning: could not move {doc_id} into current folder path: {e}")
 
@@ -918,7 +989,7 @@ def build_tree_order(nodes: dict, root: str) -> list:
 # Flask application
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200 MB per upload
+app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024 * 1024  # 4 GB per upload
 
 
 # Endpoints that don't require authentication (login itself, plus auth status check)
@@ -1037,6 +1108,13 @@ async function doLogin(e) {
 """
 
 
+# ---- Vendor static files (bundled JS/CSS — served locally so app works offline) ----
+@app.route("/vendor/<path:filename>")
+def vendor_static(filename):
+    vendor_dir = SCRIPT_DIR / "vendor"
+    return send_from_directory(vendor_dir, filename)
+
+
 # ---- Static page -----------------------------------------------------------
 @app.route("/")
 def index_page():
@@ -1102,8 +1180,6 @@ input[type=file]::file-selector-button{
   <h1>QC Document Management</h1>
   <p class="sub">Upload documents from your phone</p>
 
-  __BANNER__
-
   <!-- Login — shown only when a password is required -->
   <div id="login">
     <span class="lbl">Password</span>
@@ -1134,7 +1210,9 @@ input[type=file]::file-selector-button{
       Upload
     </button>
   </form>
-  <p style="margin-top:16px;font-size:10px;color:#ccc;text-align:center">v7</p>
+
+  <div id="banner">__BANNER__</div>
+  <p style="margin-top:16px;font-size:10px;color:#ccc;text-align:center">v8</p>
 </div>
 <script>
 async function init(){
@@ -1146,6 +1224,9 @@ async function init(){
       document.getElementById('upload').style.display='none';
     }
   }catch(e){}
+  // Scroll banner into view if present (iOS keeps scroll position after redirect)
+  var b=document.getElementById('banner');
+  if(b) b.scrollIntoView({behavior:'smooth',block:'center'});
 }
 async function doLogin(){
   var pw=document.getElementById('pw').value;
@@ -1372,7 +1453,8 @@ def mobile_upload():
         if is_photo:
             photo_year, photo_month = _read_photo_date(data, mime)
 
-        if is_photo and _valid_photo_year_month(photo_year, photo_month):
+        if is_photo and _valid_photo_year_month(photo_year, photo_month) and not node_id:
+            # Auto-route to year/month only when no folder was explicitly selected.
             attach_node_id = _find_or_create_photo_month_node(
                 tree, photo_root_node_id or None, photo_year, photo_month)
             out_dir = (
@@ -1391,7 +1473,10 @@ def mobile_upload():
             out_dir = docs_dir
 
         out_path = out_dir / f"{doc_id}__{safe_name}"
-        out_path.write_bytes(data)
+        try:
+            out_path.write_bytes(data)
+        except Exception as _e:
+            return _redirect_err(f"Could not save file: {_e}")
 
         doc_entry = {
             "id": doc_id,
@@ -1414,7 +1499,10 @@ def mobile_upload():
 
         names.append(f.filename or doc_entry["name"])
 
-    write_index(idx)
+    try:
+        write_index(idx)
+    except Exception as _e:
+        return _redirect_err(f"Save failed: {_e}")
     ok_msg = f"Uploaded {len(names)} file(s): {', '.join(names)}"
     return _redirect_ok(ok_msg)
 
@@ -1605,6 +1693,15 @@ def set_settings():
 
 
 # ---- Tree ------------------------------------------------------------------
+@app.route("/api/index-mtime", methods=["GET"])
+def get_index_mtime():
+    """Return the modification timestamp of index.json for change detection."""
+    p = get_index_path()
+    if not p or not p.exists():
+        return jsonify({"mtime": 0})
+    return jsonify({"mtime": p.stat().st_mtime})
+
+
 @app.route("/api/tree", methods=["GET"])
 def get_tree():
     if not get_storage_root():
@@ -1623,9 +1720,13 @@ def put_tree():
     idx["tree"] = data.get("tree")
     write_index(idx)
     new_tree = idx.get("tree")
-    _create_local_folder_structure(new_tree)
-    _sync_doc_files_to_tree_paths(new_tree)
-    _cleanup_stale_node_folders(old_tree, new_tree)
+    # Run expensive disk-sync in background so the HTTP response returns immediately.
+    def _background_sync(old=old_tree, new=new_tree):
+        _create_local_folder_structure(new)
+        _sync_doc_files_to_tree_paths(new)
+        _cleanup_stale_node_folders(old, new)
+    import threading as _threading
+    _threading.Thread(target=_background_sync, daemon=True).start()
     return jsonify({"ok": True})
 
 
@@ -1891,7 +1992,7 @@ def download_token(token: str):
 
 @app.route("/api/send-to-phone", methods=["POST"])
 def send_to_phone():
-    """Send a document download link to a phone number via Mac Messages (iMessage/SMS)."""
+    """Send a document download link to a phone via Messages (Mac) or Phone Link (Windows)."""
     import socket, subprocess
     data = request.get_json(force=True) or {}
     doc_id = (data.get("doc_id") or "").strip()
@@ -1910,28 +2011,26 @@ def send_to_phone():
 
     # Prefer the cloudflared tunnel URL (works from anywhere).
     # Fall back to local WiFi IP (same-network only).
-    if _tunnel_base_url:
+    is_tunnel = bool(_tunnel_base_url)
+    if is_tunnel:
         download_url = f"{_tunnel_base_url}/dl/{token}"
+        local_ip = None
+        port = None
     else:
-        try:
-            _s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            _s.connect(("8.8.8.8", 80))
-            local_ip = _s.getsockname()[0]
-            _s.close()
-        except Exception:
-            local_ip = "127.0.0.1"
+        local_ip = _get_lan_ip()
         host = request.host
         port = host.split(":")[-1] if ":" in host else "8765"
         download_url = f"http://{local_ip}:{port}/dl/{token}"
 
     doc_name = meta.get("name", doc_id)
     message = f"文件：{doc_name}\n下载：{download_url}"
-
-    # Use chat-search approach — works even if the number isn't in contacts.
     normalised = phone if phone.startswith("+") else "+" + phone
-    digits_suffix = normalised.lstrip("+")
-    safe_msg = message.replace("\\", "\\\\").replace('"', '\\"')
-    script = f"""
+
+    # ---- Mac: send via Messages.app (AppleScript) --------------------------
+    if sys.platform == "darwin":
+        digits_suffix = normalised.lstrip("+")
+        safe_msg = message.replace("\\", "\\\\").replace('"', '\\"')
+        script = f"""
 tell application "Messages"
     set _msg to "{safe_msg}"
     set _digits to "{digits_suffix}"
@@ -1967,12 +2066,35 @@ tell application "Messages"
     end if
 end tell
 """
-    result = subprocess.run(["osascript", "-e", script],
-                            capture_output=True, text=True, timeout=15)
-    if result.returncode == 0:
-        return jsonify({"ok": True, "url": download_url})
+        result = subprocess.run(["osascript", "-e", script],
+                                capture_output=True, text=True, timeout=15)
+        if result.returncode == 0:
+            return jsonify({"ok": True, "url": download_url, "method": "messages",
+                            "local_ip": local_ip, "port": port, "is_tunnel": is_tunnel})
+        return jsonify({"error": result.stderr.strip() or
+                        "Messages app could not send. Is your iPhone linked to this Mac via Messages?"}), 500
 
-    return jsonify({"error": result.stderr.strip() or "Messages app could not send. Is your iPhone linked to this Mac via Messages?"}), 500
+    # ---- Windows: open Phone Link via sms: URI -----------------------------
+    elif sys.platform == "win32":
+        import urllib.parse as _urlparse
+        # Build sms: URI — Phone Link handles this and pre-fills the compose window.
+        sms_uri = f"sms:{normalised}?body={_urlparse.quote(message)}"
+        try:
+            subprocess.Popen(
+                ["powershell", "-WindowStyle", "Hidden", "-Command",
+                 f"Start-Process '{sms_uri}'"],
+                creationflags=0x08000000,  # CREATE_NO_WINDOW
+            )
+            return jsonify({"ok": True, "url": download_url, "method": "phone_link",
+                            "local_ip": local_ip, "port": port, "is_tunnel": is_tunnel})
+        except Exception as e:
+            return jsonify({"ok": True, "url": download_url, "method": "url_only",
+                            "local_ip": local_ip, "port": port, "is_tunnel": is_tunnel})
+
+    # ---- Other (Linux etc.): return URL only --------------------------------
+    else:
+        return jsonify({"ok": True, "url": download_url, "method": "url_only",
+                        "local_ip": local_ip, "port": port, "is_tunnel": is_tunnel})
 
 
 def _email_esc(s: str) -> str:
@@ -3865,6 +3987,96 @@ def delete_doc(doc_id):
     return jsonify({"ok": True, "deleted": [m.name for m in matches]})
 
 
+@app.route("/api/docs/<doc_id>/open", methods=["POST"])
+def open_doc_native(doc_id):
+    """Open the document with the OS default application (Preview, etc.)."""
+    import subprocess, sys as _sys
+    docs_dir = get_docs_dir()
+    if not docs_dir:
+        return jsonify({"error": "Storage path not configured"}), 503
+
+    matches = list(docs_dir.rglob(f"{doc_id}__*"))
+    if not matches:
+        matches = list(docs_dir.rglob(f"{doc_id}*"))
+    if not matches:
+        abort(404)
+
+    file_path = str(matches[0])
+    if _sys.platform == "darwin":
+        subprocess.Popen(["open", file_path])
+    elif _sys.platform == "win32":
+        subprocess.Popen(["start", "", file_path], shell=True)
+    else:
+        subprocess.Popen(["xdg-open", file_path])
+
+    return jsonify({"ok": True})
+
+
+@app.route("/api/paste-screenshot", methods=["POST"])
+def paste_screenshot():
+    """Accept a base64-encoded clipboard image, convert to PDF, save to node folder."""
+    import base64
+    from io import BytesIO
+
+    data = request.get_json(force=True) or {}
+    image_b64 = data.get("image_data", "")
+    node_id = data.get("node_id", "").strip() or None
+    folder_name = data.get("folder_name", "截图").strip() or "截图"
+
+    docs_dir = get_docs_dir()
+    if not docs_dir:
+        return jsonify({"error": "Storage path not configured"}), 503
+
+    try:
+        img_bytes = base64.b64decode(image_b64)
+    except Exception:
+        return jsonify({"error": "Invalid image data"}), 400
+
+    try:
+        from PIL import Image
+        img = Image.open(BytesIO(img_bytes))
+        if img.mode in ("RGBA", "LA", "P"):
+            img = img.convert("RGB")
+        pdf_buf = BytesIO()
+        img.save(pdf_buf, "PDF", resolution=150)
+        pdf_bytes = pdf_buf.getvalue()
+    except Exception as e:
+        return jsonify({"error": f"Image to PDF conversion failed: {e}"}), 500
+
+    doc_id = secrets.token_hex(8)
+    safe_folder = re.sub(r'[/\\:*?"<>|\x00-\x1f#]', '_', folder_name).strip('. ') or "截图"
+
+    index_data = read_index()
+    tree = index_data.get("tree")
+    if node_id:
+        out_dir = _get_node_docs_dir(node_id, tree) or docs_dir
+    else:
+        out_dir = docs_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Find next available sequence number for this folder prefix
+    existing = list(docs_dir.rglob(f"*__{safe_folder}#*.pdf"))
+    n = len(existing) + 1
+    safe_name = f"{safe_folder}#{n:03d}.pdf"
+    while (out_dir / f"{doc_id}__{safe_name}").exists() or any(
+        p.name.endswith(f"__{safe_name}") for p in docs_dir.rglob(f"*__{safe_name}")
+    ):
+        n += 1
+        safe_name = f"{safe_folder}#{n:03d}.pdf"
+
+    out_path = out_dir / f"{doc_id}__{safe_name}"
+    out_path.write_bytes(pdf_bytes)
+
+    print(f"[DMS] paste-screenshot → {out_path.name} ({len(pdf_bytes)} bytes)")
+    return jsonify({
+        "ok": True,
+        "doc_id": doc_id,
+        "name": safe_name,
+        "filename": out_path.name,
+        "size": len(pdf_bytes),
+    })
+
+
 # ---- OCR / text extraction ------------------------------------------------
 @app.route("/api/ocr/status", methods=["GET"])
 def get_ocr_status():
@@ -4316,17 +4528,24 @@ def export_metadata_csv():
 
 
 # ---- Project file management (export / import / new) ---------------------
-@app.route("/api/project/export", methods=["GET"])
-def export_project():
-    """Bundle index.json + docs/ into a .dms zip saved next to index.json."""
-    root = get_storage_root()
-    if not root or not root.exists():
-        return jsonify({"error": "Storage path not configured"}), 503
 
-    # Build a zip in memory
-    import io as _io
-    buf = _io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+def _write_dms_zip(root: Path, label: str = "") -> Path:
+    """Save index.json into a .dms file next to the storage root.
+
+    The actual photo/document files stay on disk where they are — only the
+    index (folder tree + document list) is exported.  This keeps the .dms
+    file small and fast to create regardless of how many files are stored.
+
+    label: optional tag inserted before the timestamp (e.g. 'autobak').
+    Returns the path of the written file.
+    """
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in root.name)[:40]
+    tag = f"-{label}" if label else ""
+    filename = f"{safe or 'dms-project'}{tag}-{stamp}.dms"
+    out_path = root / filename
+
+    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
         manifest = {
             "format": "dms-project",
             "version": 1,
@@ -4339,22 +4558,29 @@ def export_project():
         if index_path.exists():
             zf.write(index_path, arcname="index.json")
 
-        docs_dir = root / "docs"
-        if docs_dir.exists():
-            for f in docs_dir.rglob("*"):
-                if f.is_file():
-                    zf.write(f, arcname="docs/" + f.relative_to(docs_dir).as_posix())
+    return out_path
 
-    zip_bytes = buf.getvalue()
 
-    # Save the .dms file in the same folder as index.json
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in root.name)[:40]
-    filename = f"{safe or 'dms-project'}-{stamp}.dms"
-    out_path = root / filename
-    out_path.write_bytes(zip_bytes)
+def _auto_backup():
+    """Create an autobak .dms file if a storage root is configured."""
+    try:
+        root = get_storage_root()
+        if root and root.exists():
+            out = _write_dms_zip(root, label="autobak")
+            print(f"[DMS] Auto-backup saved: {out}")
+    except Exception as exc:
+        print(f"[DMS] Auto-backup failed: {exc}")
 
-    return jsonify({"ok": True, "path": str(out_path), "filename": filename})
+
+@app.route("/api/project/export", methods=["GET"])
+def export_project():
+    """Bundle index.json + docs/ into a .dms zip saved next to index.json."""
+    root = get_storage_root()
+    if not root or not root.exists():
+        return jsonify({"error": "Storage path not configured"}), 503
+
+    out_path = _write_dms_zip(root)
+    return jsonify({"ok": True, "path": str(out_path), "filename": out_path.name})
 
 
 @app.route("/api/project/import", methods=["POST"])
@@ -4383,9 +4609,9 @@ def import_project():
 
     # Read uploaded file into a temp file for zipfile to read
     tmp_zip = tempfile.NamedTemporaryFile(suffix=".dms", delete=False)
+    tmp_zip.close()  # Must close before f.save() on Windows (file locking)
     try:
         f.save(tmp_zip.name)
-        tmp_zip.close()
 
         # Validate it's a real .dms zip with a manifest
         try:
@@ -4403,12 +4629,27 @@ def import_project():
         if target.exists():
             if any(target.iterdir()):
                 if mode == "overwrite":
-                    # Delete contents but keep the folder itself
+                    # Delete contents but keep the folder itself.
+                    # On Windows, files may be read-only; chmod first so rmtree
+                    # doesn't raise PermissionError (onerror clears the bit and retries).
+                    def _rm_readonly(func, path, _exc):
+                        try:
+                            os.chmod(path, stat.S_IWRITE)
+                            func(path)
+                        except OSError:
+                            pass
                     for item in target.iterdir():
                         if item.is_dir():
-                            shutil.rmtree(item)
+                            if sys.version_info >= (3, 12):
+                                shutil.rmtree(item, onexc=lambda f, p, e: _rm_readonly(f, p, e))
+                            else:
+                                shutil.rmtree(item, onerror=_rm_readonly)
                         else:
-                            item.unlink()
+                            try:
+                                item.unlink()
+                            except PermissionError:
+                                os.chmod(item, stat.S_IWRITE)
+                                item.unlink()
                 else:
                     return jsonify({
                         "error": (
@@ -4469,9 +4710,9 @@ def inspect_dms():
 
     f = request.files["file"]
     tmp_zip = tempfile.NamedTemporaryFile(suffix=".dms", delete=False)
+    tmp_zip.close()  # Must close before f.save() on Windows (file locking)
     try:
         f.save(tmp_zip.name)
-        tmp_zip.close()
         try:
             with zipfile.ZipFile(tmp_zip.name, "r") as zf:
                 if "manifest.json" not in zf.namelist():
@@ -4706,9 +4947,9 @@ def import_zip_docs():
 
     f = request.files["file"]
     tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+    tmp.close()  # Must close before f.save() on Windows (file locking)
     try:
         f.save(tmp.name)
-        tmp.close()
 
         try:
             with zipfile.ZipFile(tmp.name, "r") as _zf:
@@ -4858,6 +5099,7 @@ def import_zip_docs():
 def quit_app():
     """Shut down the DMS server and exit the process."""
     import threading
+    _auto_backup()
     threading.Thread(target=lambda: __import__("os")._exit(0), daemon=True).start()
     return jsonify({"ok": True})
 
@@ -4929,6 +5171,17 @@ def main():
         _migrate_flat_docs()
     except Exception as e:
         print(f"[DMS] Migration warning: {e}")
+
+    # Auto-backup on Ctrl+C or SIGTERM
+    import signal
+
+    def _handle_shutdown(signum, frame):
+        print()
+        _auto_backup()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, _handle_shutdown)
+    signal.signal(signal.SIGTERM, _handle_shutdown)
 
     # Use the built-in dev server. Fine for local single-user use.
     # For a real deployment, run via gunicorn or similar.

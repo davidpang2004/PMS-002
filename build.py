@@ -41,9 +41,12 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 APP_NAME = "DMS"
 
-# Files that must be packaged alongside the Python code
+# Files that must be packaged alongside the Python code.
+# Each entry is either a filename (goes to the _MEIPASS root)
+# or a (src, dest) tuple where dest is the subfolder inside _MEIPASS.
 DATA_FILES = [
-    "dms.html",
+    ("dms.html", "."),      # dms.html → _MEIPASS/dms.html
+    ("vendor", "vendor"),   # vendor/ dir → _MEIPASS/vendor/ (offline JS)
 ]
 
 # Icon files (optional). Add an .icns for Mac and .ico for Windows if you have them.
@@ -73,7 +76,8 @@ def ensure_venv():
         )
 
     print("Re-launching build inside virtual environment ...\n")
-    os.execv(str(venv_python), [str(venv_python)] + sys.argv)
+    result = subprocess.run([str(venv_python)] + sys.argv)
+    sys.exit(result.returncode)
 
 
 def check_pyinstaller() -> bool:
@@ -211,11 +215,25 @@ def _force_rmtree(p: Path, attempts: int = 4) -> bool:
 
 def clean_previous_builds():
     is_win = sys.platform.startswith("win")
+    # Kill any lingering cloudflared process that may lock files inside dist.
+    if is_win:
+        subprocess.run(["taskkill", "/F", "/IM", "cloudflared.exe"], capture_output=True)
     for d in ("build", "dist"):
         p = HERE / d
         if p.exists():
             print(f"Cleaning {p}...")
             if not _force_rmtree(p):
+                # If the folder is empty it's locked by the OS (Search Indexer,
+                # antivirus, IDE file watcher, etc.) but contains nothing that
+                # would conflict with PyInstaller writing fresh output into it.
+                # Treat an empty locked folder as a non-fatal warning and let
+                # PyInstaller proceed — it will create the output file inside it.
+                contents = list(p.iterdir()) if p.exists() else []
+                if not contents:
+                    print(f"  Warning: could not remove empty {p} (OS lock). "
+                          f"Continuing — PyInstaller will write into it.")
+                    continue
+
                 is_mac = sys.platform == "darwin"
                 artifact = "DMS.exe" if is_win else ("DMS.app" if is_mac else "DMS")
                 print(f"ERROR: Could not remove {p}.")
@@ -248,6 +266,20 @@ def clean_previous_builds():
                 pass
 
 
+def _ensure_cloudflared_windows() -> Path:
+    """Download cloudflared.exe into the project directory for bundling (cached after first run)."""
+    import urllib.request
+    dest = HERE / "cloudflared.exe"
+    if dest.exists():
+        print(f"  cloudflared.exe already cached ({dest})")
+        return dest
+    url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+    print(f"  Downloading cloudflared.exe (~35 MB) for bundling…")
+    urllib.request.urlretrieve(url, dest)
+    print(f"  Saved to {dest}")
+    return dest
+
+
 def build_pyinstaller_command() -> list[str]:
     """Compose the platform-specific PyInstaller command."""
     cmd = [
@@ -273,17 +305,23 @@ def build_pyinstaller_command() -> list[str]:
         cmd.append("--onefile")  # Single .exe is much friendlier on Windows
         if WIN_ICON.exists():
             cmd.extend(["--icon", str(WIN_ICON)])
+        # Bundle cloudflared.exe so users never need to download it at runtime.
+        cf_path = HERE / "cloudflared.exe"
+        if cf_path.exists():
+            cmd.extend(["--add-binary", f"{cf_path};."])
     else:
         # Linux: single-file binary
         cmd.append("--onefile")
 
-    # Bundle the dms.html resource file alongside the code
+    # Bundle data files and directories alongside the code
     sep = ";" if sys.platform.startswith("win") else ":"
-    for f in DATA_FILES:
-        if not (HERE / f).exists():
-            print(f"WARNING: data file not found: {f}")
+    for item in DATA_FILES:
+        src, dest = item if isinstance(item, tuple) else (item, ".")
+        src_path = HERE / src
+        if not src_path.exists():
+            print(f"WARNING: data file/dir not found: {src}")
             continue
-        cmd.extend(["--add-data", f"{f}{sep}."])
+        cmd.extend(["--add-data", f"{src_path}{sep}{dest}"])
 
     # Tkinter: only collect the submodules actually used; avoid pulling in the
     # entire Tcl/Tk test suite and demos which inflate the bundle and VM footprint.
@@ -446,6 +484,10 @@ def main():
 
     check_dependencies()
 
+    # On Windows, download cloudflared.exe now so it can be bundled into DMS.exe.
+    if sys.platform.startswith("win"):
+        _ensure_cloudflared_windows()
+
     # Sanity check — make sure all required files exist
     required = ["dms_launcher.py", "dms_server.py", "databook.py", "dms.html"]
     missing = [f for f in required if not (HERE / f).exists()]
@@ -455,6 +497,14 @@ def main():
 
     expiry, max_launches = prompt_trial_period()
     write_trial_module(expiry, max_launches)
+
+    # Reset the persisted launch counter so the new build starts from zero.
+    # The counter lives in ~/.pms_dms_trial.json on the build machine; without
+    # this deletion every rebuild inherits the count accumulated during testing.
+    trial_state_file = Path.home() / ".pms_dms_trial.json"
+    if trial_state_file.exists():
+        trial_state_file.unlink()
+        print(f"  Reset trial state ({trial_state_file})")
 
     clean_previous_builds()
 

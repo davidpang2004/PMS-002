@@ -3,7 +3,7 @@ from PyInstaller.utils.hooks import collect_submodules
 from PyInstaller.utils.hooks import collect_all
 from PyInstaller.utils.hooks import copy_metadata
 
-datas = [('dms.html', '.')]
+datas = [('/Users/david/PMS/dms.html', '.'), ('/Users/david/PMS/vendor', 'vendor')]
 binaries = []
 hiddenimports = ['pillow_heif', 'fitz', 'qrcode', 'pyngrok', 'pyngrok.ngrok', 'pyngrok.conf', 'tkinter', 'tkinter.ttk', 'tkinter.scrolledtext', 'tkinter.font', 'tkinter.messagebox', 'flask', 'dms_server', 'databook', 'pdf_extraction', '_dms_trial']
 datas += copy_metadata('Pillow')

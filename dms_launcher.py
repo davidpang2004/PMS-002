@@ -274,34 +274,98 @@ def _save_ngrok_token(token: str) -> None:
     save_config(cfg)
 
 
-def _get_or_start_tunnel() -> str:
+def _download_cloudflared_windows(dest_path: str, status_fn=None) -> str:
+    """Download cloudflared.exe to dest_path on Windows (one-time) and return the path."""
+    import urllib.request, os as _os
+    _os.makedirs(_os.path.dirname(dest_path), exist_ok=True)
+    url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+    if status_fn:
+        status_fn("Downloading cloudflared… (one-time, ~35 MB)")
+    urllib.request.urlretrieve(url, dest_path)
+    return dest_path
+
+
+def _get_or_start_tunnel(status_fn=None) -> str:
     """Return a public HTTPS URL via cloudflared, starting it if needed."""
     global _tunnel_proc, _tunnel_url
-    import subprocess, re as _re, threading
+    import subprocess, re as _re, threading, os as _os, sys as _sys, shutil
 
     # Reuse existing tunnel if the process is still alive.
     if _tunnel_proc is not None and _tunnel_proc.poll() is None and _tunnel_url:
         return _tunnel_url
 
     # Kill any stale cloudflared left from a previous session.
-    subprocess.run(["/usr/bin/pkill", "-f", "cloudflared"], capture_output=True)
+    if _sys.platform.startswith("win"):
+        subprocess.run(["taskkill", "/F", "/IM", "cloudflared.exe"], capture_output=True)
+    else:
+        subprocess.run(["/usr/bin/pkill", "-f", "cloudflared"], capture_output=True)
     time.sleep(0.5)
 
     _tunnel_url = None
-    collected = []
 
-    # Use full path — app bundles don't inherit the user's shell PATH.
-    _cf = next(
-        (p for p in ["/opt/homebrew/bin/cloudflared", "/usr/local/bin/cloudflared"] if __import__("os").path.exists(p)),
-        "cloudflared",
-    )
-    proc = subprocess.Popen(
-        [_cf, "tunnel", "--url", f"http://localhost:{PORT}", "--no-autoupdate"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-    )
+    # Locate cloudflared — check platform-specific well-known paths before
+    # falling back to whatever is on PATH.
+    if _sys.platform.startswith("win"):
+        _local_appdata = _os.environ.get("LOCALAPPDATA") or _os.path.join(_os.path.expanduser("~"), "AppData", "Local")
+        _local_cf = _os.path.join(_local_appdata, "cloudflared", "cloudflared.exe")
+        _candidates = [
+            r"C:\Program Files\cloudflared\cloudflared.exe",
+            r"C:\Program Files (x86)\cloudflared\cloudflared.exe",
+            _local_cf,
+            "cloudflared.exe",
+            "cloudflared",
+        ]
+        _install_hint = "Download cloudflared from https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/ and add it to your PATH."
+    else:
+        _local_cf = None
+        _candidates = ["/opt/homebrew/bin/cloudflared", "/usr/local/bin/cloudflared", "cloudflared"]
+        _install_hint = "Run: brew install cloudflare/cloudflare/cloudflared"
+
+    # Check for cloudflared bundled inside this PyInstaller build first.
+    _cf = None
+    if _sys.platform.startswith("win"):
+        _meipass = getattr(_sys, '_MEIPASS', None)
+        if _meipass:
+            _bundled = _os.path.join(_meipass, "cloudflared.exe")
+            if _os.path.isfile(_bundled):
+                _cf = _bundled
+
+    # Search well-known paths and PATH if not found in the bundle.
+    if _cf is None:
+        for p in _candidates:
+            if _os.path.isfile(p):
+                _cf = p
+                break
+            if _os.sep not in p and shutil.which(p):
+                _cf = shutil.which(p)
+                break
+
+    # On Windows, auto-download cloudflared as a last resort (running from source).
+    if _cf is None:
+        if _sys.platform.startswith("win"):
+            _cf = _download_cloudflared_windows(_local_cf, status_fn)
+        else:
+            raise RuntimeError(f"cloudflared not found. {_install_hint}")
+
+    if status_fn:
+        status_fn("Starting tunnel…")
+
+    kwargs: dict = dict(stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if _sys.platform.startswith("win"):
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+    try:
+        proc = subprocess.Popen(
+            [_cf, "tunnel", "--url", f"http://localhost:{PORT}", "--no-autoupdate",
+             "--protocol", "http2"],
+            **kwargs,
+        )
+    except FileNotFoundError:
+        raise RuntimeError(f"cloudflared not found. {_install_hint}")
+
     _tunnel_proc = proc
 
-    # Read output lines until we find the public URL (printed within ~5 s).
+    # Read output lines until we find the public URL (printed within ~15 s).
     import queue as _queue
     q = _queue.Queue()
 
@@ -321,7 +385,7 @@ def _get_or_start_tunnel() -> str:
                 break
         except _queue.Empty:
             if proc.poll() is not None:
-                raise RuntimeError("cloudflared exited unexpectedly. Is it installed? Run: brew install cloudflare/cloudflare/cloudflared")
+                raise RuntimeError(f"cloudflared exited unexpectedly. {_install_hint}")
 
     if not _tunnel_url:
         proc.kill()
@@ -401,6 +465,74 @@ end tell
 
 
 # ---------------------------------------------------------------------------
+# Single-instance guard — check BEFORE importing Flask or starting any server
+# ---------------------------------------------------------------------------
+def _kill_stale_port_owner() -> None:
+    """Windows only: kill whatever process holds PORT so we can rebind."""
+    if not sys.platform.startswith("win"):
+        return
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["netstat", "-ano"], capture_output=True, text=True, timeout=5
+        )
+        for line in result.stdout.splitlines():
+            cols = line.split()
+            # cols: Proto  Local  Foreign  State  PID
+            if len(cols) >= 5 and f":{PORT}" in cols[1] and cols[3] == "LISTENING":
+                pid = cols[4]
+                if pid.isdigit() and pid != "0":
+                    subprocess.run(
+                        ["taskkill", "/F", "/PID", pid],
+                        capture_output=True, timeout=3,
+                    )
+    except Exception:
+        pass
+
+
+def _already_running() -> bool:
+    """Return True if a healthy DMS instance is already serving on PORT.
+
+    Three cases:
+      • Port closed              → not running          → return False
+      • Port open + HTTP 200     → healthy instance     → return True
+      • Port open + HTTP fails   → stale/stuck process  → kill it, return False
+    """
+    # Quick socket probe first (cheap).
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        try:
+            s.connect(("127.0.0.1", PORT))
+        except OSError:
+            return False  # nothing on that port
+
+    # Port is open — confirm the server actually responds to HTTP.
+    import urllib.request as _req
+    try:
+        with _req.urlopen(f"http://127.0.0.1:{PORT}/", timeout=2) as resp:
+            return resp.status == 200
+    except Exception:
+        # Port is bound but server is unresponsive (stuck/zombie).
+        # Kill the stale process so the new instance can bind the port.
+        _kill_stale_port_owner()
+        return False
+
+
+if _already_running():
+    webbrowser.open(URL)
+    _r = tk.Tk()
+    _r.withdraw()
+    import tkinter.messagebox as _mb
+    _mb.showinfo(
+        "DMS Already Running",
+        f"DMS is already running.\n\nOpening browser to {URL}",
+        parent=_r,
+    )
+    _r.destroy()
+    os._exit(0)
+
+
+# ---------------------------------------------------------------------------
 # Import the Flask app (after DMS_RESOURCE_DIR is set)
 # ---------------------------------------------------------------------------
 from dms_server import app  # noqa: E402
@@ -430,9 +562,9 @@ def serve() -> None:
             app,
             host="0.0.0.0",   # accept connections from all interfaces (including iPhone on LAN)
             port=PORT,
-            threads=4,
-            channel_timeout=30,
-            connection_limit=20,
+            threads=8,
+            channel_timeout=300,
+            connection_limit=50,
         )
     except Exception:
         import traceback
@@ -836,59 +968,84 @@ class LauncherWindow:
         status_lbl.pack(padx=24, pady=(0, 4))
 
         def _generate():
+            # Read UI values on the main thread before going to background.
+            chosen_label = folder_combo.get()
+            phone = phone_var.get().strip()
 
+            generate_btn.config(state="disabled")
             status_var.set("Starting tunnel…")
             status_lbl.config(fg=SUB)
-            dlg.update_idletasks()
 
-            try:
-                public_url = _get_or_start_tunnel()
-            except Exception as exc:
-                status_var.set(f"Tunnel error: {exc}")
-                status_lbl.config(fg="#dc2626")
-                return
+            def _do_background():
+                def _ui(fn):
+                    try:
+                        dlg.after(0, fn)
+                    except Exception:
+                        pass
 
-            # Let the Flask server know the public tunnel URL so it can use
-            # it for document download links sent to the phone.
-            import dms_server as _dms_srv
-            _dms_srv._tunnel_base_url = public_url
+                def _update_status(msg):
+                    _ui(lambda m=msg: (status_var.set(m), status_lbl.config(fg=SUB)))
 
-            # Determine selected node_id
-            chosen_label = folder_combo.get()
-            node_id = next((nid for nid, lbl in folder_options if lbl == chosen_label), "")
+                try:
+                    public_url = _get_or_start_tunnel(status_fn=_update_status)
+                except Exception as exc:
+                    _ui(lambda e=str(exc): (
+                        status_var.set(f"Tunnel error: {e}"),
+                        status_lbl.config(fg="#dc2626"),
+                        generate_btn.config(state="normal"),
+                    ))
+                    return
 
-            # Create remote token on the server
-            try:
-                payload = _json.dumps({"node_id": node_id}).encode()
-                req = _urllib_req.Request(
-                    f"http://127.0.0.1:{PORT}/api/remote-token",
-                    data=payload,
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                resp = _urllib_req.urlopen(req, timeout=5)
-                token = _json.loads(resp.read())["token"]
-            except Exception as exc:
-                status_var.set(f"Could not create upload token: {exc}")
-                status_lbl.config(fg="#dc2626")
-                return
+                # Let the Flask server know the public tunnel URL so it can use
+                # it for document download links sent to the phone.
+                import dms_server as _dms_srv
+                _dms_srv._tunnel_base_url = public_url
 
-            full_url = f"{public_url}/mobile/r/{token}"
-            generated_url.clear()
-            generated_url.append(full_url)
-            url_var.set(full_url)
-            _make_qr(full_url)
-            send_btn.config(state="normal")
-            copy_btn.config(state="normal")
-            status_var.set("Link ready — valid for 24 hours.")
-            status_lbl.config(fg="#15803d")
+                node_id = next((nid for nid, lbl in folder_options if lbl == chosen_label), "")
 
-            # Persist phone number for next time
-            phone = phone_var.get().strip()
-            if phone:
-                cfg = _load_cfg()
-                cfg["remote_phone"] = phone
-                _save_cfg(cfg)
+                # Create remote token on the server
+                try:
+                    payload = _json.dumps({"node_id": node_id}).encode()
+                    req = _urllib_req.Request(
+                        f"http://127.0.0.1:{PORT}/api/remote-token",
+                        data=payload,
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    resp = _urllib_req.urlopen(req, timeout=5)
+                    token = _json.loads(resp.read())["token"]
+                except Exception as exc:
+                    _ui(lambda e=str(exc): (
+                        status_var.set(f"Could not create upload token: {e}"),
+                        status_lbl.config(fg="#dc2626"),
+                        generate_btn.config(state="normal"),
+                    ))
+                    return
+
+                full_url = f"{public_url}/mobile/r/{token}"
+
+                # Persist phone number for next time (non-UI work)
+                if phone:
+                    cfg = _load_cfg()
+                    cfg["remote_phone"] = phone
+                    _save_cfg(cfg)
+
+                def _finish():
+                    generated_url.clear()
+                    generated_url.append(full_url)
+                    url_var.set(full_url)
+                    _make_qr(full_url)
+                    send_btn.config(state="normal")
+                    if sys.platform.startswith("win"):
+                        wechat_btn.config(state="normal")
+                    copy_btn.config(state="normal")
+                    status_var.set("Link ready — valid for 24 hours.")
+                    status_lbl.config(fg="#15803d")
+                    generate_btn.config(state="normal")
+
+                _ui(_finish)
+
+            threading.Thread(target=_do_background, daemon=True).start()
 
         def _send():
             phone = phone_var.get().strip()
@@ -915,15 +1072,39 @@ class LauncherWindow:
                 copy_btn.config(text="Copied!")
                 dlg.after(2000, lambda: copy_btn.config(text="Copy URL"))
 
+        def _send_wechat():
+            if not generated_url:
+                status_var.set("Generate a link first.")
+                status_lbl.config(fg=WARN)
+                return
+            # Copy URL to clipboard, then open WeChat so the user can paste and send.
+            dlg.clipboard_clear()
+            dlg.clipboard_append(generated_url[0])
+            try:
+                import subprocess as _sp
+                _sp.Popen(["cmd", "/c", "start", "", "weixin://"])
+                status_var.set("Link copied — paste it in WeChat and send.")
+                status_lbl.config(fg="#15803d")
+            except Exception:
+                status_var.set("Link copied to clipboard. Open WeChat and paste to send.")
+                status_lbl.config(fg="#15803d")
+
         action_row = tk.Frame(dlg, bg=BG)
         action_row.pack(pady=(4, 4))
 
-        tk.Button(action_row, text="Generate Link", command=_generate,
-                  relief="groove", padx=12, pady=5).pack(side="left", padx=4)
+        generate_btn = tk.Button(action_row, text="Generate Link", command=_generate,
+                                 relief="groove", padx=12, pady=5)
+        generate_btn.pack(side="left", padx=4)
 
         send_btn = tk.Button(action_row, text="Send via iMessage", command=_send,
                              relief="groove", padx=12, pady=5, state="disabled")
-        send_btn.pack(side="left", padx=4)
+        if not sys.platform.startswith("win"):
+            send_btn.pack(side="left", padx=4)
+
+        if sys.platform.startswith("win"):
+            wechat_btn = tk.Button(action_row, text="Send via WeChat", command=_send_wechat,
+                                   relief="groove", padx=12, pady=5, state="disabled")
+            wechat_btn.pack(side="left", padx=4)
 
         copy_btn = tk.Button(action_row, text="Copy URL", command=_copy,
                              relief="groove", padx=12, pady=5, state="disabled")
@@ -935,6 +1116,29 @@ class LauncherWindow:
                   relief="groove", padx=14, pady=5).pack()
 
     def _quit(self) -> None:
+        # Kill the cloudflared tunnel process object directly (instant).
+        global _tunnel_proc
+        if _tunnel_proc is not None:
+            try:
+                _tunnel_proc.kill()
+            except Exception:
+                pass
+            _tunnel_proc = None
+
+        # Belt-and-suspenders: sweep for any lingering cloudflared.exe on
+        # Windows.  Use Popen (fire-and-forget) so we never block — taskkill
+        # will finish on its own; we exit immediately after.
+        if sys.platform.startswith("win"):
+            try:
+                import subprocess as _sp
+                _sp.Popen(
+                    ["taskkill", "/F", "/IM", "cloudflared.exe"],
+                    stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+                    creationflags=_sp.CREATE_NO_WINDOW,
+                )
+            except Exception:
+                pass
+
         os._exit(0)
 
 
@@ -950,8 +1154,12 @@ def main() -> None:
         pass  # not on macOS — ignore
 
     # Signal handlers: schedule _quit via the Tk event loop so it's thread-safe.
+    # Fall back to direct os._exit if Tkinter is unresponsive.
     def _signal_quit(*_):
-        root.after(0, win._quit)
+        try:
+            root.after(0, win._quit)
+        except Exception:
+            os._exit(0)
 
     signal.signal(signal.SIGTERM, _signal_quit)
     signal.signal(signal.SIGINT,  _signal_quit)
