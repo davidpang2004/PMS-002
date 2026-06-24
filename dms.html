@@ -4,10 +4,15 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>照片管理系统(PMS)</title>
-<script src="https://cdn.tailwindcss.com"></script>
-<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-<script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+<script src="/vendor/tailwind.min.js?v=1"></script>
+<script crossorigin src="/vendor/react.production.min.js?v=1"></script>
+<script crossorigin src="/vendor/react-dom.production.min.js?v=1"></script>
+<script src="/vendor/babel.min.js?v=1"></script>
+<script>
+Babel.registerPreset('react-classic', {
+  presets: [[Babel.availablePresets['react'], { runtime: 'classic' }]]
+});
+</script>
 <style>
   html, body, #root { height: 100%; margin: 0; }
   body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
@@ -16,7 +21,7 @@
 <body class="bg-stone-50">
 <div id="root"></div>
 
-<script type="text/babel" data-presets="react">
+<script type="text/babel" data-presets="react-classic">
 const { useState, useEffect, useCallback, useMemo, useRef } = React;
 
 /* =============================================================================
@@ -207,6 +212,19 @@ const Camera = (p) => (
   <I {...p}>
     <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" />
     <circle cx="12" cy="13" r="4" />
+  </I>
+);
+const ExternalLink = (p) => (
+  <I {...p}>
+    <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+    <polyline points="15 3 21 3 21 9" />
+    <line x1="10" y1="14" x2="21" y2="3" />
+  </I>
+);
+const Clipboard = (p) => (
+  <I {...p}>
+    <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" />
+    <rect x="8" y="2" width="8" height="4" rx="1" ry="1" />
   </I>
 );
 const Phone = (p) => (
@@ -2794,10 +2812,13 @@ const CombineFolderModal = ({ node, docIndex, formatBytes, onClose, onSaved }) =
 
 
 const SendToPhoneDialog = ({ doc, onClose }) => {
+  const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform);
   const saved = typeof localStorage !== "undefined" ? localStorage.getItem("pms_last_phone") || "" : "";
   const [phone, setPhone] = useState(saved);
-  const [status, setStatus] = useState(null); // null | {ok, msg}
+  const [status, setStatus] = useState(null); // null | { ok, msg, url, method, local_ip, port, is_tunnel }
   const [busy, setBusy] = useState(false);
+  const [urlCopied, setUrlCopied] = useState(false);
+  const [showFirewallHelp, setShowFirewallHelp] = useState(false);
 
   const send = async () => {
     const p = phone.trim();
@@ -2812,7 +2833,12 @@ const SendToPhoneDialog = ({ doc, onClose }) => {
       const data = await r.json();
       if (data.ok) {
         localStorage.setItem("pms_last_phone", p);
-        setStatus({ ok: true, msg: `已通过 Messages 发送至 ${p}` });
+        const methodMsg =
+          data.method === "messages"   ? `已通过「信息」App 发送至 ${p}` :
+          data.method === "phone_link" ? `已尝试通过 Phone Link 打开短信至 ${p}` :
+                                         "链接已生成，请手动复制发送：";
+        setStatus({ ok: true, msg: methodMsg, url: data.url, method: data.method,
+                    local_ip: data.local_ip, port: data.port, is_tunnel: data.is_tunnel });
       } else {
         setStatus({ ok: false, msg: data.error || "发送失败。" });
       }
@@ -2821,9 +2847,29 @@ const SendToPhoneDialog = ({ doc, onClose }) => {
     } finally { setBusy(false); }
   };
 
+  const copyUrl = async () => {
+    if (!status?.url) return;
+    try {
+      await navigator.clipboard.writeText(status.url);
+      setUrlCopied(true);
+      setTimeout(() => setUrlCopied(false), 1500);
+    } catch { /* clipboard blocked */ }
+  };
+
+  const openWeChat = async () => {
+    if (!status?.url) return;
+    try { await navigator.clipboard.writeText(status.url); } catch {}
+    const a = document.createElement('a');
+    a.href = 'weixin://';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setStatus(s => ({ ...s, msg: "链接已复制，请在微信中粘贴发送给对方。" }));
+  };
+
   return (
     <div className="fixed inset-0 bg-stone-900/60 z-50 flex items-center justify-center p-4" onClick={onClose}>
-      <div className="bg-white rounded shadow-2xl w-full max-w-sm p-5" onClick={(e) => e.stopPropagation()}>
+      <div className="bg-white rounded shadow-2xl w-full max-w-md p-5" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center justify-between mb-3">
           <div className="flex items-center gap-2 text-stone-800">
             <Phone size={15} className="text-amber-600" />
@@ -2839,16 +2885,66 @@ const SendToPhoneDialog = ({ doc, onClose }) => {
           value={phone}
           onChange={(e) => setPhone(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter") send(); if (e.key === "Escape") onClose(); }}
-          placeholder="+1 555 123 4567"
+          placeholder="+86 138 0000 0000"
           className="w-full px-3 py-2 border border-stone-300 rounded text-sm focus:outline-none focus:border-amber-500 mb-3"
         />
+
         {status && (
           <div className={`text-xs rounded px-3 py-2 mb-3 ${status.ok ? "bg-green-50 text-green-800 border border-green-200" : "bg-red-50 text-red-700 border border-red-200"}`}>
-            {status.msg}
+            <div>{status.msg}</div>
+            {status.ok && status.url && (
+              <div className="mt-2 space-y-1.5">
+                <div className="flex items-center gap-1.5">
+                  <span className="font-mono text-[10px] truncate flex-1 text-green-900 select-all">{status.url}</span>
+                  <button onClick={copyUrl} className="shrink-0 text-[10px] px-2 py-0.5 border border-green-400 rounded hover:bg-green-100">
+                    {urlCopied ? "已复制" : "复制"}
+                  </button>
+                </div>
+                {!isMac && (
+                  <button onClick={openWeChat} className="w-full text-[10px] px-2 py-1 bg-green-600 text-white rounded hover:bg-green-700">
+                    复制链接并打开微信
+                  </button>
+                )}
+              </div>
+            )}
+            {/* Show network requirement notice when using local IP */}
+            {status.ok && !status.is_tunnel && status.local_ip && (
+              <div className="mt-2 pt-2 border-t border-green-200 space-y-1">
+                <div className="text-[10px] text-green-700">
+                  链接使用本地 IP <span className="font-mono font-bold">{status.local_ip}:{status.port}</span>，需满足：
+                </div>
+                <div className="text-[10px] text-green-700">① 手机与此 Mac 连接在<strong>同一 Wi-Fi</strong></div>
+                <div className="text-[10px] text-green-700">② macOS 防火墙已允许 DMS.app 接受连接</div>
+                <button
+                  onClick={() => setShowFirewallHelp(!showFirewallHelp)}
+                  className="text-[10px] text-amber-700 underline mt-0.5"
+                >
+                  {showFirewallHelp ? "收起" : "链接打不开？查看解决方法 ▾"}
+                </button>
+                {showFirewallHelp && (
+                  <div className="mt-1 text-[10px] text-stone-700 bg-amber-50 border border-amber-200 rounded p-2 space-y-1.5 leading-relaxed">
+                    <div className="font-semibold text-amber-800">「找不到服务器」的常见原因：</div>
+                    <div className="font-medium text-stone-800">① 手机未连 Wi-Fi（最常见）</div>
+                    <div className="pl-2">→ 打开手机「设置」→「Wi-Fi」，确认已连接且<strong>与此 Mac 在同一网络</strong>，而非使用蜂窝数据。</div>
+                    <div className="font-medium text-stone-800">② macOS 防火墙拦截</div>
+                    <div className="pl-2">→ 系统设置 → 网络 → 防火墙 → 选项…</div>
+                    <div className="pl-2">→ 找到 <strong>DMS</strong>，设为「允许传入连接」。若没有则点 + 添加。</div>
+                    <div className="font-medium text-stone-800">③ Mac 连接了 VPN，IP 地址不对</div>
+                    <div className="pl-2">→ 上方显示的 IP 是否是 <strong>192.168.x.x</strong> 或 <strong>10.x.x.x</strong>（局域网）？若是 VPN IP，请先断开 VPN。</div>
+                    <div className="font-medium text-stone-800">④ 路由器开启了 AP 隔离</div>
+                    <div className="pl-2">→ 登录路由器管理页，关闭「AP 隔离」/「客户端隔离」。</div>
+                    <div className="pt-1 text-amber-700 font-medium">以上都试过还是不行？使用 Launcher 窗口中的「Remote Upload」，通过公网发送，不受 Wi-Fi 限制。</div>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         )}
+
         <div className="text-[10px] text-stone-400 mb-3">
-          通过 Mac「信息」App 以 iMessage 或短信发送下载链接。手机须与此 Mac 在同一 Wi-Fi 网络内。
+          {isMac
+            ? "通过 Mac「信息」App 以 iMessage 或短信发送 1 小时有效的下载链接。"
+            : "点击「发送链接」生成下载链接，再点「复制链接并打开微信」粘贴发送给对方。"}
         </div>
         <div className="flex gap-2">
           <button onClick={onClose} className="flex-1 px-3 py-1.5 text-xs border border-stone-300 hover:bg-stone-100 rounded">取消</button>
@@ -3203,7 +3299,7 @@ const EmailSettingsDialog = ({ onClose }) => {
 
 const DocumentCard = ({
   doc, otherRefCount = 0, nodeSn = "",
-  onOpen, onDelete, onUpdateMeta, onUpdateSn, formatBytes, keyParameters = [],
+  onOpen, onOpenNative, onDelete, onUpdateMeta, onUpdateSn, formatBytes, keyParameters = [],
   onOpenEmailSettings,
 }) => {
   const [showMeta, setShowMeta] = useState(() => Object.keys(doc.metadata || {}).length > 0);
@@ -3310,6 +3406,13 @@ const DocumentCard = ({
           title="编辑元数据（更改对所有引用此文档的节点生效）"
         >
           <Tag size={11} /> {Object.keys(doc.metadata || {}).length || ""}
+        </button>
+        <button
+          onClick={onOpenNative}
+          className="text-stone-400 hover:text-blue-600 p-1"
+          title="在本机应用中打开（Preview / 系统默认程序）"
+        >
+          <ExternalLink size={14} />
         </button>
         <button
           onClick={() => setShowSendPhone(true)}
@@ -5043,6 +5146,8 @@ function DMS({ storagePath, onChangeFolder }) {
       form.append("target_path", targetPath.trim());
       form.append("mode", mode);
       const res = await fetch("/api/project/import", { method: "POST", body: form });
+      if (res.status === 413) { setDmsImportError("文件过大，服务器拒绝接收。请检查服务器配置。"); return; }
+      if (!res.ok && res.headers.get("content-type")?.includes("text/html")) { setDmsImportError(`服务器错误 (${res.status})，请检查终端日志。`); return; }
       const data = await res.json();
       if (data.ok) {
         setDmsImportDialog(null);
@@ -5231,14 +5336,39 @@ function DMS({ storagePath, onChangeFolder }) {
     })();
   }, []);
 
+  // Poll for remote uploads: if index.json changes on disk (e.g. phone uploaded
+  // a file), reload tree + docIndex so the Mac UI reflects the new file.
+  const _lastMtime = React.useRef(0);
+  useEffect(() => {
+    const poll = async () => {
+      try {
+        const r = await fetch("/api/index-mtime");
+        if (!r.ok) return;
+        const { mtime } = await r.json();
+        if (_lastMtime.current === 0) { _lastMtime.current = mtime; return; }
+        if (mtime <= _lastMtime.current) return;
+        _lastMtime.current = mtime;
+        const treeResp = await StorageAdapter.getTree();
+        const freshIndex = await StorageAdapter.listDocumentIndex();
+        if (treeResp.tree) setTree(treeResp.tree);
+        setDocIndex(freshIndex);
+      } catch (_) {}
+    };
+    const id = setInterval(poll, 5000);
+    return () => clearInterval(id);
+  }, []);
+
   const persistTree = useCallback(async (newTree) => {
     setTree(newTree);
     await StorageAdapter.saveTree(newTree);
+    // Update known mtime so the poller doesn't treat our own write as an external change.
+    fetch("/api/index-mtime").then(r => r.json()).then(d => { _lastMtime.current = d.mtime; }).catch(() => {});
   }, []);
 
   const persistIndex = useCallback(async (newIndex) => {
     setDocIndex(newIndex);
     await StorageAdapter.saveDocumentIndex(newIndex);
+    fetch("/api/index-mtime").then(r => r.json()).then(d => { _lastMtime.current = d.mtime; }).catch(() => {});
   }, []);
 
   const persistKeyParameters = useCallback(async (newKeyParameters) => {
@@ -5521,6 +5651,7 @@ function DMS({ storagePath, onChangeFolder }) {
     let workingTree = tree;
     let workingIndex = [...docIndex];
     setUploadStatus({ done: 0, total: filesToProcess.length, phase: "上传" });
+    const failedFiles = [];
 
     for (const file of filesToProcess) {
       const docId = genDocId();
@@ -5552,8 +5683,9 @@ function DMS({ storagePath, onChangeFolder }) {
         console.log(`[DMS] ✓ File read into memory (${dataUrl.length} chars of base64)`);
       } catch (e) {
         console.error("[DMS] ✗ Failed to read file:", e);
-        alert("无法读取文件：" + e.message);
-        return;
+        failedFiles.push(file.name);
+        setUploadStatus((s) => s ? { ...s, done: s.done + 1 } : s);
+        continue;
       }
       const _photoExts = new Set(["jpg","jpeg","png","heic","heif","tif","tiff","webp","gif","bmp"]);
       const _isPhoto = file.type.startsWith("image/") ||
@@ -5588,8 +5720,9 @@ function DMS({ storagePath, onChangeFolder }) {
         uploadResult = await StorageAdapter.saveDocument(doc) || {};
       } catch (e) {
         console.error("[DMS] ✗ saveDocument failed:", e);
-        alert("上传失败：" + e.message + "\n\n请检查 PyCharm 运行窗口中的服务器端错误。");
-        return;
+        failedFiles.push(file.name);
+        setUploadStatus((s) => s ? { ...s, done: s.done + 1 } : s);
+        continue;
       }
 
       workingTree = updateNodeInTree(workingTree, finalNodeId, (n) => ({
@@ -5623,6 +5756,9 @@ function DMS({ storagePath, onChangeFolder }) {
       alert("文件已上传，但无法保存索引：" + e.message);
     } finally {
       setUploadStatus(null);
+      if (failedFiles.length > 0) {
+        alert(`${failedFiles.length} 个文件上传失败（已跳过）：\n${failedFiles.join("\n")}`);
+      }
     }
   };
 
@@ -5717,10 +5853,103 @@ function DMS({ storagePath, onChangeFolder }) {
     }
   };
 
-  const openDoc = async (docId) => {
-    const doc = await StorageAdapter.getDocument(docId);
-    if (doc) setViewerDoc(doc);
+  const openDoc = (docId) => {
+    const meta = docIndex.find((d) => d.id === docId);
+    if (!meta) return;
+    setViewerDoc({
+      id: docId,
+      name: meta.name,
+      mime: meta.mime,
+      size: meta.size,
+      uploadedAt: meta.uploadedAt,
+      originalNodeId: meta.originalNodeId || meta.nodeId,
+      metadata: meta.metadata || {},
+      ocrText: meta.ocrText || "",
+      localKeyParams: Array.isArray(meta.localKeyParams) ? meta.localKeyParams : [],
+      dataUrl: API_BASE + "/api/docs/" + docId,
+    });
   };
+
+  const openDocNative = (docId) => {
+    fetch(`/api/docs/${docId}/open`, { method: "POST" });
+  };
+
+  const [pasteStatus, setPasteStatus] = useState(null); // null | "saving" | "done" | "error"
+
+  const handlePasteScreenshot = async (imageBlob) => {
+    if (!selectedId || !selectedNode) {
+      alert("请先选择一个文件夹。");
+      return;
+    }
+    setPasteStatus("saving");
+    try {
+      const reader = new FileReader();
+      const dataUrl = await new Promise((res, rej) => {
+        reader.onload = () => res(reader.result);
+        reader.onerror = rej;
+        reader.readAsDataURL(imageBlob);
+      });
+      const base64 = dataUrl.split(",")[1];
+
+      const res = await fetch("/api/paste-screenshot", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          image_data: base64,
+          node_id: selectedId,
+          folder_name: selectedNode.name,
+        }),
+      });
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || "Unknown error");
+
+      const docId = data.doc_id;
+      const newTree = updateNodeInTree(tree, selectedId, (n) => ({
+        ...n,
+        documents: [...(n.documents || []), { id: docId }],
+      }));
+      const newIndex = [
+        ...docIndex,
+        {
+          id: docId,
+          name: data.name,
+          mime: "application/pdf",
+          size: data.size,
+          uploadedAt: new Date().toISOString(),
+          originalNodeId: selectedId,
+          metadata: {},
+        },
+      ];
+      await persistTree(newTree);
+      await persistIndex(newIndex);
+      setPasteStatus("done");
+      setTimeout(() => setPasteStatus(null), 1500);
+    } catch (e) {
+      console.error("[DMS] paste screenshot error:", e);
+      setPasteStatus("error");
+      setTimeout(() => setPasteStatus(null), 3000);
+      alert("截图保存失败：" + e.message);
+    }
+  };
+
+  // Listen for Ctrl+V / Cmd+V paste events when a folder is selected
+  useEffect(() => {
+    const onPaste = (e) => {
+      if (!selectedId) return;
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      for (const item of items) {
+        if (item.kind === "file" && item.type.startsWith("image/")) {
+          e.preventDefault();
+          const blob = item.getAsFile();
+          if (blob) handlePasteScreenshot(blob);
+          return;
+        }
+      }
+    };
+    document.addEventListener("paste", onPaste);
+    return () => document.removeEventListener("paste", onPaste);
+  }, [selectedId, selectedNode, tree, docIndex]);
 
   // ---- DOCUMENT LINKAGE HELPERS -----------------------------------------
   // Compute, for every docId, the list of nodes that reference it.
@@ -6304,6 +6533,37 @@ function DMS({ storagePath, onChangeFolder }) {
                     >
                       <Layers size={12} /> 合并文档
                     </button>
+                    <button
+                      onClick={async () => {
+                        try {
+                          const clipItems = await navigator.clipboard.read();
+                          for (const item of clipItems) {
+                            const imgType = item.types.find((t) => t.startsWith("image/"));
+                            if (imgType) {
+                              const blob = await item.getType(imgType);
+                              handlePasteScreenshot(blob);
+                              return;
+                            }
+                          }
+                          alert(isMacDMS
+                            ? "剪贴板中未找到图片。\n请先截图（Cmd+Ctrl+Shift+4 复制到剪贴板），再点击此按钮。"
+                            : "剪贴板中未找到图片。\n请先截图（Win+Shift+S），再点击此按钮。");
+                        } catch {
+                          alert("无法读取剪贴板。\n请改用键盘快捷键：选中此文件夹后按 Ctrl+V / Cmd+V 粘贴截图。");
+                        }
+                      }}
+                      className={`text-xs px-3 py-1.5 border rounded cursor-pointer flex items-center gap-1.5 ${
+                        pasteStatus === "saving" ? "border-amber-400 bg-amber-50 text-amber-700 opacity-60 pointer-events-none"
+                        : pasteStatus === "done"  ? "border-green-400 bg-green-50 text-green-700"
+                        : pasteStatus === "error" ? "border-red-400 bg-red-50 text-red-700"
+                        : "border-stone-300 hover:bg-amber-50 hover:border-amber-400 text-stone-700"
+                      }`}
+                      title="将剪贴板截图保存为 PDF（也可在选中文件夹后直接按 Ctrl+V / Cmd+V）"
+                      disabled={pasteStatus === "saving"}
+                    >
+                      <Clipboard size={12} />
+                      {pasteStatus === "saving" ? "保存中…" : pasteStatus === "done" ? "已保存" : "粘贴截图"}
+                    </button>
                     <label className="text-xs px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white rounded cursor-pointer flex items-center gap-1.5">
                       <Upload size={12} /> 上传文件
                       <input type="file" multiple accept="application/pdf,image/*,text/*,.txt,.csv,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.zip" onChange={handleUpload} className="hidden" />
@@ -6336,6 +6596,7 @@ function DMS({ storagePath, onChangeFolder }) {
                         otherRefCount={otherRefs}
                         nodeSn={selectedNode.sn || ""}
                         onOpen={() => openDoc(doc.id)}
+                        onOpenNative={() => openDocNative(doc.id)}
                         onDelete={() => deleteDoc(doc.id)}
                         onUpdateMeta={(m) => updateDocMetadata(doc.id, m)}
                         onUpdateSn={(newSn) => updateDocSn(doc.id, newSn)}
