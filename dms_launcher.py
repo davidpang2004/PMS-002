@@ -1041,6 +1041,7 @@ class LauncherWindow:
                     _make_qr(full_url)
                     send_btn.config(state="normal")
                     if sys.platform.startswith("win"):
+                        sms_btn.config(state="normal")
                         wechat_btn.config(state="normal")
                     copy_btn.config(state="normal")
                     status_var.set("Link ready — valid for 24 hours.")
@@ -1076,6 +1077,32 @@ class LauncherWindow:
                 copy_btn.config(text="Copied!")
                 dlg.after(2000, lambda: copy_btn.config(text="Copy URL"))
 
+        def _send_sms():
+            phone = phone_var.get().strip()
+            if not phone:
+                status_var.set("Enter a phone number first.")
+                status_lbl.config(fg=WARN)
+                return
+            if not generated_url:
+                status_var.set("Generate a link first.")
+                status_lbl.config(fg=WARN)
+                return
+            import urllib.parse as _urlparse, subprocess as _sp
+            normalised = phone if phone.startswith("+") else "+" + phone
+            message = f"文件上传链接：\n{generated_url[0]}"
+            sms_uri = f"sms:{normalised}?body={_urlparse.quote(message)}"
+            try:
+                _sp.Popen(
+                    ["powershell", "-WindowStyle", "Hidden", "-Command",
+                     f"Start-Process '{sms_uri}'"],
+                    creationflags=0x08000000,
+                )
+                status_var.set(f"Opening Phone Link to send to {phone}…")
+                status_lbl.config(fg="#15803d")
+            except Exception as exc:
+                status_var.set(f"Could not open Phone Link: {exc}")
+                status_lbl.config(fg="#dc2626")
+
         def _send_wechat():
             if not generated_url:
                 status_var.set("Generate a link first.")
@@ -1106,6 +1133,9 @@ class LauncherWindow:
             send_btn.pack(side="left", padx=4)
 
         if sys.platform.startswith("win"):
+            sms_btn = tk.Button(action_row, text="Send via SMS", command=_send_sms,
+                                relief="groove", padx=12, pady=5, state="disabled")
+            sms_btn.pack(side="left", padx=4)
             wechat_btn = tk.Button(action_row, text="Send via WeChat", command=_send_wechat,
                                    relief="groove", padx=12, pady=5, state="disabled")
             wechat_btn.pack(side="left", padx=4)
