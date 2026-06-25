@@ -2823,7 +2823,8 @@ const SendToPhoneDialog = ({ doc, onClose }) => {
   const send = async () => {
     const p = phone.trim();
     if (!p) { setStatus({ ok: false, msg: "请输入手机号码。" }); return; }
-    setBusy(true); setStatus(null);
+    setBusy(true);
+    setStatus({ pending: true, msg: "正在建立安全通道，请稍候（约 15 秒）…" });
     try {
       const r = await fetch("/api/send-to-phone", {
         method: "POST",
@@ -2890,7 +2891,7 @@ const SendToPhoneDialog = ({ doc, onClose }) => {
         />
 
         {status && (
-          <div className={`text-xs rounded px-3 py-2 mb-3 ${status.ok ? "bg-green-50 text-green-800 border border-green-200" : "bg-red-50 text-red-700 border border-red-200"}`}>
+          <div className={`text-xs rounded px-3 py-2 mb-3 ${status.pending ? "bg-amber-50 text-amber-800 border border-amber-200" : status.ok ? "bg-green-50 text-green-800 border border-green-200" : "bg-red-50 text-red-700 border border-red-200"}`}>
             <div>{status.msg}</div>
             {status.ok && status.url && (
               <div className="mt-2 space-y-1.5">

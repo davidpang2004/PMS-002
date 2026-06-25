@@ -547,6 +547,10 @@ if _cli_project_path:
         p.mkdir(parents=True, exist_ok=True)
     _dms_server._storage_path_override = str(p)
 
+# Register the tunnel-start callback so send_to_phone can auto-start
+# the cloudflared tunnel on demand (no same-WiFi requirement).
+_dms_server._tunnel_start_fn = _get_or_start_tunnel
+
 
 # ---------------------------------------------------------------------------
 # WSGI server thread — waitress with a fixed thread pool

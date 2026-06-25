@@ -37,7 +37,7 @@ import webbrowser
 import zipfile
 from datetime import datetime
 from pathlib import Path
-from threading import Timer
+from threading import Timer, Lock as _Lock
 
 import re
 import time as _time
@@ -128,6 +128,8 @@ def save_config(cfg: dict) -> None:
 # Takes precedence over the shared ~/.dms_server_config.json storage_path.
 _storage_path_override: str = ""
 _tunnel_base_url: str = ""   # set by launcher after cloudflared starts
+_tunnel_start_fn = None      # injected by launcher: callable() -> public_url str
+_tunnel_start_lock = _Lock() # prevents two requests from starting the tunnel simultaneously
 
 
 def get_storage_root():
@@ -2010,7 +2012,17 @@ def send_to_phone():
     _DOWNLOAD_TOKENS[token] = {"doc_id": doc_id, "expiry": _t.time() + 3600}  # 1-hour link
 
     # Prefer the cloudflared tunnel URL (works from anywhere).
-    # Fall back to local WiFi IP (same-network only).
+    # Auto-start the tunnel on first use if the launcher registered a start function.
+    # Fall back to local WiFi IP (same-network only) if tunnel unavailable.
+    global _tunnel_base_url
+    if not _tunnel_base_url and _tunnel_start_fn is not None:
+        with _tunnel_start_lock:
+            if not _tunnel_base_url:  # re-check inside lock
+                try:
+                    _tunnel_base_url = _tunnel_start_fn()
+                except Exception as _e:
+                    print(f"[DMS] Tunnel auto-start failed: {_e} — falling back to LAN IP")
+
     is_tunnel = bool(_tunnel_base_url)
     if is_tunnel:
         download_url = f"{_tunnel_base_url}/dl/{token}"
