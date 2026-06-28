@@ -45,8 +45,9 @@ APP_NAME = "DMS"
 # Each entry is either a filename (goes to the _MEIPASS root)
 # or a (src, dest) tuple where dest is the subfolder inside _MEIPASS.
 DATA_FILES = [
-    ("dms.html", "."),      # dms.html → _MEIPASS/dms.html
-    ("vendor", "vendor"),   # vendor/ dir → _MEIPASS/vendor/ (offline JS)
+    ("dms.html", "."),             # dms.html → _MEIPASS/dms.html
+    ("vendor", "vendor"),          # vendor/ dir → _MEIPASS/vendor/ (offline JS)
+    ("deepface_worker.py", "."),   # deepface subprocess worker
 ]
 
 # Icon files (optional). Add an .icns for Mac and .ico for Windows if you have them.
@@ -71,7 +72,7 @@ def ensure_venv():
         subprocess.run(
             [str(venv_python), "-m", "pip", "install", "--quiet", "--upgrade",
              "pip", "pyinstaller", "flask", "waitress", "pypdf", "reportlab", "Pillow",
-             "pillow-heif", "PyMuPDF", "qrcode"],
+             "pillow-heif", "PyMuPDF", "qrcode", "numpy"],
             check=True,
         )
 
@@ -389,9 +390,18 @@ def build_pyinstaller_command() -> list[str]:
     # Stdlib exclusions are risky — http/email/uu modules form an import chain
     # that werkzeug pulls in at module level, so excluding any one of them
     # causes a ModuleNotFoundError inside Flask's own __init__.
-    for mod in ("numpy", "pandas", "scipy", "matplotlib",
+    for mod in ("pandas", "scipy", "matplotlib",
                 "idlelib", "turtle", "turtledemo", "lib2to3"):
         cmd.extend(["--exclude-module", mod])
+
+    # numpy is used by _cosine_sim for face recognition
+    try:
+        import numpy  # noqa: F401
+        cmd.extend(["--collect-submodules", "numpy"])
+        cmd.extend(["--hidden-import", "numpy"])
+        print("  numpy found — face recognition cosine similarity will work.")
+    except ImportError:
+        print("  numpy not installed — face recognition will be disabled.")
 
     # Belt-and-suspenders hidden imports
     for mod in ("tkinter", "tkinter.ttk", "tkinter.scrolledtext",

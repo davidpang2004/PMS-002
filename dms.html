@@ -214,6 +214,28 @@ const Camera = (p) => (
     <circle cx="12" cy="13" r="4" />
   </I>
 );
+const Users = (p) => (
+  <I {...p}>
+    <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
+    <circle cx="9" cy="7" r="4" />
+    <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
+    <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+  </I>
+);
+const User = (p) => (
+  <I {...p}>
+    <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
+    <circle cx="12" cy="7" r="4" />
+  </I>
+);
+const ScanFace = (p) => (
+  <I {...p}>
+    <path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/>
+    <path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/>
+    <circle cx="12" cy="12" r="3"/>
+    <path d="M9 9l1.5 1.5"/><path d="M15 9l-1.5 1.5"/><path d="M12 15v1"/>
+  </I>
+);
 const ExternalLink = (p) => (
   <I {...p}>
     <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
@@ -840,6 +862,7 @@ const TreeNode = ({
   const docCount = (node.documents || []).length;
   const isLast = siblingIndex === siblingCount - 1;
   const isPhotoRoot = node.id === photoRootNodeId;
+  const isRecycleBin = node.name === "Not Show in Tree";
   const currentParentLines = parentLines || [];
   const isDragging = draggingId === node.id;
   const isDropTarget = dropInfo?.targetId === node.id;
@@ -955,7 +978,9 @@ const TreeNode = ({
             isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />
           ) : <span className="w-3.5" />}
         </span>
-        {isExpanded && hasChildren ? (
+        {isRecycleBin ? (
+          <Trash2 size={15} className="text-stone-400 shrink-0" />
+        ) : isExpanded && hasChildren ? (
           <FolderOpen size={15} className="text-amber-700 shrink-0" />
         ) : (
           <Folder size={15} className="text-amber-700 shrink-0" />
@@ -976,8 +1001,8 @@ const TreeNode = ({
             className="flex-1 text-sm px-1 py-0 border border-amber-500 rounded bg-white text-stone-900 focus:outline-none"
           />
         ) : (
-          <span className="truncate flex-1" title="双击重命名">
-            {node.name}
+          <span className={`truncate flex-1 ${isRecycleBin ? "italic text-stone-400" : ""}`} title={isRecycleBin ? "已删除文件暂存于此 · 在此处删除则永久清除" : "双击重命名"}>
+            {isRecycleBin ? "已删除文件 (Not Show in Tree)" : node.name}
             {isPhotoRoot && (
               <Camera size={11} className="inline ml-1.5 text-amber-600 shrink-0" title="照片根目录" />
             )}
@@ -985,7 +1010,7 @@ const TreeNode = ({
               <span className="ml-1.5 text-[10px] text-amber-700 font-mono">· {node.sn}</span>
             )}
             {docCount > 0 && (
-              <span className="ml-1.5 text-[10px] text-stone-500">({docCount} 份文档)</span>
+              <span className={`ml-1.5 text-[10px] ${isRecycleBin ? "text-stone-400" : "text-stone-500"}`}>({docCount} 份文档)</span>
             )}
           </span>
         )}
@@ -1211,6 +1236,8 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
     ? `${API_BASE}/api/docs/${doc.id}/preview`
     : doc?.dataUrl;
 
+  const [imgLoadError, setImgLoadError] = useState(false);
+
   // OCR state
   const [ocrStatus, setOcrStatus] = useState(null);   // capability report
   const [ocrRunning, setOcrRunning] = useState(false);
@@ -1258,6 +1285,7 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
     setOcrInfo(null); setOcrHint(""); setOcrError("");
     setPanelMode(doc.ocrText ? "text" : null);
     setCopied(false); setSaved(false);
+    setImgLoadError(false);
     // Load this document's locally-added parameters; select NONE by default
     // (request: user explicitly picks what to extract for each document).
     setLocalKeys(normalizeKeyParameters(doc.localKeyParams || []));
@@ -1271,6 +1299,16 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
     if (!doc || !ocrEligible) return;
     let alive = true;
     StorageAdapter.ocrStatus().then((s) => { if (alive) setOcrStatus(s); });
+    return () => { alive = false; };
+  }, [doc?.id]);
+
+  // For non-image types (PDF, text), verify the file exists via HEAD request.
+  useEffect(() => {
+    if (!doc || isImage) return;
+    let alive = true;
+    fetch(doc.dataUrl, { method: "HEAD" })
+      .then((r) => { if (alive && !r.ok) setImgLoadError(true); })
+      .catch(() => { if (alive) setImgLoadError(true); });
     return () => { alive = false; };
   }, [doc?.id]);
 
@@ -1492,18 +1530,31 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
         <div className="flex-1 min-h-0 flex">
           {/* Preview pane */}
           <div className={"min-h-0 overflow-auto bg-stone-100 " + (panelOpen ? "flex-1 border-r border-stone-200" : "flex-1")}>
-            {isImage && (
-              <div className="h-full flex items-center justify-center p-4">
-                <img src={viewUrl} alt={doc.name} className="max-w-full max-h-full object-contain" />
+            {imgLoadError ? (
+              <div className="h-full flex flex-col items-center justify-center text-stone-500 gap-3 p-6">
+                <File size={52} className="text-stone-300" />
+                <div className="text-sm font-medium text-stone-700 text-center">{doc.name}</div>
+                <div className="text-xs text-red-500 bg-red-50 border border-red-200 rounded px-3 py-2 text-center max-w-xs">
+                  文件不存在或无法访问。<br/>该文件可能已从磁盘中移走或删除。
+                </div>
+                <a
+                  href={doc.dataUrl}
+                  download={doc.name}
+                  className="mt-1 flex items-center gap-2 px-4 py-2 border border-stone-300 text-stone-600 text-xs rounded hover:bg-stone-100"
+                >
+                  <Download size={13} /> 尝试下载
+                </a>
               </div>
-            )}
-            {isPdf && (
+            ) : isImage ? (
+              <div className="h-full flex items-center justify-center p-4">
+                <img src={viewUrl} alt={doc.name} className="max-w-full max-h-full object-contain"
+                  onError={() => setImgLoadError(true)} />
+              </div>
+            ) : isPdf ? (
               <iframe src={doc.dataUrl} title={doc.name} className="w-full h-full border-0" />
-            )}
-            {isText && (
+            ) : isText ? (
               <iframe src={doc.dataUrl} title={doc.name} className="w-full h-full border-0 bg-white font-mono" />
-            )}
-            {!isImage && !isPdf && !isText && (
+            ) : (
               <div className="h-full flex flex-col items-center justify-center text-stone-500 gap-3 p-6">
                 <File size={52} className="text-stone-400" />
                 <div className="text-sm font-medium text-stone-700 text-center">{doc.name}</div>
@@ -3302,6 +3353,7 @@ const DocumentCard = ({
   doc, otherRefCount = 0, nodeSn = "",
   onOpen, onOpenNative, onDelete, onUpdateMeta, onUpdateSn, formatBytes, keyParameters = [],
   onOpenEmailSettings,
+  faceSelectMode = false, faceSelected = false, onToggleFaceSelect,
 }) => {
   const [showMeta, setShowMeta] = useState(() => Object.keys(doc.metadata || {}).length > 0);
   const [editingSn, setEditingSn] = useState(false);
@@ -3328,10 +3380,22 @@ const DocumentCard = ({
   const cancelSn = () => setEditingSn(false);
 
   return (
-    <div className="border border-stone-200 rounded bg-white">
+    <div className={`border rounded bg-white ${faceSelectMode && faceSelected ? "border-amber-400 bg-amber-50" : "border-stone-200"}`}>
       <div className="flex items-center gap-3 p-3">
-        <div className="w-10 h-10 bg-stone-100 rounded flex items-center justify-center text-stone-600 shrink-0">
-          <Icon size={18} />
+        <div
+          className={`w-10 h-10 rounded flex items-center justify-center shrink-0 relative ${faceSelectMode ? "cursor-pointer" : "bg-stone-100 text-stone-600"}`}
+          onClick={faceSelectMode ? (e) => { e.stopPropagation(); onToggleFaceSelect && onToggleFaceSelect(); } : undefined}
+        >
+          {faceSelectMode ? (
+            <div className={`w-10 h-10 rounded border-2 flex items-center justify-center ${faceSelected ? "border-amber-500 bg-amber-100" : "border-stone-300 bg-stone-100"}`}>
+              {faceSelected
+                ? <CheckSquare size={18} className="text-amber-600" />
+                : <Square size={18} className="text-stone-400" />
+              }
+            </div>
+          ) : (
+            <Icon size={18} />
+          )}
         </div>
         <div className="flex-1 min-w-0 cursor-pointer" onClick={onOpen}>
           <div className="text-sm font-medium text-stone-900 truncate hover:text-amber-700 flex items-center gap-1.5">
@@ -4163,13 +4227,696 @@ const HierarchyImportDialog = ({ open, onClose, onImported }) => {
   );
 };
 
-const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onOpenHierarchyImport, onOpenZipImport, onTriggerImport, onOpenEmailSettings }) => {
+// ---- Face Tagging Dialog ---------------------------------------------------
+const FaceTaggingDialog = ({ open, onClose, docIds, onLabeled }) => {
+  const [detecting, setDetecting] = useState(false);
+  const [results, setResults] = useState([]);
+  const [people, setPeople] = useState([]);
+  const [activeFace, setActiveFace] = useState(null); // {docId,faceIdx,embedding,bbox}
+  const [nameInput, setNameInput] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState(null);
+  const [deepfaceMissing, setDeepfaceMissing] = useState(false);
+  const [installing, setInstalling] = useState(false);
+  const [installError, setInstallError] = useState(null);
+  const nameRef = React.useRef(null);
+
+  useEffect(() => {
+    if (!open) return;
+    setResults([]);
+    setError(null);
+    setActiveFace(null);
+    setNameInput("");
+    setDetecting(true);
+    Promise.all([
+      fetch("/api/faces/detect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ docIds }),
+      }).then((r) => r.json()),
+      fetch("/api/faces/people").then((r) => r.json()),
+    ])
+      .then(([detectData, peopleData]) => {
+        if (detectData.error && detectData.deepfaceMissing) {
+          setDeepfaceMissing(true);
+        } else if (detectData.error) {
+          setError(detectData.error);
+        } else {
+          setResults(detectData.results || []);
+        }
+        setPeople((peopleData.people || []));
+      })
+      .catch((e) => setError("请求失败: " + e.message))
+      .finally(() => setDetecting(false));
+  }, [open, docIds.join(",")]);
+
+  useEffect(() => {
+    if (activeFace && nameRef.current) {
+      nameRef.current.focus();
+    }
+  }, [activeFace]);
+
+  if (!open) return null;
+
+  const nameSuggestions = people
+    .map((p) => p.name)
+    .filter((n) => !nameInput || n.toLowerCase().includes(nameInput.toLowerCase()));
+
+  const handleLabel = async (personName) => {
+    if (!activeFace || !personName.trim()) return;
+    setSaving(true);
+    try {
+      const res = await fetch("/api/faces/label", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          docId: activeFace.docId,
+          faceIdx: activeFace.faceIdx,
+          name: personName.trim(),
+          embedding: activeFace.embedding,
+          bbox: activeFace.bbox,
+        }),
+      });
+      const d = await res.json();
+      if (d.ok) {
+        // Update results in-place
+        setResults((prev) =>
+          prev.map((r) => {
+            if (r.docId !== activeFace.docId) return r;
+            return {
+              ...r,
+              faces: r.faces.map((f) =>
+                f.faceIdx === activeFace.faceIdx
+                  ? { ...f, personId: d.personId, personName: d.personName }
+                  : f
+              ),
+            };
+          })
+        );
+        // Refresh people list
+        fetch("/api/faces/people")
+          .then((r) => r.json())
+          .then((d) => setPeople(d.people || []));
+        onLabeled && onLabeled();
+        setActiveFace(null);
+        setNameInput("");
+      }
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleUnlabel = async (docId, faceIdx) => {
+    await fetch("/api/faces/label", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ docId, faceIdx }),
+    });
+    setResults((prev) =>
+      prev.map((r) => {
+        if (r.docId !== docId) return r;
+        return {
+          ...r,
+          faces: r.faces.map((f) =>
+            f.faceIdx === faceIdx ? { ...f, personId: null, personName: null } : f
+          ),
+        };
+      })
+    );
+  };
+
+  return (
+    <div className="fixed inset-0 bg-stone-900/60 z-50 flex items-center justify-center p-4" onClick={(e) => { if (e.target === e.currentTarget) { setActiveFace(null); } }}>
+      <div className="bg-white rounded-xl shadow-2xl w-full max-w-2xl max-h-[85vh] flex flex-col">
+        {/* Header */}
+        <div className="flex items-center justify-between px-5 py-3 border-b border-stone-200">
+          <div className="font-semibold text-stone-900 flex items-center gap-2">
+            <ScanFace size={16} className="text-amber-600" />
+            标记人脸 · 选中 {docIds.length} 张照片
+          </div>
+          <button onClick={onClose} className="text-stone-400 hover:text-stone-700"><X size={18} /></button>
+        </div>
+
+        {/* Body */}
+        <div className="flex-1 overflow-y-auto p-4 space-y-4">
+          {detecting && (
+            <div className="flex items-center justify-center gap-2 py-8 text-stone-500">
+              <Loader size={18} className="animate-spin" /> 正在检测人脸…
+            </div>
+          )}
+          {deepfaceMissing && (
+            <div className="bg-amber-50 border border-amber-200 rounded p-3 text-sm text-amber-800 space-y-2">
+              <p className="font-medium">需要安装 deepface 才能检测人脸。</p>
+              {installError && (
+                <div className="text-xs text-red-700 bg-red-50 border border-red-200 rounded px-2 py-1 break-all">{installError}</div>
+              )}
+              <button
+                onClick={async () => {
+                  setInstalling(true); setInstallError(null);
+                  try {
+                    const r = await fetch("/api/install-deepface", { method: "POST" });
+                    const d = await r.json();
+                    if (d.needsPython312) {
+                      setInstallError(d.message + "\n\n点击下方按钮下载 Python 3.12，安装后重试。");
+                      window.open(d.downloadUrl, "_blank");
+                    } else if (d.ok) {
+                      setDeepfaceMissing(false);
+                      setDetecting(true);
+                      Promise.all([
+                        fetch("/api/faces/detect", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ docIds }) }).then(r => r.json()),
+                        fetch("/api/faces/people").then(r => r.json()),
+                      ]).then(([detectData, peopleData]) => {
+                        if (detectData.results) setResults(detectData.results);
+                        if (peopleData.people) setPeople(peopleData.people);
+                      }).catch(e => setError(e.message)).finally(() => setDetecting(false));
+                    } else { setInstallError(d.error || "安装失败"); }
+                  } catch (e) { setInstallError(e.message); }
+                  finally { setInstalling(false); }
+                }}
+                disabled={installing}
+                className="w-full py-1.5 bg-amber-600 hover:bg-amber-700 text-white rounded text-xs disabled:opacity-60 flex items-center justify-center gap-1.5"
+              >
+                {installing ? <><Loader size={11} className="animate-spin" /> 安装中，请稍候…</> : "自动安装 deepface"}
+              </button>
+              <p className="text-[10px] text-amber-600">首次安装需下载约 200 MB，请保持网络连接。</p>
+            </div>
+          )}
+          {error && (
+            <div className="bg-red-50 border border-red-200 rounded p-3 text-sm text-red-700">
+              {error}
+            </div>
+          )}
+          {!detecting && !error && results.map((result) => (
+            <div key={result.docId} className="border border-stone-200 rounded-lg p-3">
+              <div className="flex items-start gap-3">
+                {/* Thumbnail */}
+                <img
+                  src={`/api/docs/${result.docId}/preview`}
+                  alt=""
+                  className="w-16 h-16 object-cover rounded border border-stone-200 shrink-0"
+                  onError={(e) => { e.target.style.display = "none"; }}
+                />
+                <div className="flex-1 min-w-0">
+                  {result.error ? (
+                    <div className="text-sm text-stone-500">{result.error}</div>
+                  ) : result.faces.length === 0 ? (
+                    <div className="text-sm text-stone-400">未检测到人脸</div>
+                  ) : (
+                    <div className="flex flex-wrap gap-2">
+                      {result.faces.map((face) => {
+                        const isActive = activeFace && activeFace.docId === result.docId && activeFace.faceIdx === face.faceIdx;
+                        return (
+                          <div key={face.faceIdx} className="relative flex flex-col items-center gap-1">
+                            <div className="relative">
+                              <img
+                                src={`data:image/jpeg;base64,${face.crop_b64}`}
+                                alt={`人脸 ${face.faceIdx + 1}`}
+                                className={`w-14 h-14 object-cover rounded cursor-pointer border-2 transition-colors ${
+                                  isActive ? "border-amber-500 ring-2 ring-amber-300" :
+                                  face.personId ? "border-green-400" : "border-stone-200 hover:border-amber-400"
+                                }`}
+                                onClick={() => {
+                                  if (isActive) {
+                                    setActiveFace(null);
+                                  } else {
+                                    setActiveFace({ docId: result.docId, faceIdx: face.faceIdx, embedding: face.embedding, bbox: face.bbox });
+                                    setNameInput(face.personName || "");
+                                  }
+                                }}
+                              />
+                              {face.personId && (
+                                <button
+                                  onClick={(e) => { e.stopPropagation(); handleUnlabel(result.docId, face.faceIdx); }}
+                                  className="absolute -top-1 -right-1 w-4 h-4 bg-red-500 text-white rounded-full flex items-center justify-center text-[9px] hover:bg-red-600"
+                                  title="取消标记"
+                                >×</button>
+                              )}
+                            </div>
+                            {face.personName ? (
+                              <span className="text-[10px] bg-green-100 text-green-800 px-1.5 py-0.5 rounded max-w-[56px] truncate">{face.personName}</span>
+                            ) : (
+                              <span className="text-[10px] text-stone-400">未标记</span>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+
+                  {/* Name input popover for active face in this result */}
+                  {activeFace && activeFace.docId === result.docId && (
+                    <div className="mt-2 flex flex-col gap-1">
+                      <div className="flex gap-1">
+                        <input
+                          ref={nameRef}
+                          value={nameInput}
+                          onChange={(e) => setNameInput(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") { handleLabel(nameInput); }
+                            if (e.key === "Escape") { setActiveFace(null); setNameInput(""); }
+                          }}
+                          placeholder="输入姓名…"
+                          className="flex-1 text-xs border border-stone-300 rounded px-2 py-1 outline-none focus:border-amber-400"
+                          disabled={saving}
+                        />
+                        <button
+                          onClick={() => handleLabel(nameInput)}
+                          disabled={saving || !nameInput.trim()}
+                          className="text-xs px-2 py-1 bg-amber-500 hover:bg-amber-600 text-white rounded disabled:opacity-40"
+                        >
+                          {saving ? "…" : "标记"}
+                        </button>
+                      </div>
+                      {nameSuggestions.length > 0 && (
+                        <div className="flex flex-wrap gap-1">
+                          {nameSuggestions.slice(0, 8).map((n) => (
+                            <button
+                              key={n}
+                              onClick={() => handleLabel(n)}
+                              className="text-[10px] px-1.5 py-0.5 bg-stone-100 hover:bg-amber-100 text-stone-700 rounded border border-stone-200"
+                            >{n}</button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* Footer */}
+        <div className="px-5 py-3 border-t border-stone-200 flex justify-end">
+          <button onClick={onClose} className="text-sm px-4 py-1.5 bg-stone-100 hover:bg-stone-200 text-stone-700 rounded">
+            完成
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// ---- People Panel ----------------------------------------------------------
+const PeoplePanel = ({ onFilterPerson, filteredPersonId, tree }) => {
+  const [people, setPeople] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [recognizing, setRecognizing] = useState(null); // personId or null
+  const [error, setError] = useState(null);
+  const [deepfaceAvailable, setDeepfaceAvailable] = useState(true);
+  const [confirmDelete, setConfirmDelete] = useState(null); // personId
+  const [scanDialog, setScanDialog] = useState(null);    // personId being scoped
+  const [scanNodeIds, setScanNodeIds] = useState(new Set());
+  const [scanExpanded, setScanExpanded] = useState(new Set());
+  const [scanThreshold, setScanThreshold] = useState(0.70);
+  const [installing, setInstalling] = useState(false);
+  const [installError, setInstallError] = useState(null);
+  const [gallery, setGallery] = useState(null); // { personName, docIds: [], folderCreated: false }
+  const [galleryBusy, setGalleryBusy] = useState(false);
+
+  const openGallery = (person) => {
+    fetch(`/api/faces/photos/${person.id}`)
+      .then((r) => r.json())
+      .then((d) => setGallery({ personName: person.name, docIds: d.docIds || [], folderCreated: false }))
+      .catch(() => {});
+  };
+
+  const createFaceFolder = async () => {
+    if (!gallery) return;
+    setGalleryBusy(true);
+    try {
+      const res = await fetch("/api/faces/create-folder", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ personName: gallery.personName, docIds: gallery.docIds }),
+      });
+      const d = await res.json();
+      if (d.ok) {
+        setGallery((g) => ({ ...g, folderCreated: true, added: d.added }));
+      }
+    } catch (e) {
+      // silent
+    } finally {
+      setGalleryBusy(false);
+    }
+  };
+
+  const loadPeople = () => {
+    setLoading(true);
+    fetch("/api/faces/people")
+      .then((r) => r.json())
+      .then((d) => {
+        setPeople(d.people || []);
+        setDeepfaceAvailable(d.deepfaceAvailable !== false);
+      })
+      .catch((e) => setError("加载失败: " + e.message))
+      .finally(() => setLoading(false));
+  };
+
+  useEffect(() => { loadPeople(); }, []);
+
+  const openScanDialog = (personId) => {
+    setScanDialog(personId);
+    setScanNodeIds(new Set());
+    setScanExpanded(tree ? new Set([tree.id]) : new Set());
+  };
+
+  const toggleScanExpand = (id) =>
+    setScanExpanded((prev) => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
+
+  const toggleScanFolder = (node) => {
+    setScanNodeIds((prev) => {
+      const next = new Set(prev);
+      const on = !next.has(node.id);
+      const walk = (n) => { on ? next.add(n.id) : next.delete(n.id); (n.children || []).forEach(walk); };
+      walk(node);
+      return next;
+    });
+  };
+
+  const hasScanDescendant = (node) =>
+    (node.children || []).some((c) => scanNodeIds.has(c.id) || hasScanDescendant(c));
+
+  const renderScanTree = (node, depth = 0) => {
+    const isExp = scanExpanded.has(node.id);
+    const isChecked = scanNodeIds.has(node.id);
+    const isPartial = !isChecked && hasScanDescendant(node);
+    const hasChildren = (node.children || []).length > 0;
+    return (
+      <div key={node.id}>
+        <div className="flex items-center gap-1 hover:bg-amber-50 rounded py-0.5 cursor-pointer"
+             style={{ paddingLeft: `${6 + depth * 14}px` }}>
+          <button onClick={() => toggleScanExpand(node.id)}
+            className="shrink-0 w-4 flex items-center justify-center">
+            {hasChildren ? (isExp ? <ChevronDown size={11} /> : <ChevronRight size={11} />) : null}
+          </button>
+          <input type="checkbox" checked={isChecked}
+            ref={(el) => { if (el) el.indeterminate = isPartial; }}
+            onChange={() => toggleScanFolder(node)}
+            className="shrink-0 cursor-pointer" />
+          <Folder size={12} className="text-amber-600 shrink-0 ml-0.5" />
+          <span className="text-xs text-stone-800 truncate ml-0.5">{node.name}</span>
+        </div>
+        {isExp && hasChildren && (node.children || []).map((c) => renderScanTree(c, depth + 1))}
+      </div>
+    );
+  };
+
+  const handleRecognize = async (personId, nodeIds) => {
+    setRecognizing(personId);
+    setScanDialog(null);
+    setError(null);
+    try {
+      const body = { personId, threshold: scanThreshold };
+      if (nodeIds && nodeIds.length > 0) body.nodeIds = nodeIds;
+      const res = await fetch("/api/faces/recognize", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const d = await res.json();
+      if (d.error) {
+        setError(d.error);
+      } else {
+        const person = people.find(p => p.id === personId);
+        const name = person ? person.name : "";
+        const photoCount = d.photos != null ? d.photos : d.found;
+        const msg = photoCount > 0
+          ? `在 ${d.scanned} 张照片中识别到 ${photoCount} 张含有${name}的照片`
+          : `已扫描 ${d.scanned} 张照片，未发现新的匹配`;
+        setError("✅ " + msg);
+        loadPeople();
+      }
+    } catch (e) {
+      setError("识别失败: " + e.message);
+    } finally {
+      setRecognizing(null);
+    }
+  };
+
+  const handleDelete = async (personId) => {
+    await fetch(`/api/faces/person/${personId}`, { method: "DELETE" });
+    if (filteredPersonId === personId) onFilterPerson(null);
+    setConfirmDelete(null);
+    loadPeople();
+  };
+
+  return (
+    <div className="flex flex-col h-full overflow-hidden">
+      {/* Header */}
+      <div className="flex items-center justify-between px-3 py-2 border-b border-stone-200 shrink-0">
+        <span className="text-xs font-semibold text-stone-700 flex items-center gap-1.5">
+          <Users size={12} /> 人脸识别
+        </span>
+        <button onClick={loadPeople} className="text-stone-400 hover:text-stone-700" title="刷新">
+          <Loader size={12} className={loading ? "animate-spin" : ""} />
+        </button>
+      </div>
+
+      {recognizing !== null && (
+        <div className="mx-2 mt-2 p-2 bg-amber-50 border border-amber-200 rounded text-xs text-amber-800 flex items-center gap-2">
+          <Loader size={11} className="animate-spin shrink-0" />
+          <span>正在扫描照片，识别人脸中…可能需要几分钟，请耐心等待。</span>
+        </div>
+      )}
+
+      {!deepfaceAvailable && (
+        <div className="m-2 p-3 bg-amber-50 border border-amber-200 rounded text-xs text-amber-800 space-y-2">
+          <p className="font-medium">需要安装 deepface 才能使用人脸识别。</p>
+          {installError && (
+            <div className="text-red-700 bg-red-50 border border-red-200 rounded px-2 py-1 break-all">{installError}</div>
+          )}
+          <button
+            onClick={async () => {
+              setInstalling(true); setInstallError(null);
+              try {
+                const r = await fetch("/api/install-deepface", { method: "POST" });
+                const d = await r.json();
+                if (d.needsPython312) {
+                  setInstallError(d.message);
+                  window.open(d.downloadUrl, "_blank");
+                } else if (d.ok) { loadPeople(); }
+                else { setInstallError(d.error || "安装失败"); }
+              } catch (e) { setInstallError(e.message); }
+              finally { setInstalling(false); }
+            }}
+            disabled={installing}
+            className="w-full py-1.5 bg-amber-600 hover:bg-amber-700 text-white rounded disabled:opacity-60 flex items-center justify-center gap-1.5"
+          >
+            {installing
+              ? <><Loader size={11} className="animate-spin" /> 安装中，请稍候…</>
+              : "自动安装 deepface"}
+          </button>
+          <p className="text-[10px] text-amber-600">首次安装需下载约 200 MB，请保持网络连接。</p>
+        </div>
+      )}
+
+      {error && (
+        <div className={`mx-2 my-1 p-2 rounded text-xs flex items-start gap-1 ${error.startsWith("✅") ? "bg-green-50 border border-green-200 text-green-800" : "bg-red-50 border border-red-200 text-red-700"}`}>
+          <span className="flex-1">{error}</span>
+          <button onClick={() => setError(null)} className="ml-1 opacity-50 hover:opacity-100 shrink-0">×</button>
+        </div>
+      )}
+
+      {filteredPersonId && (
+        <div className="mx-2 mt-1 flex items-center justify-between">
+          <span className="text-[10px] text-amber-700 bg-amber-50 px-2 py-0.5 rounded border border-amber-200">
+            已筛选：{(people.find((p) => p.id === filteredPersonId) || {}).name || ""}
+          </span>
+          <button
+            onClick={() => onFilterPerson(null)}
+            className="text-[10px] text-stone-500 hover:text-stone-700 ml-1"
+          >清除筛选</button>
+        </div>
+      )}
+
+      {/* Scan scope dialog */}
+      {scanDialog && (
+        <div className="fixed inset-0 bg-stone-900/70 z-50 flex items-center justify-center p-4"
+             onClick={() => setScanDialog(null)}>
+          <div className="bg-white w-full max-w-sm rounded shadow-2xl flex flex-col"
+               style={{ maxHeight: "75vh" }}
+               onClick={(e) => e.stopPropagation()}>
+            <div className="px-4 pt-4 pb-3 border-b border-stone-200 shrink-0">
+              <div className="text-[10px] tracking-[0.2em] uppercase text-stone-500 mb-0.5">识别范围</div>
+              <h2 className="text-sm font-semibold text-stone-900">
+                选择要扫描的文件夹
+              </h2>
+              <p className="text-[11px] text-stone-500 mt-1">
+                扫描选中文件夹及其所有子文件夹中的照片。不选则扫描全库。
+              </p>
+            </div>
+            <div className="overflow-y-auto flex-1 px-3 py-2">
+              {tree ? renderScanTree(tree) : (
+                <div className="text-xs text-stone-400 text-center py-4">暂无文件夹树。</div>
+              )}
+            </div>
+            <div className="px-4 py-2 border-t border-stone-100 shrink-0">
+              <div className="flex items-center justify-between mb-0.5">
+                <label className="text-[10px] text-stone-500">匹配精度（相似度阈值）</label>
+                <span className="text-[10px] font-medium text-stone-700">{Math.round(scanThreshold * 100)}%</span>
+              </div>
+              <input type="range" min="55" max="95" step="1"
+                value={Math.round(scanThreshold * 100)}
+                onChange={(e) => setScanThreshold(Number(e.target.value) / 100)}
+                className="w-full h-1.5 accent-amber-500" />
+              <div className="flex justify-between text-[9px] text-stone-400 mt-0.5">
+                <span>宽松（更多匹配）</span>
+                <span>严格（更少误匹配）</span>
+              </div>
+            </div>
+            <div className="px-4 py-3 border-t border-stone-200 flex gap-2 justify-end shrink-0">
+              <button onClick={() => setScanDialog(null)}
+                className="px-3 py-1.5 text-xs border border-stone-300 hover:bg-stone-100 rounded">
+                取消
+              </button>
+              <button
+                onClick={() => handleRecognize(scanDialog, [])}
+                disabled={recognizing !== null}
+                className="px-3 py-1.5 text-xs border border-stone-300 hover:bg-stone-50 text-stone-700 rounded disabled:opacity-50">
+                扫描全库
+              </button>
+              <button
+                onClick={() => handleRecognize(scanDialog, Array.from(scanNodeIds))}
+                disabled={recognizing !== null || scanNodeIds.size === 0}
+                className="px-3 py-1.5 text-xs bg-amber-600 hover:bg-amber-700 text-white rounded disabled:opacity-50">
+                扫描选中文件夹 {scanNodeIds.size > 0 ? `(${scanNodeIds.size})` : ""}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="flex-1 overflow-y-auto p-2 space-y-2">
+        {loading && people.length === 0 && (
+          <div className="flex items-center justify-center gap-1 py-6 text-stone-400 text-xs">
+            <Loader size={12} className="animate-spin" /> 加载中…
+          </div>
+        )}
+        {!loading && people.length === 0 && (
+          <div className="text-center py-6 text-stone-400 text-xs">
+            尚无标记人脸。<br />选择照片后点击"标记人脸"开始。
+          </div>
+        )}
+        {people.map((person) => (
+          <div
+            key={person.id}
+            className={`border rounded-lg p-2 cursor-pointer transition-colors ${
+              filteredPersonId === person.id
+                ? "border-amber-400 bg-amber-50"
+                : "border-stone-200 bg-white hover:border-stone-300 hover:bg-stone-50"
+            }`}
+            onClick={() => openGallery(person)}
+          >
+            {confirmDelete === person.id ? (
+              <div className="text-xs text-red-700">
+                <p>确认删除 <b>{person.name}</b> 及其所有标记？</p>
+                <div className="flex gap-2 mt-1">
+                  <button onClick={(e) => { e.stopPropagation(); handleDelete(person.id); }} className="px-2 py-0.5 bg-red-500 text-white rounded text-[10px]">确认删除</button>
+                  <button onClick={(e) => { e.stopPropagation(); setConfirmDelete(null); }} className="px-2 py-0.5 bg-stone-100 rounded text-[10px]">取消</button>
+                </div>
+              </div>
+            ) : (
+              <div className="flex items-center gap-2">
+                {person.avatarCrop ? (
+                  <img src={`data:image/jpeg;base64,${person.avatarCrop}`} alt={person.name}
+                    className="w-10 h-10 rounded-full object-cover border-2 border-stone-200 shrink-0" />
+                ) : (
+                  <div className="w-10 h-10 rounded-full bg-stone-200 flex items-center justify-center shrink-0">
+                    <User size={16} className="text-stone-500" />
+                  </div>
+                )}
+                <div className="flex-1 min-w-0">
+                  <div className="text-xs font-medium text-stone-900 truncate">{person.name}</div>
+                  <div className="text-[10px] text-stone-500">{person.photoCount} 张照片</div>
+                </div>
+                <div className="flex gap-1 shrink-0" onClick={(e) => e.stopPropagation()}>
+                  <button
+                    onClick={() => openScanDialog(person.id)}
+                    disabled={recognizing !== null}
+                    className="text-[10px] px-1.5 py-0.5 border border-stone-300 rounded hover:bg-amber-50 hover:border-amber-400 disabled:opacity-40 flex items-center gap-0.5"
+                    title="在指定文件夹中搜索此人"
+                  >
+                    {recognizing === person.id
+                      ? <Loader size={9} className="animate-spin" />
+                      : <ScanFace size={9} />
+                    }
+                    识别
+                  </button>
+                  <button
+                    onClick={() => setConfirmDelete(person.id)}
+                    className="text-[10px] px-1 py-0.5 border border-stone-200 rounded text-stone-400 hover:bg-red-50 hover:border-red-300 hover:text-red-600"
+                    title="删除此人及所有标记"
+                  >
+                    <Trash2 size={9} />
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+
+      {/* Photo gallery modal */}
+      {gallery && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
+             onClick={() => setGallery(null)}>
+          <div className="bg-white rounded-xl shadow-2xl w-[90vw] max-w-3xl max-h-[80vh] flex flex-col"
+               onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between px-4 py-3 border-b border-stone-200 shrink-0">
+              <span className="text-sm font-semibold text-stone-800">
+                {gallery.personName} — {gallery.docIds.length} 张照片
+              </span>
+              <div className="flex items-center gap-2">
+                {gallery.folderCreated ? (
+                  <span className="text-xs text-green-700 bg-green-50 border border-green-200 rounded px-2 py-0.5">
+                    ✓ 已创建"人脸匹配/{gallery.personName}"文件夹（{gallery.added} 张）
+                  </span>
+                ) : (
+                  <button
+                    onClick={createFaceFolder}
+                    disabled={galleryBusy}
+                    className="text-xs px-3 py-1 bg-amber-500 hover:bg-amber-600 text-white rounded disabled:opacity-40"
+                  >
+                    {galleryBusy ? "创建中…" : "创建匹配文件夹"}
+                  </button>
+                )}
+                <button onClick={() => setGallery(null)}
+                  className="text-stone-400 hover:text-stone-700 text-lg leading-none ml-1">×</button>
+              </div>
+            </div>
+            <div className="overflow-y-auto p-3 grid grid-cols-4 gap-2">
+              {gallery.docIds.map((docId) => (
+                <div key={docId} className="aspect-square rounded overflow-hidden bg-stone-100 border border-stone-200">
+                  <img
+                    src={`/api/docs/${docId}/preview`}
+                    alt={docId}
+                    className="w-full h-full object-cover"
+                    loading="lazy"
+                    onError={(e) => { e.target.style.display = "none"; }}
+                  />
+                </div>
+              ))}
+              {gallery.docIds.length === 0 && (
+                <div className="col-span-4 text-center py-8 text-stone-400 text-sm">暂无照片</div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onOpenHierarchyImport, onOpenZipImport, onTriggerImport, onOpenEmailSettings, tree }) => {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const [importDialog, setImportDialog] = useState(null); // { file, mode, target }
   const [newDialog, setNewDialog] = useState(null);       // { target }
   const [pwDialog, setPwDialog] = useState(null);         // { current, next, confirm, hasExisting }
   const [authStatus, setAuthStatus] = useState(null);
+  const [exportSelDialog, setExportSelDialog] = useState(false);
+  const [exportSelChecked, setExportSelChecked] = useState(new Set());
   const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform);
   const exampleNew = isMac
     ? "/Users/yourname/DMS_Project_2"
@@ -4227,6 +4974,67 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
+      onClose();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const doExportFull = async () => {
+    setError(null);
+    setBusy(true);
+    try {
+      const res = await fetch("/api/project/export-full");
+      if (!res.ok) {
+        let msg = `HTTP ${res.status}`;
+        try { msg = (await res.json()).error || msg; } catch {}
+        throw new Error(msg);
+      }
+      const blob = await res.blob();
+      const cd = res.headers.get("Content-Disposition") || "";
+      const m = cd.match(/filename[^;=\n]*=["']?([^"'\n]+)["']?/);
+      const filename = m ? m[1] : "dms-full-backup.dms";
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = filename;
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+      onClose();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const doExportSelected = async (nodeIds) => {
+    if (!nodeIds.length) return;
+    setError(null);
+    setBusy(true);
+    try {
+      const res = await fetch("/api/project/export-selected", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ node_ids: nodeIds }),
+      });
+      if (!res.ok) {
+        let msg = `HTTP ${res.status}`;
+        try { msg = (await res.json()).error || msg; } catch {}
+        throw new Error(msg);
+      }
+      const blob = await res.blob();
+      const cd = res.headers.get("Content-Disposition") || "";
+      const m = cd.match(/filename[^;=\n]*=["']?([^"'\n]+)["']?/);
+      const filename = m ? m[1] : "dms-selected.dms";
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = filename;
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+      setExportSelDialog(false);
+      setExportSelChecked(new Set());
       onClose();
     } catch (e) {
       setError(e.message);
@@ -4373,6 +5181,8 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
           onClick={(e) => e.stopPropagation()}
           className="absolute right-0 top-full mt-1 w-72 bg-white border border-stone-300 rounded shadow-lg py-1 text-sm z-30"
         >
+          {/* ── Export ── */}
+          <div className="px-3 pt-2 pb-0.5 text-[10px] font-semibold uppercase tracking-wider text-stone-400">导出 Export</div>
           <button
             onClick={doExport}
             disabled={busy}
@@ -4380,9 +5190,44 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
           >
             <Download size={14} className="text-stone-600 mt-0.5 shrink-0" />
             <div>
-              <div className="text-stone-900">导出项目（.dms）</div>
+              <div className="text-stone-900">导出索引备份（.dms）</div>
               <div className="text-[11px] text-stone-500 mt-0.5">
-                将整个文件库下载为单一压缩文件
+                仅保存文件夹树结构，不含实体文件，保存在项目目录中
+              </div>
+              <div className="text-[11px] text-amber-700 mt-0.5">
+                文件保存至：存储文件夹内（如 DMS_Storage/）
+              </div>
+            </div>
+          </button>
+          <button
+            onClick={doExportFull}
+            disabled={busy}
+            className="w-full text-left px-3 py-2 hover:bg-amber-50 flex items-start gap-2 disabled:opacity-50"
+          >
+            <Download size={14} className="text-stone-600 mt-0.5 shrink-0" />
+            <div>
+              <div className="text-stone-900">导出完整备份（含文件）</div>
+              <div className="text-[11px] text-stone-500 mt-0.5">
+                将文件夹树和全部实体文件打包下载
+              </div>
+              <div className="text-[11px] text-amber-700 mt-0.5">
+                文件保存至：浏览器默认下载文件夹
+              </div>
+            </div>
+          </button>
+          <button
+            onClick={() => { setExportSelChecked(new Set()); setExportSelDialog(true); }}
+            disabled={busy}
+            className="w-full text-left px-3 py-2 hover:bg-amber-50 flex items-start gap-2 disabled:opacity-50"
+          >
+            <Download size={14} className="text-stone-600 mt-0.5 shrink-0" />
+            <div>
+              <div className="text-stone-900">导出选定文件夹（含文件）</div>
+              <div className="text-[11px] text-stone-500 mt-0.5">
+                选择部分文件夹，仅导出其中的文件
+              </div>
+              <div className="text-[11px] text-amber-700 mt-0.5">
+                文件保存至：浏览器默认下载文件夹
               </div>
             </div>
           </button>
@@ -4399,6 +5244,10 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
               </div>
             </div>
           </button>
+          <div className="border-t border-stone-200 my-1" />
+
+          {/* ── Import ── */}
+          <div className="px-3 pt-2 pb-0.5 text-[10px] font-semibold uppercase tracking-wider text-stone-400">导入 Import</div>
           <button
             onClick={triggerImportPicker}
             disabled={busy}
@@ -4412,7 +5261,69 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
               </div>
             </div>
           </button>
+          <button
+            onClick={() => { onOpenZipImport?.(); onClose(); }}
+            disabled={busy}
+            className="w-full text-left px-3 py-2 hover:bg-amber-50 flex items-start gap-2 disabled:opacity-50"
+          >
+            <Upload size={14} className="text-stone-600 mt-0.5 shrink-0" />
+            <div>
+              <div className="text-stone-900">从 ZIP 批量导入文档</div>
+              <div className="text-[11px] text-stone-500 mt-0.5">
+                按文件名前缀自动分配文档到对应文件夹
+              </div>
+            </div>
+          </button>
           <div className="border-t border-stone-200 my-1" />
+
+          {/* ── Downloads ── */}
+          <div className="px-3 pt-2 pb-0.5 text-[10px] font-semibold uppercase tracking-wider text-stone-400">文档下载 Downloads</div>
+          <a
+            href="/api/download-user-manual"
+            download
+            onClick={() => onClose()}
+            className="w-full text-left px-3 py-2 hover:bg-amber-50 flex items-start gap-2 block"
+          >
+            <FileText size={14} className="text-stone-600 mt-0.5 shrink-0" />
+            <div>
+              <div className="text-stone-900">下载用户手册 (.docx)</div>
+              <div className="text-[11px] text-stone-500 mt-0.5">
+                完整操作指南，包含所有功能说明与示例
+              </div>
+            </div>
+          </a>
+          <a
+            href="/guides/onedrive-setup"
+            download
+            onClick={() => onClose()}
+            className="w-full text-left px-3 py-2 hover:bg-amber-50 flex items-start gap-2 block"
+          >
+            <FileText size={14} className="text-stone-600 mt-0.5 shrink-0" />
+            <div>
+              <div className="text-stone-900">OneDrive Setup Guide (.txt) — English</div>
+              <div className="text-[11px] text-stone-500 mt-0.5">
+                How to move DMS storage to Microsoft OneDrive
+              </div>
+            </div>
+          </a>
+          <a
+            href="/guides/onedrive-setup-cn"
+            download
+            onClick={() => onClose()}
+            className="w-full text-left px-3 py-2 hover:bg-amber-50 flex items-start gap-2 block"
+          >
+            <FileText size={14} className="text-stone-600 mt-0.5 shrink-0" />
+            <div>
+              <div className="text-stone-900">OneDrive 设置指南 (.txt) — 中文</div>
+              <div className="text-[11px] text-stone-500 mt-0.5">
+                如何将 DMS 存储位置迁移到 Microsoft OneDrive
+              </div>
+            </div>
+          </a>
+          <div className="border-t border-stone-200 my-1" />
+
+          {/* ── Settings ── */}
+          <div className="px-3 pt-2 pb-0.5 text-[10px] font-semibold uppercase tracking-wider text-stone-400">设置 Settings</div>
           <button
             onClick={() => { onOpenKeyParameters?.(); onClose(); }}
             disabled={busy}
@@ -4439,21 +5350,6 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
               </div>
             </div>
           </button>
-          <a
-            href="/api/download-user-manual"
-            download
-            onClick={() => onClose()}
-            className="w-full text-left px-3 py-2 hover:bg-amber-50 flex items-start gap-2 block"
-          >
-            <FileText size={14} className="text-stone-600 mt-0.5 shrink-0" />
-            <div>
-              <div className="text-stone-900">下载用户手册 (.docx)</div>
-              <div className="text-[11px] text-stone-500 mt-0.5">
-                完整操作指南，包含所有功能说明与示例
-              </div>
-            </div>
-          </a>
-          <div className="border-t border-stone-200 my-1" />
           <button
             onClick={() => setNewDialog({ target: "" })}
             disabled={busy}
@@ -4477,19 +5373,6 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
               <div className="text-stone-900">从层级文件创建文件夹树</div>
               <div className="text-[11px] text-stone-500 mt-0.5">
                 按层级定义文件批量创建节点树结构
-              </div>
-            </div>
-          </button>
-          <button
-            onClick={() => { onOpenZipImport?.(); onClose(); }}
-            disabled={busy}
-            className="w-full text-left px-3 py-2 hover:bg-amber-50 flex items-start gap-2 disabled:opacity-50"
-          >
-            <Upload size={14} className="text-stone-600 mt-0.5 shrink-0" />
-            <div>
-              <div className="text-stone-900">从 ZIP 批量导入文档</div>
-              <div className="text-[11px] text-stone-500 mt-0.5">
-                按文件名前缀自动分配文档到对应文件夹
               </div>
             </div>
           </button>
@@ -4529,6 +5412,65 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
         </div>
       )}
 
+      {/* Export selected dialog */}
+      {exportSelDialog && (() => {
+        const getAllIds = (node) => {
+          const ids = [node.id];
+          (node.children || []).forEach(c => ids.push(...getAllIds(c)));
+          return ids;
+        };
+        const toggleNode = (node, check) => {
+          const ids = getAllIds(node);
+          setExportSelChecked(prev => {
+            const next = new Set(prev);
+            ids.forEach(id => check ? next.add(id) : next.delete(id));
+            return next;
+          });
+        };
+        const hasAnyChecked = (node) => {
+          if (exportSelChecked.has(node.id)) return true;
+          return (node.children || []).some(c => hasAnyChecked(c));
+        };
+        const renderNode = (node, depth) => (
+          <div key={node.id}>
+            <label style={{ paddingLeft: depth * 16 + 4 }} className="flex items-center gap-1.5 py-0.5 cursor-pointer hover:bg-stone-50 rounded pr-1">
+              <input
+                type="checkbox"
+                checked={exportSelChecked.has(node.id)}
+                onChange={(e) => toggleNode(node, e.target.checked)}
+                className="accent-amber-600 shrink-0"
+              />
+              <span className="text-xs text-stone-800 truncate">{node.name}</span>
+            </label>
+            {(node.children || []).map(c => renderNode(c, depth + 1))}
+          </div>
+        );
+        return (
+          <div className="fixed inset-0 bg-stone-900/70 z-50 flex items-center justify-center p-4" onClick={(e) => e.stopPropagation()}>
+            <div className="bg-white w-full max-w-sm rounded shadow-2xl p-5 flex flex-col" style={{ maxHeight: "80vh" }}>
+              <div className="text-[10px] tracking-[0.2em] uppercase text-stone-500 mb-1">导出</div>
+              <h2 className="text-base font-semibold text-stone-900 mb-1">选择要导出的文件夹</h2>
+              <p className="text-[11px] text-stone-500 mb-3">勾选的文件夹（含子文件夹）中的文档和文件将被打包下载。</p>
+              <div className="flex-1 overflow-y-auto border border-stone-200 rounded p-2 mb-2" style={{ minHeight: 0 }}>
+                {tree ? renderNode(tree, 0) : <div className="text-xs text-stone-400 p-2">无文件夹树</div>}
+              </div>
+              <div className="text-[11px] text-stone-400 mb-3">已选 {exportSelChecked.size} 个节点</div>
+              {error && <div className="text-xs text-red-700 bg-red-50 border border-red-200 rounded p-2 mb-3">{error}</div>}
+              <div className="flex gap-2 justify-end">
+                <button onClick={() => { setExportSelDialog(false); setError(null); }} disabled={busy} className="px-4 py-1.5 text-xs border border-stone-300 hover:bg-stone-100 rounded disabled:opacity-60">取消</button>
+                <button
+                  onClick={() => doExportSelected([...exportSelChecked])}
+                  disabled={busy || exportSelChecked.size === 0}
+                  className="px-4 py-1.5 text-xs bg-amber-600 hover:bg-amber-700 text-white rounded disabled:opacity-60"
+                >
+                  {busy ? "导出中…" : "导出并下载"}
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
       {/* Import dialog */}
       {importDialog && (
         <div
@@ -4559,15 +5501,9 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
               className="w-full px-2 py-1.5 text-sm border border-stone-300 rounded font-mono mb-3"
             />
 
-            <label className="flex items-center gap-2 text-xs text-stone-700 mb-3">
-              <input
-                type="checkbox"
-                checked={importDialog.mode === "overwrite"}
-                onChange={(e) => setImportDialog({ ...importDialog, mode: e.target.checked ? "overwrite" : "new" })}
-              />
-              如文件夹非空则覆盖
-              <span className="text-stone-400">（将删除现有内容）</span>
-            </label>
+            <div className="text-[11px] text-stone-400 bg-stone-50 border border-stone-200 rounded px-3 py-2 mb-3">
+              导入只恢复文件夹树结构，不会删除磁盘上已有的文件。
+            </div>
 
             {error && (
               <div className="text-xs text-red-700 bg-red-50 border border-red-200 rounded p-2 mb-3 whitespace-pre-wrap">
@@ -5121,13 +6057,12 @@ function DMS({ storagePath, onChangeFolder }) {
       currentPath,
       chosenPathMode: pathsDiffer ? "source" : "current",
       customPath: "",
-      mode: "overwrite",
     });
   };
 
   const doImportFromDialog = async () => {
     if (!dmsImportDialog) return;
-    const { file, sourcePath, currentPath, chosenPathMode, customPath, mode } = dmsImportDialog;
+    const { file, sourcePath, currentPath, chosenPathMode, customPath } = dmsImportDialog;
 
     let targetPath = "";
     if (chosenPathMode === "source") targetPath = sourcePath;
@@ -5145,7 +6080,6 @@ function DMS({ storagePath, onChangeFolder }) {
       const form = new FormData();
       form.append("file", file);
       form.append("target_path", targetPath.trim());
-      form.append("mode", mode);
       const res = await fetch("/api/project/import", { method: "POST", body: form });
       if (res.status === 413) { setDmsImportError("文件过大，服务器拒绝接收。请检查服务器配置。"); return; }
       if (!res.ok && res.headers.get("content-type")?.includes("text/html")) { setDmsImportError(`服务器错误 (${res.status})，请检查终端日志。`); return; }
@@ -5181,6 +6115,12 @@ function DMS({ storagePath, onChangeFolder }) {
   const [textTreeCopied, setTextTreeCopied] = useState(false);
   const [dupDialog, setDupDialog] = useState(null); // { duplicates, allFiles, targetNodeId }
   const [uploadStatus, setUploadStatus] = useState(null); // { done, total } or null
+  // Face recognition state
+  const [faceSelectMode, setFaceSelectMode] = useState(false);
+  const [faceSelectedIds, setFaceSelectedIds] = useState(new Set());
+  const [showFaceTag, setShowFaceTag] = useState(false);
+  const [facePersonFilter, setFacePersonFilter] = useState(null); // personId or null
+  const [personDocIds, setPersonDocIds] = useState(null); // Set of doc IDs for current person filter
 
   // Resizable sidebar — width in pixels, persisted in localStorage.
   // Min/max prevent absurdly small or huge sidebars.
@@ -5952,6 +6892,18 @@ function DMS({ storagePath, onChangeFolder }) {
     return () => document.removeEventListener("paste", onPaste);
   }, [selectedId, selectedNode, tree, docIndex]);
 
+  // ---- Face person filter: fetch docIds when filter changes ----------------
+  useEffect(() => {
+    if (!facePersonFilter) {
+      setPersonDocIds(null);
+      return;
+    }
+    fetch(`/api/faces/photos/${facePersonFilter}`)
+      .then((r) => r.json())
+      .then((d) => setPersonDocIds(new Set(d.docIds || [])))
+      .catch(() => setPersonDocIds(null));
+  }, [facePersonFilter]);
+
   // ---- DOCUMENT LINKAGE HELPERS -----------------------------------------
   // Compute, for every docId, the list of nodes that reference it.
   // Used to show "linked from N other nodes" badges and to drive deletion logic.
@@ -6241,6 +7193,7 @@ function DMS({ storagePath, onChangeFolder }) {
               onOpenHierarchyImport={() => setShowHierarchyImport(true)}
               onOpenZipImport={() => setShowZipImport(true)}
               onOpenEmailSettings={() => setShowEmailSettings(true)}
+              tree={tree}
             />
           </div>
           <button
@@ -6299,6 +7252,14 @@ function DMS({ storagePath, onChangeFolder }) {
                 }`}
               >
                 <Book size={12} /> 数据手册
+              </button>
+              <button
+                onClick={() => setTab("people")}
+                className={`flex-1 py-2 px-2 flex items-center justify-center gap-1 ${
+                  tab === "people" ? "border-b-2 border-amber-600 text-stone-900 font-medium" : "text-stone-500 hover:text-stone-900"
+                }`}
+              >
+                <Users size={12} /> 人脸
               </button>
             </div>
 
@@ -6413,6 +7374,13 @@ function DMS({ storagePath, onChangeFolder }) {
                 formatBytes={formatBytes}
               />
             )}
+            {tab === "people" && (
+              <PeoplePanel
+                onFilterPerson={(pid) => { setFacePersonFilter(pid); }}
+                filteredPersonId={facePersonFilter}
+                tree={tree}
+              />
+            )}
           </aside>
             {/* Drag handle — narrow strip with wider invisible hit area for easier grabbing */}
             <div
@@ -6440,8 +7408,9 @@ function DMS({ storagePath, onChangeFolder }) {
 
               <div className="border-b border-stone-300 pb-4 mb-5">
                 {editingNode ? (
-                  <div className="space-y-2">
+                  <div className="space-y-2 bg-amber-50/60 border border-amber-200 rounded-lg p-3 -mx-3">
                     <input
+                      autoFocus
                       type="text"
                       defaultValue={selectedNode.name}
                       onBlur={(e) => {
@@ -6519,7 +7488,31 @@ function DMS({ storagePath, onChangeFolder }) {
               <section>
                 <div className="flex items-center justify-between mb-3">
                   <h2 className="text-xs font-semibold uppercase tracking-wider text-stone-700">附加文档</h2>
-                  <div className="flex gap-2">
+                  <div className="flex gap-2 flex-wrap">
+                    {!faceSelectMode ? (
+                      <button
+                        onClick={() => { setFaceSelectMode(true); setFaceSelectedIds(new Set()); }}
+                        className="text-xs px-3 py-1.5 border border-stone-300 hover:bg-amber-50 hover:border-amber-400 text-stone-700 rounded flex items-center gap-1.5"
+                      >
+                        <ScanFace size={12} /> 标记人脸
+                      </button>
+                    ) : (
+                      <>
+                        <button
+                          onClick={() => { setFaceSelectMode(false); setFaceSelectedIds(new Set()); }}
+                          className="text-xs px-3 py-1.5 border border-stone-300 hover:bg-stone-100 text-stone-700 rounded flex items-center gap-1.5"
+                        >
+                          <X size={12} /> 取消选择
+                        </button>
+                        <button
+                          onClick={() => setShowFaceTag(true)}
+                          disabled={faceSelectedIds.size === 0}
+                          className="text-xs px-3 py-1.5 border border-amber-400 bg-amber-50 hover:bg-amber-100 text-amber-800 rounded flex items-center gap-1.5 disabled:opacity-40"
+                        >
+                          <ScanFace size={12} /> 标记选中照片 ({faceSelectedIds.size})
+                        </button>
+                      </>
+                    )}
                     <button
                       onClick={() => setShowLinkPicker(true)}
                       className="text-xs px-3 py-1.5 border border-stone-300 hover:bg-amber-50 hover:border-amber-400 text-stone-700 rounded cursor-pointer flex items-center gap-1.5"
@@ -6587,7 +7580,9 @@ function DMS({ storagePath, onChangeFolder }) {
                 )}
 
                 <div className="space-y-3">
-                  {enrichDocsForNode(selectedNode).map((doc) => {
+                  {enrichDocsForNode(selectedNode)
+                    .filter((doc) => !personDocIds || personDocIds.has(doc.id))
+                    .map((doc) => {
                     const refs = refMap.get(doc.id) || [];
                     const otherRefs = refs.filter((id) => id !== selectedId).length;
                     return (
@@ -6604,6 +7599,13 @@ function DMS({ storagePath, onChangeFolder }) {
                         keyParameters={keyParameters}
                         formatBytes={formatBytes}
                         onOpenEmailSettings={() => setShowEmailSettings(true)}
+                        faceSelectMode={faceSelectMode && doc.mime?.startsWith("image/")}
+                        faceSelected={faceSelectedIds.has(doc.id)}
+                        onToggleFaceSelect={() => setFaceSelectedIds((prev) => {
+                          const n = new Set(prev);
+                          n.has(doc.id) ? n.delete(doc.id) : n.add(doc.id);
+                          return n;
+                        })}
                       />
                     );
                   })}
@@ -6626,6 +7628,13 @@ function DMS({ storagePath, onChangeFolder }) {
         onAddKeyParameter={handleAddKeyParameter}
         onSaveLocalParams={handleSaveLocalParams}
         onSaveParams={handleSaveParams}
+      />
+
+      <FaceTaggingDialog
+        open={showFaceTag}
+        onClose={() => { setShowFaceTag(false); setFaceSelectMode(false); setFaceSelectedIds(new Set()); }}
+        docIds={Array.from(faceSelectedIds)}
+        onLabeled={() => { /* PeoplePanel refreshes itself on next open */ }}
       />
 
       {showTextTree && (() => {
@@ -6957,15 +7966,9 @@ function DMS({ storagePath, onChangeFolder }) {
               </label>
             </div>
 
-            <label className="flex items-center gap-2 text-xs text-stone-700 mb-4">
-              <input
-                type="checkbox"
-                checked={dmsImportDialog.mode === "overwrite"}
-                onChange={(e) => setDmsImportDialog({ ...dmsImportDialog, mode: e.target.checked ? "overwrite" : "new" })}
-              />
-              如目标文件夹非空则覆盖
-              <span className="text-stone-400">（将删除现有内容）</span>
-            </label>
+            <div className="text-[11px] text-stone-400 bg-stone-50 border border-stone-200 rounded px-3 py-2 mb-4">
+              导入只恢复文件夹树结构（index），不会删除磁盘上已有的文件。
+            </div>
 
             {dmsImportError && (
               <div className="text-xs text-red-700 bg-red-50 border border-red-200 rounded p-2 mb-3 whitespace-pre-wrap">

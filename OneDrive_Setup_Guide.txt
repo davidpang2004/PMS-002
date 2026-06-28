@@ -1,0 +1,374 @@
+================================================================================
+  QCDMS — HOW TO STORE YOUR DOCUMENTS ON MICROSOFT ONEDRIVE
+  Step-by-Step Setup Guide for New Users
+================================================================================
+
+OVERVIEW
+--------
+By default, QCDMS saves all your folders and documents on your computer's
+local hard drive. This guide shows you how to store everything in Microsoft
+OneDrive instead, so your documents are:
+
+  • Automatically backed up to the cloud
+  • Accessible from any computer, phone, or tablet
+  • Protected even if your computer is lost, stolen, or damaged
+  • Shareable with other people if needed
+
+How it works: OneDrive keeps a special sync folder on your computer. Anything
+you save in that folder is automatically and silently uploaded to Microsoft's
+cloud servers. We simply tell QCDMS to use a subfolder inside that OneDrive
+folder as its storage location. QCDMS works exactly as before — it writes
+files to that folder, and OneDrive does the rest.
+
+--------------------------------------------------------------------------------
+PART 1 — SET UP MICROSOFT ONEDRIVE ON YOUR COMPUTER
+--------------------------------------------------------------------------------
+
+You only need to do Part 1 once per computer. If OneDrive is already installed
+and you are already signed in, skip to Part 2.
+
+STEP 1: CHECK IF ONEDRIVE IS ALREADY INSTALLED
+-----------------------------------------------
+  Mac:
+    - Look for a cloud icon (looks like a small cloud) in the menu bar at the
+      top-right of your screen. If you see it, OneDrive is installed.
+    - Alternatively, open Finder and look in the left sidebar for an entry
+      called "OneDrive" or "OneDrive - Personal".
+
+  Windows:
+    - Look for a cloud icon in the system tray (bottom-right corner of the
+      screen, near the clock). If you see it, OneDrive is installed.
+    - Alternatively, open File Explorer and look in the left sidebar for
+      an entry called "OneDrive" or "OneDrive - Personal".
+
+  If you see OneDrive, skip to STEP 3. If not, continue to STEP 2.
+
+
+STEP 2: INSTALL MICROSOFT ONEDRIVE
+-----------------------------------
+  Mac:
+    Option A — From the Mac App Store:
+      1. Open the App Store (blue icon with the letter "A").
+      2. In the search bar, type "Microsoft OneDrive".
+      3. Click "Get" and then "Install". You may need to enter your
+         Apple ID password.
+      4. Once installed, open OneDrive from your Applications folder or
+         Launchpad.
+
+    Option B — Direct download:
+      1. Open your web browser.
+      2. Go to: https://www.microsoft.com/en-us/microsoft-365/onedrive/download
+      3. Click "Download" and open the downloaded file.
+      4. Follow the on-screen installer instructions.
+
+  Windows 10 / 11:
+    OneDrive is usually pre-installed on Windows 10 and 11. If it is missing:
+      1. Open your web browser.
+      2. Go to: https://www.microsoft.com/en-us/microsoft-365/onedrive/download
+      3. Click "Download" and run the downloaded installer.
+      4. Follow the on-screen instructions.
+
+
+STEP 3: SIGN IN TO ONEDRIVE
+-----------------------------
+  1. Open OneDrive (click the cloud icon in the menu bar or system tray,
+     or open it from your Applications folder / Start Menu).
+
+  2. A "Sign in" window will appear. Enter your Microsoft account email
+     address. This is usually one of:
+       • yourname@outlook.com
+       • yourname@hotmail.com
+       • yourname@live.com
+       • A work or school email ending in @yourcompany.com (Microsoft 365)
+
+  3. Click "Sign in" and enter your password.
+
+  4. Follow any additional prompts (two-factor authentication, etc.).
+
+  5. You will be asked to choose your OneDrive folder location.
+     RECOMMENDATION: Accept the default location. It will be:
+       Mac:     /Users/[your username]/OneDrive - Personal
+       Windows: C:\Users\[your username]\OneDrive - Personal
+
+     Write down this folder path — you will need it in Part 2.
+
+  6. OneDrive will begin syncing. A blue cloud icon will appear in your
+     menu bar (Mac) or system tray (Windows) to confirm it is running.
+
+
+STEP 4: CONFIRM ONEDRIVE IS WORKING
+--------------------------------------
+  1. Click the OneDrive cloud icon in your menu bar or system tray.
+  2. You should see "Up to date" or a sync progress message.
+  3. If you see any error messages, resolve them before continuing
+     (usually just signing in again fixes them).
+
+--------------------------------------------------------------------------------
+PART 2 — CREATE A DEDICATED FOLDER FOR QCDMS INSIDE ONEDRIVE
+--------------------------------------------------------------------------------
+
+STEP 5: FIND YOUR ONEDRIVE FOLDER
+-----------------------------------
+  Mac:
+    1. Open Finder (the smiley face icon in your Dock).
+    2. In the left sidebar, click "OneDrive" or "OneDrive - Personal".
+    3. The full path is typically:
+         /Users/[your username]/OneDrive - Personal
+       For example: /Users/david/OneDrive - Personal
+
+    TIP — To see the exact full path:
+      1. With the OneDrive folder open in Finder, right-click (or
+         Control-click) anywhere in the window background.
+      2. If "Get Info" is shown, click it and look at "Where:".
+      3. Alternatively, hold the Option key and right-click the folder name
+         at the top of the window — the full path appears.
+
+  Windows:
+    1. Open File Explorer (the folder icon in your taskbar).
+    2. In the left sidebar, click "OneDrive" or "OneDrive - Personal".
+    3. The address bar at the top shows the full path. It is typically:
+         C:\Users\[your username]\OneDrive - Personal
+       For example: C:\Users\David\OneDrive - Personal
+
+
+STEP 6: CREATE A SUBFOLDER FOR QCDMS
+---------------------------------------
+  It is best to give QCDMS its own dedicated subfolder inside OneDrive,
+  rather than putting files directly in the root of OneDrive. This keeps
+  things organized.
+
+  Suggested folder name: DMS_Storage
+  (You can name it anything you like, such as "My DMS" or "Company Files".)
+
+  Mac — using Finder:
+    1. Open Finder and navigate to your OneDrive folder.
+    2. Right-click in an empty area of the window.
+    3. Select "New Folder".
+    4. Type the folder name (e.g., DMS_Storage) and press Enter.
+    5. The full path to use later will be:
+         /Users/[your username]/OneDrive - Personal/DMS_Storage
+       For example: /Users/david/OneDrive - Personal/DMS_Storage
+
+  Windows — using File Explorer:
+    1. Open File Explorer and navigate to your OneDrive folder.
+    2. Right-click in an empty area of the window.
+    3. Select "New" > "Folder".
+    4. Type the folder name (e.g., DMS_Storage) and press Enter.
+    5. The full path to use later will be:
+         C:\Users\[your username]\OneDrive - Personal\DMS_Storage
+       For example: C:\Users\David\OneDrive - Personal\DMS_Storage
+
+  WRITE DOWN THIS FULL PATH. You will paste it into QCDMS in the next step.
+
+--------------------------------------------------------------------------------
+PART 3 — TELL QCDMS TO USE YOUR ONEDRIVE FOLDER
+--------------------------------------------------------------------------------
+
+STEP 7: LAUNCH QCDMS
+----------------------
+  Start QCDMS as you normally would:
+    Mac:     Double-click DMS.app (or run start_dms.command)
+    Windows: Double-click DMS.exe (or run start_dms.bat)
+
+  QCDMS will open in your web browser automatically.
+
+
+STEP 8A: IF THIS IS YOUR FIRST TIME USING QCDMS (No data yet)
+--------------------------------------------------------------
+  When QCDMS opens for the first time, it will show a setup screen that says
+  "Set Storage Location" (设置存储位置). This is where you enter your path.
+
+    1. Click inside the text box (it shows a greyed-out example path).
+
+    2. Type (or paste) the full path to your OneDrive folder you created
+       in Step 6. Example:
+         Mac:     /Users/david/OneDrive - Personal/DMS_Storage
+         Windows: C:\Users\David\OneDrive - Personal\DMS_Storage
+
+    3. Click "Save and Continue" (保存并继续).
+
+    4. QCDMS will create the folder if it doesn't already exist, and will
+       show the main document management interface. You are done!
+
+    TIP: You can also type ~ as a shortcut for your home folder on Mac:
+         ~/OneDrive - Personal/DMS_Storage
+
+
+STEP 8B: IF YOU ALREADY HAVE QCDMS DATA (Migrating from local storage)
+-----------------------------------------------------------------------
+  If you have been using QCDMS and already have documents stored locally,
+  follow these steps to move everything to OneDrive.
+
+  IMPORTANT: Before doing anything, make a backup copy of your existing
+  QCDMS data folder. This is simply a precaution.
+
+  Step 8B-1: Find your current storage folder.
+    - Look at the grey status bar at the very bottom of the QCDMS window.
+    - You will see a hard drive icon followed by a folder path, for example:
+        /Users/david/Documents/Company01
+    - That is your current storage folder. Make a copy of it somewhere safe.
+
+  Step 8B-2: Copy your existing data to OneDrive.
+    Option A — Copy before changing (Recommended for large collections):
+      1. Open Finder (Mac) or File Explorer (Windows).
+      2. Navigate to your current QCDMS storage folder.
+      3. Select ALL files and folders inside it (Cmd+A on Mac, Ctrl+A on
+         Windows).
+      4. Copy them (Cmd+C on Mac, Ctrl+C on Windows).
+      5. Navigate to your new OneDrive DMS folder (e.g., OneDrive/DMS_Storage).
+      6. Paste (Cmd+V on Mac, Ctrl+V on Windows).
+      7. Wait for the copy to finish before continuing.
+
+    Option B — Let QCDMS migrate automatically (for smaller collections):
+      QCDMS can copy your current data to the new location automatically.
+      Skip ahead to Step 8B-3 and let the app handle it.
+
+  Step 8B-3: Change the storage path in QCDMS.
+    1. In the QCDMS window, look at the bottom status bar. You will see
+       a path displayed next to a small hard-drive icon.
+    2. Click that path. A "Change Storage Location" screen appears.
+    3. Clear the text box and type your new OneDrive path:
+         Mac:     /Users/david/OneDrive - Personal/DMS_Storage
+         Windows: C:\Users\David\OneDrive - Personal\DMS_Storage
+    4. Click "Save" (保存).
+    5. If QCDMS detects that the new folder already contains DMS data
+       (because you copied it in Option A above), it will ask if you
+       want to switch to that data. Click "Continue" (继续).
+    6. If the new folder is empty (Option B), QCDMS will copy your current
+       index and document list automatically.
+
+  Step 8B-4: Verify the migration was successful.
+    1. Check that your folders and documents all appear correctly in QCDMS.
+    2. Open a few documents to confirm they can be viewed.
+    3. Once satisfied, you may delete the old local storage folder, or keep
+       it as an extra backup.
+
+
+--------------------------------------------------------------------------------
+PART 4 — VERIFY ONEDRIVE IS SYNCING YOUR QCDMS DATA
+--------------------------------------------------------------------------------
+
+STEP 9: CONFIRM SYNC IS WORKING
+---------------------------------
+  1. After saving documents in QCDMS, look at the OneDrive cloud icon in
+     your menu bar (Mac) or system tray (Windows).
+
+  2. While syncing, the icon will show animated arrows or a progress circle.
+
+  3. When sync is complete, the icon will show a green checkmark or a
+     plain cloud, and you will see "Up to date".
+
+  4. To double-check online:
+     a. Open your web browser.
+     b. Go to https://onedrive.live.com and sign in.
+     c. Look for your DMS_Storage folder. You should see your QCDMS files
+        (especially index.json and a "docs" subfolder containing your
+        uploaded documents).
+
+
+--------------------------------------------------------------------------------
+PART 5 — USING QCDMS ON A SECOND COMPUTER
+--------------------------------------------------------------------------------
+
+STEP 10: ACCESS YOUR DOCUMENTS FROM ANOTHER COMPUTER
+------------------------------------------------------
+  To use the same QCDMS document library on a second Mac or Windows PC:
+
+  1. Install QCDMS on the second computer (copy the DMS.app or DMS.exe).
+
+  2. Install and sign in to OneDrive on the second computer using the same
+     Microsoft account (see Steps 1-4 above). OneDrive will sync all your
+     files to that computer.
+
+  3. Launch QCDMS on the second computer. It will show the setup screen.
+
+  4. Enter the same OneDrive DMS folder path:
+       Mac:     /Users/[username on this computer]/OneDrive - Personal/DMS_Storage
+       Windows: C:\Users\[username on this computer]\OneDrive - Personal\DMS_Storage
+     Note: The username part of the path may differ on each computer, but
+     the OneDrive folder name (OneDrive - Personal) will be the same.
+
+  5. Click "Save and Continue". QCDMS will detect your existing data and
+     open your full document library.
+
+  IMPORTANT — Do not run QCDMS on two computers at exactly the same time.
+  Both would be writing to the same files via OneDrive, which can cause
+  conflicts. Use it on one computer at a time.
+
+
+--------------------------------------------------------------------------------
+FREQUENTLY ASKED QUESTIONS
+--------------------------------------------------------------------------------
+
+Q: What happens if my internet connection goes down?
+A: QCDMS will continue to work normally because it reads and writes to the
+   local OneDrive sync folder on your computer. Your changes are saved locally
+   first and uploaded to the cloud as soon as the internet is restored.
+
+Q: What if OneDrive is not running when I use QCDMS?
+A: QCDMS will still work, writing to the local folder. When OneDrive starts
+   again, it will sync any changes you made while it was offline.
+
+Q: How much OneDrive storage do I need?
+A: A free Microsoft account includes 5 GB of OneDrive storage. A Microsoft 365
+   Personal subscription includes 1 TB (1,000 GB). For most personal document
+   libraries, 5 GB is more than sufficient. You can check how much storage
+   you are using at https://onedrive.live.com (sign in, click your name or
+   avatar in the top right, then "Storage").
+
+Q: Can I share my QCDMS library with someone else?
+A: You can share the OneDrive folder with another person via OneDrive's
+   sharing feature. However, both people should not run QCDMS at the same
+   time on the same folder, as this can cause file conflicts.
+
+Q: Will OneDrive compress or change my documents?
+A: No. OneDrive stores your files exactly as they are. PDFs, images, and
+   all other files are stored and retrieved without any modification.
+
+Q: How do I find out my exact OneDrive folder path on Mac?
+A: Open Terminal (press Cmd+Space, type "Terminal", press Enter) and type:
+     ls ~/OneDrive*
+   Press Enter. The folder name(s) shown are inside your home directory.
+   Your full path is /Users/[your username]/[that folder name].
+   Example: /Users/david/OneDrive - Personal
+
+Q: How do I find out my exact OneDrive folder path on Windows?
+A: Open File Explorer, click on OneDrive in the left sidebar, then look at
+   the address bar at the top. It shows the full path.
+   Alternatively, right-click the OneDrive tray icon and choose "Settings",
+   then look in the Account tab for the folder location.
+
+Q: What is "OneDrive - Personal" vs. "OneDrive - [Company Name]"?
+A: "OneDrive - Personal" uses your personal Microsoft account (Outlook,
+   Hotmail, Live). "OneDrive - [Company Name]" is a work or school account
+   managed by your organization. Either will work with QCDMS; just make sure
+   to use the correct folder path.
+
+--------------------------------------------------------------------------------
+QUICK REFERENCE — PATH EXAMPLES
+--------------------------------------------------------------------------------
+
+  Mac (Personal account):
+    /Users/david/OneDrive - Personal/DMS_Storage
+
+  Mac (Work/School account, replace "Contoso" with your company name):
+    /Users/david/OneDrive - Contoso/DMS_Storage
+
+  Windows (Personal account):
+    C:\Users\David\OneDrive - Personal\DMS_Storage
+
+  Windows (Work/School account):
+    C:\Users\David\OneDrive - Contoso\DMS_Storage
+
+--------------------------------------------------------------------------------
+SUPPORT
+--------------------------------------------------------------------------------
+
+  For QCDMS issues, contact your QCDMS administrator.
+
+  For OneDrive issues, visit Microsoft's support site:
+    https://support.microsoft.com/onedrive
+
+================================================================================
+  END OF GUIDE
+================================================================================

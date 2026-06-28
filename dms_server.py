@@ -24,13 +24,16 @@ you have a network-accessible DMS. The frontend doesn't change at all.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
+import io
 import json
 import mimetypes
 import os
 import secrets
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import webbrowser
@@ -653,6 +656,89 @@ def _try_rmdir_empty(path: Path) -> None:
             print(f"[DMS] Removed empty folder: {path}")
     except OSError as e:
         print(f"[DMS] Could not remove folder {path}: {e}")
+
+
+def _sync_folder_moves(old_tree: dict | None, new_tree: dict | None) -> None:
+    """Move node folders on disk when a node is reparented in the tree.
+
+    When the user drags a folder to a new parent in the UI, this moves the
+    entire on-disk folder (and all its contents) from the old path to the new
+    path, keeping the physical directory structure in sync with the tree.
+
+    Nodes are processed shallowest-first so that if a parent moves and carries
+    its children along, the children's old paths won't exist anymore and will be
+    skipped rather than double-moved.
+    """
+    docs_dir = get_docs_dir()
+    if not docs_dir or not old_tree or not new_tree:
+        return
+
+    def _index_paths(node: dict, tree: dict, out: dict) -> None:
+        nid = node.get("id")
+        if nid:
+            parts = _get_node_path_parts(tree, nid)
+            if parts:
+                out[nid] = docs_dir.joinpath(*parts)
+        for child in (node.get("children") or []):
+            _index_paths(child, tree, out)
+
+    old_paths: dict[str, Path] = {}
+    new_paths: dict[str, Path] = {}
+    _index_paths(old_tree, old_tree, old_paths)
+    _index_paths(new_tree, new_tree, new_paths)
+
+    moved = [
+        (old_paths[nid], new_paths[nid])
+        for nid in old_paths
+        if nid in new_paths and old_paths[nid].resolve() != new_paths[nid].resolve()
+    ]
+    # Shallowest first: moving a parent carries its children automatically.
+    moved.sort(key=lambda x: len(x[0].parts))
+
+    for old_folder, new_folder in moved:
+        if not old_folder.exists():
+            continue  # already carried by a parent move
+
+        if new_folder.exists():
+            # Strip macOS / Windows metadata-only files so they don't
+            # block an otherwise-empty destination.
+            for meta in new_folder.rglob("*"):
+                if meta.is_file() and meta.name in (".DS_Store", "desktop.ini", "Thumbs.db"):
+                    try:
+                        meta.unlink()
+                    except OSError:
+                        pass
+
+            real_items = [p for p in new_folder.iterdir()
+                          if p.name not in (".DS_Store", "desktop.ini", "Thumbs.db")]
+
+            if not real_items:
+                # Empty placeholder — remove it so shutil.move can rename cleanly.
+                try:
+                    _try_rmdir_empty(new_folder)
+                except OSError:
+                    pass
+
+            if new_folder.exists():
+                # Destination still has real content — merge item by item.
+                for item in list(old_folder.iterdir()):
+                    dest = new_folder / item.name
+                    if dest.exists():
+                        continue  # leave existing content untouched
+                    try:
+                        shutil.move(str(item), str(dest))
+                    except OSError as e:
+                        print(f"[DMS] Warning: could not merge {item.name}: {e}")
+                _try_rmdir_empty(old_folder)
+                print(f"[DMS] Merged folder contents: {old_folder.name}  →  {new_folder}")
+                continue
+
+        try:
+            new_folder.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(old_folder), str(new_folder))
+            print(f"[DMS] Moved folder: {old_folder.name}  →  {new_folder}")
+        except OSError as e:
+            print(f"[DMS] Warning: could not move folder {old_folder}: {e}")
 
 
 def _cleanup_stale_node_folders(old_tree: dict | None, new_tree: dict | None) -> None:
@@ -1724,6 +1810,7 @@ def put_tree():
     new_tree = idx.get("tree")
     # Run expensive disk-sync in background so the HTTP response returns immediately.
     def _background_sync(old=old_tree, new=new_tree):
+        _sync_folder_moves(old, new)
         _create_local_folder_structure(new)
         _sync_doc_files_to_tree_paths(new)
         _cleanup_stale_node_folders(old, new)
@@ -1982,11 +2069,19 @@ def download_token(token: str):
     if not docs_dir:
         abort(503)
     matches = list(docs_dir.rglob(f"{doc_id}__*")) or list(docs_dir.rglob(f"{doc_id}*"))
-    if not matches:
-        abort(404)
-    file_path = matches[0]
     idx = read_index()
     meta = next((d for d in idx.get("docIndex", []) if d.get("id") == doc_id), None)
+    if not matches:
+        fname = meta["name"] if meta else doc_id
+        return Response(
+            f"<html><body style='font-family:sans-serif;padding:40px'>"
+            f"<h2>文件不存在</h2>"
+            f"<p>无法找到文件：<strong>{fname}</strong></p>"
+            f"<p>该文件可能已从服务器磁盘中删除或移走。</p>"
+            f"</body></html>",
+            status=404, mimetype="text/html"
+        )
+    file_path = matches[0]
     download_name = meta["name"] if meta else file_path.name
     mime = (meta.get("mime") if meta else None) or mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
     return send_file(file_path, mimetype=mime, download_name=download_name, as_attachment=False)
@@ -2012,16 +2107,17 @@ def send_to_phone():
     _DOWNLOAD_TOKENS[token] = {"doc_id": doc_id, "expiry": _t.time() + 3600}  # 1-hour link
 
     # Prefer the cloudflared tunnel URL (works from anywhere).
-    # Auto-start the tunnel on first use if the launcher registered a start function.
-    # Fall back to local WiFi IP (same-network only) if tunnel unavailable.
+    # Call _tunnel_start_fn every time — it returns instantly if the tunnel is
+    # already alive, and restarts it if the process has crashed.  This prevents
+    # sending stale (dead) tunnel URLs after cloudflared drops unexpectedly.
     global _tunnel_base_url
-    if not _tunnel_base_url and _tunnel_start_fn is not None:
+    if _tunnel_start_fn is not None:
         with _tunnel_start_lock:
-            if not _tunnel_base_url:  # re-check inside lock
-                try:
-                    _tunnel_base_url = _tunnel_start_fn()
-                except Exception as _e:
-                    print(f"[DMS] Tunnel auto-start failed: {_e} — falling back to LAN IP")
+            try:
+                _tunnel_base_url = _tunnel_start_fn()
+            except Exception as _e:
+                print(f"[DMS] Tunnel check/start failed: {_e} — falling back to LAN IP")
+                _tunnel_base_url = ""
 
     is_tunnel = bool(_tunnel_base_url)
     if is_tunnel:
@@ -2299,7 +2395,8 @@ def send_email():
     if not matches:
         matches = list(docs_dir.rglob(f"{doc_id}*"))
     if not matches:
-        return jsonify({"error": "File not found on disk"}), 404
+        fname = meta.get("name", doc_id) if meta else doc_id
+        return jsonify({"error": f"文件不存在：{fname}（可能已从磁盘中删除或移走）"}), 404
 
     file_path = matches[0]
     doc_name  = meta.get("name", file_path.name)
@@ -3922,9 +4019,12 @@ def download_user_manual():
     )
     return resp
 
+NOT_SHOW_FOLDER_NAME = "Not Show in Tree"
+
+
 @app.route("/api/nodes/<node_id>", methods=["DELETE"])
 def delete_node(node_id):
-    """Delete a tree node, its physical folder on disk, and all documents within it."""
+    """Delete a tree node. Documents inside are soft-deleted to 'Not Show in Tree'."""
     docs_dir = get_docs_dir()
     if not docs_dir:
         return jsonify({"error": "Storage path not configured"}), 503
@@ -3940,6 +4040,11 @@ def delete_node(node_id):
     if tree.get("id") == node_id:
         return jsonify({"error": "Cannot delete root node"}), 400
 
+    # Prevent deleting the "Not Show in Tree" recycle bin node via the normal
+    # delete path — the frontend handles that separately (permanent delete).
+    if target.get("name") == NOT_SHOW_FOLDER_NAME:
+        return jsonify({"error": "Use the document-level delete to remove items from this folder"}), 400
+
     # Collect all doc IDs in the entire subtree.
     def _collect_doc_ids(node):
         ids = [d["id"] for d in (node.get("documents") or []) if d.get("id")]
@@ -3947,17 +4052,9 @@ def delete_node(node_id):
             ids.extend(_collect_doc_ids(child))
         return ids
 
-    doc_ids_to_delete = set(_collect_doc_ids(target))
+    doc_ids = set(_collect_doc_ids(target))
 
-    # Delete the physical folder for this node (and all its sub-folders/files).
-    node_folder = _get_node_docs_dir(node_id, tree)
-    if node_folder and node_folder != docs_dir and node_folder.exists():
-        shutil.rmtree(node_folder, ignore_errors=True)
-
-    # Remove all collected docs from docIndex.
-    new_doc_index = [d for d in (idx.get("docIndex") or []) if d.get("id") not in doc_ids_to_delete]
-
-    # Remove the node from the tree.
+    # Remove the node from the tree first (we need old tree for path lookups).
     def _remove(node, target_id):
         children = [c for c in (node.get("children") or []) if c["id"] != target_id]
         children = [_remove(c, target_id) for c in children]
@@ -3965,11 +4062,67 @@ def delete_node(node_id):
 
     new_tree = _remove(tree, node_id)
 
+    # Soft-delete: move documents to "Not Show in Tree" recycle bin.
+    not_show_id = None
+    if doc_ids:
+        # Find or create the recycle bin node.
+        for child in (new_tree.get("children") or []):
+            if child.get("name") == NOT_SHOW_FOLDER_NAME:
+                not_show_id = child["id"]
+                break
+        if not_show_id is None:
+            not_show_id = f"NODE-{secrets.token_hex(4).upper()}"
+            recycle_node = {"id": not_show_id, "name": NOT_SHOW_FOLDER_NAME,
+                            "children": [], "documents": []}
+            new_tree = {**new_tree, "children": [*(new_tree.get("children") or []), recycle_node]}
+
+        # Add docs to the recycle bin node.
+        def _add_to_recycle(node):
+            if node["id"] == not_show_id:
+                existing = {d["id"] for d in (node.get("documents") or [])}
+                new_docs = [{"id": d} for d in doc_ids if d not in existing]
+                return {**node, "documents": [*(node.get("documents") or []), *new_docs]}
+            return {**node, "children": [_add_to_recycle(c) for c in (node.get("children") or [])]}
+
+        new_tree = _add_to_recycle(new_tree)
+
+        # Update docIndex: redirect physical file ownership to the recycle bin.
+        new_doc_index = [
+            {**d, "originalNodeId": not_show_id} if d.get("id") in doc_ids else d
+            for d in (idx.get("docIndex") or [])
+        ]
+
+        # Move physical files from deleted node's folder to recycle bin folder.
+        recycle_folder = _get_node_docs_dir(not_show_id, new_tree)
+        if recycle_folder:
+            recycle_folder.mkdir(parents=True, exist_ok=True)
+        node_folder = _get_node_docs_dir(node_id, tree)  # use OLD tree for source path
+        if node_folder and node_folder != docs_dir and node_folder.exists() and recycle_folder:
+            for item in list(node_folder.rglob("*")):
+                if not item.is_file():
+                    continue
+                dest = recycle_folder / item.name
+                if dest.exists():
+                    continue
+                try:
+                    shutil.move(str(item), str(dest))
+                except OSError as e:
+                    print(f"[DMS] Warning: could not move {item.name} to recycle bin: {e}")
+        # Remove the now-empty deleted folder.
+        if node_folder and node_folder != docs_dir and node_folder.exists():
+            _try_rmdir_empty(node_folder)
+    else:
+        new_doc_index = idx.get("docIndex") or []
+        # No documents — just delete the empty physical folder.
+        node_folder = _get_node_docs_dir(node_id, tree)
+        if node_folder and node_folder != docs_dir and node_folder.exists():
+            shutil.rmtree(node_folder, ignore_errors=True)
+
     idx["tree"] = new_tree
     idx["docIndex"] = new_doc_index
     write_index(idx)
 
-    return jsonify({"ok": True, "deletedDocs": len(doc_ids_to_delete)})
+    return jsonify({"ok": True, "savedDocs": len(doc_ids), "recycleBinId": not_show_id})
 
 
 def _find_node(tree, node_id):
@@ -4595,6 +4748,110 @@ def export_project():
     return jsonify({"ok": True, "path": str(out_path), "filename": out_path.name})
 
 
+@app.route("/api/project/export-full", methods=["GET"])
+def export_project_full():
+    """Download a complete .dms backup that includes all document files."""
+    root = get_storage_root()
+    if not root or not root.exists():
+        return jsonify({"error": "Storage path not configured"}), 503
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in root.name)[:40]
+    filename = f"{safe or 'dms-project'}-full-{stamp}.dms"
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("manifest.json", json.dumps({
+            "format": "dms-project",
+            "version": 1,
+            "exported_at": datetime.now().isoformat(timespec="seconds"),
+            "source_path": str(root),
+            "includes_files": True,
+        }, indent=2))
+        index_path = root / "index.json"
+        if index_path.exists():
+            zf.write(index_path, arcname="index.json")
+        docs_dir = root / "docs"
+        if docs_dir.exists():
+            for fpath in sorted(docs_dir.rglob("*")):
+                if fpath.is_file():
+                    zf.write(fpath, arcname=str(fpath.relative_to(root)))
+    buf.seek(0)
+    return send_file(buf, as_attachment=True, download_name=filename,
+                     mimetype="application/octet-stream")
+
+
+@app.route("/api/project/export-selected", methods=["POST"])
+def export_project_selected():
+    """Download a .dms backup containing only the selected nodes and their documents.
+
+    Body JSON: { "node_ids": ["NODE-xxx", ...] }
+    Selected nodes AND all their descendants are included.
+    """
+    root = get_storage_root()
+    if not root or not root.exists():
+        return jsonify({"error": "Storage path not configured"}), 503
+
+    body = request.get_json(force=True) or {}
+    selected_ids = set(body.get("node_ids", []))
+    if not selected_ids:
+        return jsonify({"error": "No nodes selected"}), 400
+
+    idx = read_index()
+    doc_index = idx.get("docIndex", [])
+
+    # Collect all node IDs in selected subtrees (selected node + all descendants)
+    def collect_subtree_ids(node, parent_included=False):
+        nid = node.get("id", "")
+        included = parent_included or nid in selected_ids
+        ids = {nid} if included else set()
+        for child in node.get("children", []):
+            ids.update(collect_subtree_ids(child, included))
+        return ids
+
+    included_node_ids = collect_subtree_ids(idx.get("tree", {}))
+
+    # Filter docs to only those belonging to included nodes
+    included_docs = [d for d in doc_index if d.get("originalNodeId") in included_node_ids]
+    included_doc_ids = {d["id"] for d in included_docs}
+
+    # Build a filtered index: keep full tree but only selected docs
+    filtered_idx = dict(idx)
+    filtered_idx["docIndex"] = included_docs
+
+    # Build a map from doc_id → file path by scanning docs/
+    docs_dir = root / "docs"
+    doc_file_map: dict[str, Path] = {}
+    if docs_dir.exists():
+        for fpath in docs_dir.rglob("*"):
+            if fpath.is_file():
+                doc_id = fpath.name.split("__")[0]
+                if doc_id in included_doc_ids:
+                    doc_file_map[doc_id] = fpath
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in root.name)[:40]
+    filename = f"{safe or 'dms-project'}-selected-{stamp}.dms"
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("manifest.json", json.dumps({
+            "format": "dms-project",
+            "version": 1,
+            "exported_at": datetime.now().isoformat(timespec="seconds"),
+            "source_path": str(root),
+            "includes_files": True,
+            "selected_node_count": len(included_node_ids),
+            "doc_count": len(included_docs),
+        }, indent=2))
+        zf.writestr("index.json", json.dumps(filtered_idx, indent=2, ensure_ascii=False))
+        for doc_id, fpath in doc_file_map.items():
+            zf.write(fpath, arcname=str(fpath.relative_to(root)))
+    buf.seek(0)
+    return send_file(buf, as_attachment=True, download_name=filename,
+                     mimetype="application/octet-stream")
+
+
 @app.route("/api/project/import", methods=["POST"])
 def import_project():
     """
@@ -4637,40 +4894,11 @@ def import_project():
         except zipfile.BadZipFile:
             return jsonify({"error": "Uploaded file is not a valid .dms (zip) file"}), 400
 
-        # Handle the target folder
-        if target.exists():
-            if any(target.iterdir()):
-                if mode == "overwrite":
-                    # Delete contents but keep the folder itself.
-                    # On Windows, files may be read-only; chmod first so rmtree
-                    # doesn't raise PermissionError (onerror clears the bit and retries).
-                    def _rm_readonly(func, path, _exc):
-                        try:
-                            os.chmod(path, stat.S_IWRITE)
-                            func(path)
-                        except OSError:
-                            pass
-                    for item in target.iterdir():
-                        if item.is_dir():
-                            if sys.version_info >= (3, 12):
-                                shutil.rmtree(item, onexc=lambda f, p, e: _rm_readonly(f, p, e))
-                            else:
-                                shutil.rmtree(item, onerror=_rm_readonly)
-                        else:
-                            try:
-                                item.unlink()
-                            except PermissionError:
-                                os.chmod(item, stat.S_IWRITE)
-                                item.unlink()
-                else:
-                    return jsonify({
-                        "error": (
-                            f"Target folder '{target}' is not empty. "
-                            "Either choose an empty folder, or set mode='overwrite' "
-                            "to replace its contents."
-                        )
-                    }), 400
-        else:
+        # Create the target folder if it doesn't exist.
+        # A .dms file contains only index.json — no actual document files.
+        # We never delete existing content; importing only restores the
+        # tree/index and leaves all physical files and folders untouched.
+        if not target.exists():
             try:
                 target.mkdir(parents=True, exist_ok=True)
             except OSError as e:
@@ -5104,6 +5332,1277 @@ def import_zip_docs():
             os.unlink(tmp.name)
         except OSError:
             pass
+
+
+# ---- Face recognition -------------------------------------------------------
+
+def _get_faces_path():
+    root = get_storage_root()
+    if not root:
+        return None
+    return root / "faces.json"
+
+
+def read_faces() -> dict:
+    p = _get_faces_path()
+    if not p or not p.exists():
+        return {"people": [], "labels": [], "recognitions": []}
+    try:
+        return json.loads(p.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {"people": [], "labels": [], "recognitions": []}
+
+
+def write_faces(data: dict) -> None:
+    p = _get_faces_path()
+    if not p:
+        raise RuntimeError("Storage path is not configured")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(data, indent=2))
+
+
+# Deepface runs in a dedicated Python 3.12 venv because TensorFlow (which
+# deepface requires) does not yet support Python 3.14.  All DeepFace calls
+# go through deepface_worker.py executed in that venv via subprocess.
+_DEEPFACE_VENV = Path.home() / ".dms_deepface"
+_DEEPFACE_WORKER = Path(__file__).with_name("deepface_worker.py")
+
+
+def _deepface_python() -> str | None:
+    """Return path to the deepface-venv Python executable, or None if not ready."""
+    candidates = [
+        _DEEPFACE_VENV / "bin" / "python3",
+        _DEEPFACE_VENV / "Scripts" / "python.exe",  # Windows
+    ]
+    for p in candidates:
+        if p.exists():
+            return str(p)
+    return None
+
+
+def _check_deepface() -> bool:
+    return _deepface_python() is not None
+
+
+def _run_deepface_worker(cmd: dict, timeout: int = 300) -> dict:
+    """Call deepface_worker.py in the isolated deepface venv and return parsed JSON."""
+    python = _deepface_python()
+    if not python:
+        raise RuntimeError("deepface not installed")
+    worker = str(_DEEPFACE_WORKER)
+    result = subprocess.run(
+        [python, worker],
+        input=json.dumps(cmd),
+        capture_output=True, text=True, timeout=timeout,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "deepface worker failed")
+    return json.loads(result.stdout)
+
+
+@app.route("/api/install-deepface", methods=["POST"])
+def install_deepface():
+    """Set up the deepface venv (Python 3.12) and install deepface + dependencies."""
+    # Find Python 3.12 — check well-known paths directly (server PATH may not
+    # include /opt/homebrew/bin even when brew is installed on Apple Silicon).
+    python312_candidates = [
+        "/opt/homebrew/bin/python3.12",   # Homebrew Apple Silicon
+        "/usr/local/bin/python3.12",       # Homebrew Intel Mac
+        "/usr/bin/python3.12",
+        # python.org universal installer (macOS)
+        "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12",
+    ]
+    if sys.platform.startswith("win"):
+        import winreg  # type: ignore
+        try:
+            for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                key = winreg.OpenKey(root, r"SOFTWARE\Python\PythonCore\3.12\InstallPath")
+                base = winreg.QueryValueEx(key, "ExecutablePath")[0]
+                if base and Path(base).exists():
+                    python312_candidates.insert(0, base)
+        except Exception:
+            pass
+        python312_candidates += [r"C:\Python312\python.exe",
+                                  r"C:\Program Files\Python312\python.exe"]
+
+    python312 = next((p for p in python312_candidates if Path(p).exists()), None)
+
+    if not python312:
+        # Try to install via Homebrew (check known paths, not just PATH)
+        brew_candidates = [
+            "/opt/homebrew/bin/brew",
+            "/usr/local/bin/brew",
+            shutil.which("brew") or "",
+        ]
+        brew = next((b for b in brew_candidates if b and Path(b).exists()), None)
+        if brew:
+            try:
+                subprocess.run([brew, "install", "python@3.12"],
+                               capture_output=True, timeout=300, check=True)
+            except Exception as e:
+                return jsonify({"error": f"brew install python@3.12 失败: {e}"}), 500
+            python312 = next((p for p in python312_candidates if Path(p).exists()), None)
+
+        if not python312:
+            # No Python 3.12 and no Homebrew — tell the frontend to show download link
+            if sys.platform.startswith("win"):
+                dl_url = "https://www.python.org/ftp/python/3.12.9/python-3.12.9-amd64.exe"
+            else:
+                dl_url = "https://www.python.org/ftp/python/3.12.9/python-3.12.9-macos11.pkg"
+            return jsonify({
+                "needsPython312": True,
+                "downloadUrl": dl_url,
+                "message": "人脸识别需要 Python 3.12。请点击下方按钮下载安装，完成后再点击「安装 deepface」。",
+            }), 200
+
+    venv_dir = str(_DEEPFACE_VENV)
+
+    # Create venv with Python 3.12
+    try:
+        subprocess.run([python312, "-m", "venv", venv_dir],
+                       capture_output=True, timeout=60, check=True)
+    except Exception as e:
+        return jsonify({"error": f"创建虚拟环境失败: {e}"}), 500
+
+    pip = _DEEPFACE_VENV / "bin" / "pip"
+    if not pip.exists():
+        pip = _DEEPFACE_VENV / "Scripts" / "pip.exe"
+
+    # Install deepface (TF will install automatically on Python 3.12)
+    try:
+        result = subprocess.run(
+            [str(pip), "install", "--quiet", "deepface", "tf-keras", "pillow-heif"],
+            capture_output=True, text=True, timeout=600,
+        )
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout or "pip install 失败").strip()[-1000:]
+            return jsonify({"error": err}), 500
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "安装超时（超过10分钟）。请检查网络后重试。"}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"ok": True})
+
+
+def _resolve_photo_path(doc_id: str):
+    """Return Path to the actual file for doc_id, or None if not found."""
+    docs_dir = get_docs_dir()
+    if not docs_dir:
+        return None
+    matches = list(docs_dir.rglob(f"{doc_id}__*"))
+    if not matches:
+        matches = list(docs_dir.rglob(f"{doc_id}*"))
+    return matches[0] if matches else None
+
+
+def _face_crop_b64(file_path, bbox: dict) -> str:
+    """Return 120x120 JPEG crop of face area as base64 string."""
+    try:
+        try:
+            import pillow_heif
+            pillow_heif.register_heif_opener()
+        except ImportError:
+            pass
+        from PIL import Image
+        img = Image.open(file_path).convert("RGB")
+        x, y, w, h = bbox.get("x", 0), bbox.get("y", 0), bbox.get("w", 50), bbox.get("h", 50)
+        pad = max(10, int(min(w, h) * 0.3))
+        crop = img.crop((max(0, x - pad), max(0, y - pad),
+                         min(img.width, x + w + pad), min(img.height, y + h + pad)))
+        crop = crop.resize((120, 120), Image.LANCZOS)
+        buf = io.BytesIO()
+        crop.save(buf, "JPEG", quality=85)
+        buf.seek(0)
+        return base64.b64encode(buf.read()).decode()
+    except Exception as e:
+        return ""
+
+
+def _cosine_sim(a, b) -> float:
+    try:
+        import numpy as np
+        a, b = np.array(a, dtype=float), np.array(b, dtype=float)
+        denom = float(np.linalg.norm(a)) * float(np.linalg.norm(b))
+        if denom == 0:
+            return 0.0
+        return float(np.dot(a, b) / denom)
+    except Exception:
+        pass
+    try:
+        import math
+        dot = sum(x * y for x, y in zip(a, b))
+        na = math.sqrt(sum(x * x for x in a))
+        nb = math.sqrt(sum(x * x for x in b))
+        return dot / (na * nb) if na * nb > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+@app.route("/api/faces/detect", methods=["POST"])
+def faces_detect():
+    if not _check_deepface():
+        return jsonify({"error": "deepface 未安装", "deepfaceMissing": True}), 200
+    data = request.get_json(force=True) or {}
+    doc_ids = data.get("docIds", [])
+    if not doc_ids:
+        return jsonify({"error": "No docIds provided"}), 400
+
+    # Load existing labels for annotation
+    faces_data = read_faces()
+    label_map = {(lbl["docId"], lbl["faceIdx"]): lbl.get("personId")
+                 for lbl in faces_data.get("labels", [])}
+    person_name_map = {p["id"]: p["name"] for p in faces_data.get("people", [])}
+
+    # Build worker items (images only, with resolved paths)
+    items = []
+    skipped = {}
+    for doc_id in doc_ids:
+        file_path = _resolve_photo_path(doc_id)
+        if not file_path:
+            skipped[doc_id] = "文件未找到"
+            continue
+        mime = mimetypes.guess_type(str(file_path))[0] or ""
+        if not mime.startswith("image/"):
+            skipped[doc_id] = "不是图片文件"
+            continue
+        items.append({"doc_id": doc_id, "path": str(file_path)})
+
+    results = []
+    for doc_id, reason in skipped.items():
+        results.append({"docId": doc_id, "faces": [], "error": reason})
+
+    if items:
+        try:
+            worker_out = _run_deepface_worker({"action": "represent", "items": items})
+        except Exception as e:
+            return jsonify({"error": f"人脸检测失败: {e}"}), 500
+
+        for r in worker_out.get("results", []):
+            doc_id = r["doc_id"]
+            if r.get("error"):
+                results.append({"docId": doc_id, "faces": [], "error": r["error"]})
+                continue
+            faces = []
+            for idx, f in enumerate(r.get("faces", [])):
+                person_id = label_map.get((doc_id, idx))
+                faces.append({
+                    "faceIdx": idx,
+                    "bbox": f["bbox"],
+                    "confidence": f["confidence"],
+                    "embedding": f["embedding"],
+                    "crop_b64": f["crop_b64"],
+                    "personId": person_id,
+                    "personName": person_name_map.get(person_id) if person_id else None,
+                })
+            results.append({"docId": doc_id, "faces": faces})
+
+    return jsonify({"results": results})
+
+
+@app.route("/api/faces/label", methods=["POST"])
+def faces_label():
+    data = request.get_json(force=True) or {}
+    doc_id = data.get("docId", "").strip()
+    face_idx = data.get("faceIdx", 0)
+    name = (data.get("name") or "").strip()
+    embedding = data.get("embedding", [])
+    bbox = data.get("bbox", {})
+
+    if not doc_id or not name:
+        return jsonify({"error": "Missing docId or name"}), 400
+
+    faces_data = read_faces()
+
+    # Find or create person (case-insensitive match)
+    person = next(
+        (p for p in faces_data["people"] if p["name"].lower() == name.lower()),
+        None,
+    )
+    if not person:
+        person = {"id": "PERSON-" + secrets.token_hex(4).upper(), "name": name}
+        faces_data["people"].append(person)
+
+    # Remove any existing label for this (docId, faceIdx)
+    faces_data["labels"] = [
+        lbl for lbl in faces_data["labels"]
+        if not (lbl["docId"] == doc_id and lbl["faceIdx"] == face_idx)
+    ]
+    faces_data["labels"].append({
+        "docId": doc_id,
+        "faceIdx": face_idx,
+        "personId": person["id"],
+        "embedding": embedding,
+        "bbox": bbox,
+    })
+
+    write_faces(faces_data)
+    return jsonify({"ok": True, "personId": person["id"], "personName": person["name"]})
+
+
+@app.route("/api/faces/label", methods=["DELETE"])
+def faces_unlabel():
+    data = request.get_json(force=True) or {}
+    doc_id = data.get("docId", "").strip()
+    face_idx = data.get("faceIdx", 0)
+
+    if not doc_id:
+        return jsonify({"error": "Missing docId"}), 400
+
+    faces_data = read_faces()
+    faces_data["labels"] = [
+        lbl for lbl in faces_data["labels"]
+        if not (lbl["docId"] == doc_id and lbl["faceIdx"] == face_idx)
+    ]
+    write_faces(faces_data)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/faces/people", methods=["GET"])
+def faces_people():
+    faces_data = read_faces()
+    people = faces_data.get("people", [])
+    labels = faces_data.get("labels", [])
+    recognitions = faces_data.get("recognitions", [])
+
+    result = []
+    for person in people:
+        pid = person["id"]
+        labeled_docs = list({lbl["docId"] for lbl in labels if lbl["personId"] == pid})
+        recog_docs = list({r["docId"] for r in recognitions if r["personId"] == pid})
+        all_docs = list(set(labeled_docs + recog_docs))
+        photo_count = len(all_docs)
+
+        # Avatar: first labeled face crop
+        avatar_crop = None
+        first_label = next((lbl for lbl in labels if lbl["personId"] == pid), None)
+        avatar_doc_id = None
+        avatar_face_idx = None
+        if first_label:
+            avatar_doc_id = first_label["docId"]
+            avatar_face_idx = first_label["faceIdx"]
+            file_path = _resolve_photo_path(avatar_doc_id)
+            if file_path:
+                avatar_crop = _face_crop_b64(file_path, first_label.get("bbox", {}))
+
+        result.append({
+            "id": pid,
+            "name": person["name"],
+            "photoCount": photo_count,
+            "avatarDocId": avatar_doc_id,
+            "avatarFaceIdx": avatar_face_idx,
+            "avatarCrop": avatar_crop,
+        })
+
+    return jsonify({"people": result, "deepfaceAvailable": _check_deepface()})
+
+
+@app.route("/api/faces/recognize", methods=["POST"])
+def faces_recognize():
+    if not _check_deepface():
+        return jsonify({"error": "deepface 未安装", "deepfaceMissing": True}), 200
+
+    data = request.get_json(force=True) or {}
+    target_person_id = data.get("personId")  # optional — scan for specific person
+    threshold_raw = data.get("threshold")
+    try:
+        threshold_val = float(threshold_raw) if threshold_raw is not None else 0.70
+        threshold_val = max(0.50, min(0.99, threshold_val))
+    except (TypeError, ValueError):
+        threshold_val = 0.70
+    node_ids = data.get("nodeIds", [])        # optional — limit scan to these folder subtrees
+
+    faces_data = read_faces()
+    labels = faces_data.get("labels", [])
+    people = faces_data.get("people", [])
+
+    if not labels:
+        return jsonify({"ok": True, "found": 0, "scanned": 0, "message": "没有已标记的人脸用于比对"})
+
+    # Build reference embeddings per person
+    person_embeddings = {}  # personId -> [embedding, ...]
+    for lbl in labels:
+        pid = lbl["personId"]
+        if target_person_id and pid != target_person_id:
+            continue
+        emb = lbl.get("embedding", [])
+        if emb:
+            person_embeddings.setdefault(pid, []).append(emb)
+
+    if not person_embeddings:
+        return jsonify({"ok": True, "found": 0, "scanned": 0, "message": "指定人物没有可用的嵌入向量"})
+
+    # Get all image docs
+    idx = read_index()
+    all_docs = idx.get("docIndex", [])
+    image_docs = [d for d in all_docs if (d.get("mime") or "").startswith("image/")]
+
+    # If specific folders requested, limit to docs in those subtrees
+    if node_ids:
+        tree = idx.get("tree")
+        allowed_ids: set[str] = set()
+        for nid in node_ids:
+            node = _find_node_by_id(tree, nid) if tree else None
+            if node:
+                stack = [node]
+                while stack:
+                    n = stack.pop()
+                    for d in (n.get("documents") or []):
+                        allowed_ids.add(d["id"] if isinstance(d, dict) else d)
+                    stack.extend(n.get("children") or [])
+        image_docs = [d for d in image_docs if d["id"] in allowed_ids]
+
+    labeled_pairs = {(lbl["docId"], lbl["faceIdx"]) for lbl in labels}
+
+    # Remove old recognitions for target person (or all if no target)
+    if target_person_id:
+        faces_data["recognitions"] = [
+            r for r in faces_data.get("recognitions", [])
+            if r["personId"] != target_person_id
+        ]
+    else:
+        faces_data["recognitions"] = []
+
+    THRESHOLD = threshold_val
+    found = 0
+    scanned = 0
+
+    # Build worker items for all candidate images
+    items = []
+    for doc in image_docs:
+        doc_id = doc["id"]
+        file_path = _resolve_photo_path(doc_id)
+        if file_path:
+            items.append({"doc_id": doc_id, "path": str(file_path)})
+
+    if not items:
+        write_faces(faces_data)
+        return jsonify({"ok": True, "found": 0, "scanned": 0})
+
+    try:
+        worker_out = _run_deepface_worker({"action": "represent", "items": items},
+                                          timeout=600)
+    except Exception as e:
+        return jsonify({"error": f"人脸识别失败: {e}"}), 500
+
+    for r in worker_out.get("results", []):
+        doc_id = r["doc_id"]
+        if r.get("error"):
+            continue
+        scanned += 1
+        for idx_face, f in enumerate(r.get("faces", [])):
+            if (doc_id, idx_face) in labeled_pairs:
+                continue
+            emb = f.get("embedding", [])
+            if not emb:
+                continue
+            bbox = f["bbox"]
+            for pid, ref_embeddings in person_embeddings.items():
+                best_sim = max(_cosine_sim(emb, ref) for ref in ref_embeddings)
+                if best_sim >= THRESHOLD:
+                    faces_data["recognitions"].append({
+                        "docId": doc_id,
+                        "faceIdx": idx_face,
+                        "personId": pid,
+                        "confidence": round(best_sim, 4),
+                        "bbox": bbox,
+                    })
+                    found += 1
+                    break
+
+    write_faces(faces_data)
+    # Count unique photos (a group photo may have multiple matched faces)
+    matched_docs = len({r["docId"] for r in faces_data.get("recognitions", [])
+                        if r["personId"] == target_person_id} if target_person_id
+                       else {r["docId"] for r in faces_data.get("recognitions", [])})
+    return jsonify({"ok": True, "found": found, "photos": matched_docs, "scanned": scanned})
+
+
+@app.route("/api/faces/photos/<person_id>", methods=["GET"])
+def faces_photos(person_id):
+    faces_data = read_faces()
+    labels = faces_data.get("labels", [])
+    recognitions = faces_data.get("recognitions", [])
+    labeled_docs = list({lbl["docId"] for lbl in labels if lbl["personId"] == person_id})
+    recog_docs = list({r["docId"] for r in recognitions if r["personId"] == person_id})
+    all_doc_ids = list(set(labeled_docs + recog_docs))
+    return jsonify({"docIds": all_doc_ids})
+
+
+@app.route("/api/faces/create-folder", methods=["POST"])
+def faces_create_folder():
+    """Create a tree folder named after a person and link all their matched photos to it."""
+    data = request.get_json(force=True) or {}
+    person_name = (data.get("personName") or "").strip()
+    doc_ids = data.get("docIds") or []
+    if not person_name or not doc_ids:
+        return jsonify({"error": "personName and docIds are required"}), 400
+
+    idx = read_index()
+    tree = idx.get("tree")
+    if not tree:
+        return jsonify({"error": "No project tree found"}), 400
+
+    # Create/find "人脸匹配" parent folder at root level
+    face_parent = _get_or_create_child_node(tree, "人脸匹配")
+    # Create/find the person's subfolder
+    person_node = _get_or_create_child_node(face_parent, person_name)
+
+    # Link docs that aren't already in this node
+    existing_ids = {d["id"] for d in (person_node.get("documents") or []) if isinstance(d, dict)}
+    added = 0
+    for doc_id in doc_ids:
+        if doc_id not in existing_ids:
+            person_node.setdefault("documents", []).append({"id": doc_id})
+            existing_ids.add(doc_id)
+            added += 1
+
+    write_index(idx)
+    return jsonify({"ok": True, "added": added, "nodeId": person_node["id"]})
+
+
+@app.route("/api/faces/person/<person_id>", methods=["DELETE"])
+def faces_delete_person(person_id):
+    faces_data = read_faces()
+    faces_data["people"] = [p for p in faces_data["people"] if p["id"] != person_id]
+    faces_data["labels"] = [lbl for lbl in faces_data["labels"] if lbl["personId"] != person_id]
+    faces_data["recognitions"] = [r for r in faces_data.get("recognitions", []) if r["personId"] != person_id]
+    write_faces(faces_data)
+    return jsonify({"ok": True})
+
+
+# ---- Guide download -------------------------------------------------------
+_ONEDRIVE_GUIDE_TEXT = """\
+================================================================================
+  QCDMS — HOW TO STORE YOUR DOCUMENTS ON MICROSOFT ONEDRIVE
+  Step-by-Step Setup Guide for New Users
+================================================================================
+
+OVERVIEW
+--------
+By default, QCDMS saves all your folders and documents on your computer's
+local hard drive. This guide shows you how to store everything in Microsoft
+OneDrive instead, so your documents are:
+
+  • Automatically backed up to the cloud
+  • Accessible from any computer, phone, or tablet
+  • Protected even if your computer is lost, stolen, or damaged
+  • Shareable with other people if needed
+
+How it works: OneDrive keeps a special sync folder on your computer. Anything
+you save in that folder is automatically and silently uploaded to Microsoft's
+cloud servers. We simply tell QCDMS to use a subfolder inside that OneDrive
+folder as its storage location. QCDMS works exactly as before — it writes
+files to that folder, and OneDrive does the rest.
+
+--------------------------------------------------------------------------------
+PART 1 — SET UP MICROSOFT ONEDRIVE ON YOUR COMPUTER
+--------------------------------------------------------------------------------
+
+You only need to do Part 1 once per computer. If OneDrive is already installed
+and you are already signed in, skip to Part 2.
+
+STEP 1: CHECK IF ONEDRIVE IS ALREADY INSTALLED
+-----------------------------------------------
+  Mac:
+    - Look for a cloud icon (looks like a small cloud) in the menu bar at the
+      top-right of your screen. If you see it, OneDrive is installed.
+    - Alternatively, open Finder and look in the left sidebar for an entry
+      called "OneDrive" or "OneDrive - Personal".
+
+  Windows:
+    - Look for a cloud icon in the system tray (bottom-right corner of the
+      screen, near the clock). If you see it, OneDrive is installed.
+    - Alternatively, open File Explorer and look in the left sidebar for
+      an entry called "OneDrive" or "OneDrive - Personal".
+
+  If you see OneDrive, skip to STEP 3. If not, continue to STEP 2.
+
+
+STEP 2: INSTALL MICROSOFT ONEDRIVE
+-----------------------------------
+  Mac:
+    Option A — From the Mac App Store:
+      1. Open the App Store (blue icon with the letter "A").
+      2. In the search bar, type "Microsoft OneDrive".
+      3. Click "Get" and then "Install". You may need to enter your
+         Apple ID password.
+      4. Once installed, open OneDrive from your Applications folder or
+         Launchpad.
+
+    Option B — Direct download:
+      1. Open your web browser.
+      2. Go to: https://www.microsoft.com/en-us/microsoft-365/onedrive/download
+      3. Click "Download" and open the downloaded file.
+      4. Follow the on-screen installer instructions.
+
+  Windows 10 / 11:
+    OneDrive is usually pre-installed on Windows 10 and 11. If it is missing:
+      1. Open your web browser.
+      2. Go to: https://www.microsoft.com/en-us/microsoft-365/onedrive/download
+      3. Click "Download" and run the downloaded installer.
+      4. Follow the on-screen instructions.
+
+
+STEP 3: SIGN IN TO ONEDRIVE
+-----------------------------
+  1. Open OneDrive (click the cloud icon in the menu bar or system tray,
+     or open it from your Applications folder / Start Menu).
+
+  2. A "Sign in" window will appear. Enter your Microsoft account email
+     address. This is usually one of:
+       • yourname@outlook.com
+       • yourname@hotmail.com
+       • yourname@live.com
+       • A work or school email ending in @yourcompany.com (Microsoft 365)
+
+  3. Click "Sign in" and enter your password.
+
+  4. Follow any additional prompts (two-factor authentication, etc.).
+
+  5. You will be asked to choose your OneDrive folder location.
+     RECOMMENDATION: Accept the default location. It will be:
+       Mac:     /Users/[your username]/OneDrive - Personal
+       Windows: C:\\Users\\[your username]\\OneDrive - Personal
+
+     Write down this folder path — you will need it in Part 2.
+
+  6. OneDrive will begin syncing. A blue cloud icon will appear in your
+     menu bar (Mac) or system tray (Windows) to confirm it is running.
+
+
+STEP 4: CONFIRM ONEDRIVE IS WORKING
+--------------------------------------
+  1. Click the OneDrive cloud icon in your menu bar or system tray.
+  2. You should see "Up to date" or a sync progress message.
+  3. If you see any error messages, resolve them before continuing
+     (usually just signing in again fixes them).
+
+--------------------------------------------------------------------------------
+PART 2 — CREATE A DEDICATED FOLDER FOR QCDMS INSIDE ONEDRIVE
+--------------------------------------------------------------------------------
+
+STEP 5: FIND YOUR ONEDRIVE FOLDER
+-----------------------------------
+  Mac:
+    1. Open Finder (the smiley face icon in your Dock).
+    2. In the left sidebar, click "OneDrive" or "OneDrive - Personal".
+    3. The full path is typically:
+         /Users/[your username]/OneDrive - Personal
+       For example: /Users/david/OneDrive - Personal
+
+    TIP — To see the exact full path:
+      1. With the OneDrive folder open in Finder, right-click (or
+         Control-click) anywhere in the window background.
+      2. If "Get Info" is shown, click it and look at "Where:".
+      3. Alternatively, hold the Option key and right-click the folder name
+         at the top of the window — the full path appears.
+
+  Windows:
+    1. Open File Explorer (the folder icon in your taskbar).
+    2. In the left sidebar, click "OneDrive" or "OneDrive - Personal".
+    3. The address bar at the top shows the full path. It is typically:
+         C:\\Users\\[your username]\\OneDrive - Personal
+       For example: C:\\Users\\David\\OneDrive - Personal
+
+
+STEP 6: CREATE A SUBFOLDER FOR QCDMS
+---------------------------------------
+  It is best to give QCDMS its own dedicated subfolder inside OneDrive,
+  rather than putting files directly in the root of OneDrive. This keeps
+  things organized.
+
+  Suggested folder name: DMS_Storage
+  (You can name it anything you like, such as "My DMS" or "Company Files".)
+
+  Mac — using Finder:
+    1. Open Finder and navigate to your OneDrive folder.
+    2. Right-click in an empty area of the window.
+    3. Select "New Folder".
+    4. Type the folder name (e.g., DMS_Storage) and press Enter.
+    5. The full path to use later will be:
+         /Users/[your username]/OneDrive - Personal/DMS_Storage
+       For example: /Users/david/OneDrive - Personal/DMS_Storage
+
+  Windows — using File Explorer:
+    1. Open File Explorer and navigate to your OneDrive folder.
+    2. Right-click in an empty area of the window.
+    3. Select "New" > "Folder".
+    4. Type the folder name (e.g., DMS_Storage) and press Enter.
+    5. The full path to use later will be:
+         C:\\Users\\[your username]\\OneDrive - Personal\\DMS_Storage
+       For example: C:\\Users\\David\\OneDrive - Personal\\DMS_Storage
+
+  WRITE DOWN THIS FULL PATH. You will paste it into QCDMS in the next step.
+
+--------------------------------------------------------------------------------
+PART 3 — TELL QCDMS TO USE YOUR ONEDRIVE FOLDER
+--------------------------------------------------------------------------------
+
+STEP 7: LAUNCH QCDMS
+----------------------
+  Start QCDMS as you normally would:
+    Mac:     Double-click DMS.app (or run start_dms.command)
+    Windows: Double-click DMS.exe (or run start_dms.bat)
+
+  QCDMS will open in your web browser automatically.
+
+
+STEP 8A: IF THIS IS YOUR FIRST TIME USING QCDMS (No data yet)
+--------------------------------------------------------------
+  When QCDMS opens for the first time, it will show a setup screen that says
+  "Set Storage Location" (设置存储位置). This is where you enter your path.
+
+    1. Click inside the text box (it shows a greyed-out example path).
+
+    2. Type (or paste) the full path to your OneDrive folder you created
+       in Step 6. Example:
+         Mac:     /Users/david/OneDrive - Personal/DMS_Storage
+         Windows: C:\\Users\\David\\OneDrive - Personal\\DMS_Storage
+
+    3. Click "Save and Continue" (保存并继续).
+
+    4. QCDMS will create the folder if it doesn't already exist, and will
+       show the main document management interface. You are done!
+
+    TIP: You can also type ~ as a shortcut for your home folder on Mac:
+         ~/OneDrive - Personal/DMS_Storage
+
+
+STEP 8B: IF YOU ALREADY HAVE QCDMS DATA (Migrating from local storage)
+-----------------------------------------------------------------------
+  If you have been using QCDMS and already have documents stored locally,
+  follow these steps to move everything to OneDrive.
+
+  IMPORTANT: Before doing anything, make a backup copy of your existing
+  QCDMS data folder. This is simply a precaution.
+
+  Step 8B-1: Find your current storage folder.
+    - Look at the grey status bar at the very bottom of the QCDMS window.
+    - You will see a hard drive icon followed by a folder path, for example:
+        /Users/david/Documents/Company01
+    - That is your current storage folder. Make a copy of it somewhere safe.
+
+  Step 8B-2: Copy your existing data to OneDrive.
+    Option A — Copy before changing (Recommended for large collections):
+      1. Open Finder (Mac) or File Explorer (Windows).
+      2. Navigate to your current QCDMS storage folder.
+      3. Select ALL files and folders inside it (Cmd+A on Mac, Ctrl+A on
+         Windows).
+      4. Copy them (Cmd+C on Mac, Ctrl+C on Windows).
+      5. Navigate to your new OneDrive DMS folder (e.g., OneDrive/DMS_Storage).
+      6. Paste (Cmd+V on Mac, Ctrl+V on Windows).
+      7. Wait for the copy to finish before continuing.
+
+    Option B — Let QCDMS migrate automatically (for smaller collections):
+      QCDMS can copy your current data to the new location automatically.
+      Skip ahead to Step 8B-3 and let the app handle it.
+
+  Step 8B-3: Change the storage path in QCDMS.
+    1. In the QCDMS window, look at the bottom status bar. You will see
+       a path displayed next to a small hard-drive icon.
+    2. Click that path. A "Change Storage Location" screen appears.
+    3. Clear the text box and type your new OneDrive path:
+         Mac:     /Users/david/OneDrive - Personal/DMS_Storage
+         Windows: C:\\Users\\David\\OneDrive - Personal\\DMS_Storage
+    4. Click "Save" (保存).
+    5. If QCDMS detects that the new folder already contains DMS data
+       (because you copied it in Option A above), it will ask if you
+       want to switch to that data. Click "Continue" (继续).
+    6. If the new folder is empty (Option B), QCDMS will copy your current
+       index and document list automatically.
+
+  Step 8B-4: Verify the migration was successful.
+    1. Check that your folders and documents all appear correctly in QCDMS.
+    2. Open a few documents to confirm they can be viewed.
+    3. Once satisfied, you may delete the old local storage folder, or keep
+       it as an extra backup.
+
+
+--------------------------------------------------------------------------------
+PART 4 — VERIFY ONEDRIVE IS SYNCING YOUR QCDMS DATA
+--------------------------------------------------------------------------------
+
+STEP 9: CONFIRM SYNC IS WORKING
+---------------------------------
+  1. After saving documents in QCDMS, look at the OneDrive cloud icon in
+     your menu bar (Mac) or system tray (Windows).
+
+  2. While syncing, the icon will show animated arrows or a progress circle.
+
+  3. When sync is complete, the icon will show a green checkmark or a
+     plain cloud, and you will see "Up to date".
+
+  4. To double-check online:
+     a. Open your web browser.
+     b. Go to https://onedrive.live.com and sign in.
+     c. Look for your DMS_Storage folder. You should see your QCDMS files
+        (especially index.json and a "docs" subfolder containing your
+        uploaded documents).
+
+
+--------------------------------------------------------------------------------
+PART 5 — USING QCDMS ON A SECOND COMPUTER
+--------------------------------------------------------------------------------
+
+STEP 10: ACCESS YOUR DOCUMENTS FROM ANOTHER COMPUTER
+------------------------------------------------------
+  To use the same QCDMS document library on a second Mac or Windows PC:
+
+  1. Install QCDMS on the second computer (copy the DMS.app or DMS.exe).
+
+  2. Install and sign in to OneDrive on the second computer using the same
+     Microsoft account (see Steps 1-4 above). OneDrive will sync all your
+     files to that computer.
+
+  3. Launch QCDMS on the second computer. It will show the setup screen.
+
+  4. Enter the same OneDrive DMS folder path:
+       Mac:     /Users/[username on this computer]/OneDrive - Personal/DMS_Storage
+       Windows: C:\\Users\\[username on this computer]\\OneDrive - Personal\\DMS_Storage
+     Note: The username part of the path may differ on each computer, but
+     the OneDrive folder name (OneDrive - Personal) will be the same.
+
+  5. Click "Save and Continue". QCDMS will detect your existing data and
+     open your full document library.
+
+  IMPORTANT — Do not run QCDMS on two computers at exactly the same time.
+  Both would be writing to the same files via OneDrive, which can cause
+  conflicts. Use it on one computer at a time.
+
+
+--------------------------------------------------------------------------------
+FREQUENTLY ASKED QUESTIONS
+--------------------------------------------------------------------------------
+
+Q: What happens if my internet connection goes down?
+A: QCDMS will continue to work normally because it reads and writes to the
+   local OneDrive sync folder on your computer. Your changes are saved locally
+   first and uploaded to the cloud as soon as the internet is restored.
+
+Q: What if OneDrive is not running when I use QCDMS?
+A: QCDMS will still work, writing to the local folder. When OneDrive starts
+   again, it will sync any changes you made while it was offline.
+
+Q: How much OneDrive storage do I need?
+A: A free Microsoft account includes 5 GB of OneDrive storage. A Microsoft 365
+   Personal subscription includes 1 TB (1,000 GB). For most personal document
+   libraries, 5 GB is more than sufficient. You can check how much storage
+   you are using at https://onedrive.live.com (sign in, click your name or
+   avatar in the top right, then "Storage").
+
+Q: Can I share my QCDMS library with someone else?
+A: You can share the OneDrive folder with another person via OneDrive's
+   sharing feature. However, both people should not run QCDMS at the same
+   time on the same folder, as this can cause file conflicts.
+
+Q: Will OneDrive compress or change my documents?
+A: No. OneDrive stores your files exactly as they are. PDFs, images, and
+   all other files are stored and retrieved without any modification.
+
+Q: How do I find out my exact OneDrive folder path on Mac?
+A: Open Terminal (press Cmd+Space, type "Terminal", press Enter) and type:
+     ls ~/OneDrive*
+   Press Enter. The folder name(s) shown are inside your home directory.
+   Your full path is /Users/[your username]/[that folder name].
+   Example: /Users/david/OneDrive - Personal
+
+Q: How do I find out my exact OneDrive folder path on Windows?
+A: Open File Explorer, click on OneDrive in the left sidebar, then look at
+   the address bar at the top. It shows the full path.
+   Alternatively, right-click the OneDrive tray icon and choose "Settings",
+   then look in the Account tab for the folder location.
+
+Q: What is "OneDrive - Personal" vs. "OneDrive - [Company Name]"?
+A: "OneDrive - Personal" uses your personal Microsoft account (Outlook,
+   Hotmail, Live). "OneDrive - [Company Name]" is a work or school account
+   managed by your organization. Either will work with QCDMS; just make sure
+   to use the correct folder path.
+
+--------------------------------------------------------------------------------
+QUICK REFERENCE — PATH EXAMPLES
+--------------------------------------------------------------------------------
+
+  Mac (Personal account):
+    /Users/david/OneDrive - Personal/DMS_Storage
+
+  Mac (Work/School account, replace "Contoso" with your company name):
+    /Users/david/OneDrive - Contoso/DMS_Storage
+
+  Windows (Personal account):
+    C:\\Users\\David\\OneDrive - Personal\\DMS_Storage
+
+  Windows (Work/School account):
+    C:\\Users\\David\\OneDrive - Contoso\\DMS_Storage
+
+--------------------------------------------------------------------------------
+SUPPORT
+--------------------------------------------------------------------------------
+
+  For QCDMS issues, contact your QCDMS administrator.
+
+  For OneDrive issues, visit Microsoft's support site:
+    https://support.microsoft.com/onedrive
+
+================================================================================
+  END OF GUIDE
+================================================================================
+"""
+
+@app.route("/guides/onedrive-setup", methods=["GET"])
+def download_onedrive_guide():
+    buf = io.BytesIO(_ONEDRIVE_GUIDE_TEXT.encode("utf-8"))
+    return send_file(buf, mimetype="text/plain",
+                     as_attachment=True,
+                     download_name="OneDrive_Setup_Guide.txt")
+
+
+_ONEDRIVE_GUIDE_CN_TEXT = """\
+================================================================================
+  QCDMS — 如何将文档保存到 Microsoft OneDrive
+  新用户逐步设置指南
+================================================================================
+
+概述
+----
+默认情况下，QCDMS 将所有文件夹和文档保存在电脑本地硬盘上。本指南将引导您将
+存储位置改为 Microsoft OneDrive，这样您的文档将：
+
+  • 自动备份到云端
+  • 可从任何电脑、手机或平板访问
+  • 即使电脑丢失、被盗或损坏，数据也不会丢失
+  • 可根据需要与他人共享
+
+工作原理：OneDrive 在您的电脑上建立一个专属同步文件夹。保存在该文件夹中的
+任何内容都会自动静默上传到微软云端服务器。我们只需告诉 QCDMS 使用该 OneDrive
+文件夹内的子文件夹作为存储位置即可。QCDMS 的使用方式完全不变——它照常向该
+文件夹写入文件，OneDrive 负责其余的同步工作。
+
+--------------------------------------------------------------------------------
+第一部分 — 在电脑上安装并设置 Microsoft OneDrive
+--------------------------------------------------------------------------------
+
+每台电脑只需设置一次。如果 OneDrive 已安装并且您已登录，请直接跳至第二部分。
+
+第一步：检查是否已安装 OneDrive
+--------------------------------
+  Mac（苹果电脑）：
+    - 查看屏幕右上角菜单栏中是否有云朵图标（形似小云）。有则表示已安装。
+    - 或者，打开 Finder（访达），查看左侧栏中是否有"OneDrive"或
+      "OneDrive - Personal"条目。
+
+  Windows：
+    - 查看屏幕右下角系统托盘（时钟旁边）是否有云朵图标。有则表示已安装。
+    - 或者，打开文件资源管理器，查看左侧栏中是否有"OneDrive"条目。
+
+  若已看到 OneDrive，请跳至第三步。否则继续第二步。
+
+
+第二步：安装 Microsoft OneDrive
+---------------------------------
+  Mac（苹果电脑）：
+    方式一 — 从 Mac App Store 安装：
+      1. 打开 App Store（蓝色"A"字图标）。
+      2. 在搜索栏中输入"Microsoft OneDrive"。
+      3. 点击"获取"，然后点击"安装"。可能需要输入 Apple ID 密码。
+      4. 安装完成后，从应用程序文件夹或启动台打开 OneDrive。
+
+    方式二 — 直接下载：
+      1. 打开浏览器。
+      2. 访问：https://www.microsoft.com/zh-cn/microsoft-365/onedrive/download
+      3. 点击"下载"，打开下载的文件。
+      4. 按照屏幕提示完成安装。
+
+  Windows 10 / 11：
+    OneDrive 通常已预装在 Windows 10 和 11 中。如果缺失：
+      1. 打开浏览器。
+      2. 访问：https://www.microsoft.com/zh-cn/microsoft-365/onedrive/download
+      3. 点击"下载"并运行安装程序。
+      4. 按照屏幕提示完成安装。
+
+
+第三步：登录 OneDrive
+-----------------------
+  1. 打开 OneDrive（点击菜单栏或系统托盘中的云朵图标，或从应用程序文件夹 /
+     开始菜单打开）。
+
+  2. 将出现"登录"窗口。输入您的微软账户电子邮件地址，通常为：
+       • yourname@outlook.com
+       • yourname@hotmail.com
+       • yourname@live.com
+       • 单位或学校邮件（以 @yourcompany.com 结尾，即 Microsoft 365 账户）
+
+  3. 点击"登录"并输入密码。
+
+  4. 按照提示完成任何附加验证（如两步验证等）。
+
+  5. 系统会询问您选择 OneDrive 文件夹的保存位置。
+     建议：接受默认位置，通常为：
+       Mac：     /Users/[您的用户名]/OneDrive - Personal
+       Windows： C:\\Users\\[您的用户名]\\OneDrive - Personal
+
+     请记下此路径——第二部分将用到它。
+
+  6. OneDrive 开始同步后，菜单栏（Mac）或系统托盘（Windows）将显示蓝色云朵图标。
+
+
+第四步：确认 OneDrive 正常运行
+---------------------------------
+  1. 点击菜单栏或系统托盘中的 OneDrive 云朵图标。
+  2. 应看到"已是最新"或同步进度提示。
+  3. 如有错误提示，请先解决（通常重新登录即可），再继续。
+
+--------------------------------------------------------------------------------
+第二部分 — 在 OneDrive 中为 QCDMS 创建专用文件夹
+--------------------------------------------------------------------------------
+
+第五步：找到您的 OneDrive 文件夹
+-----------------------------------
+  Mac：
+    1. 打开 Finder（Dock 中的笑脸图标）。
+    2. 点击左侧栏中的"OneDrive"或"OneDrive - Personal"。
+    3. 完整路径通常为：
+         /Users/[您的用户名]/OneDrive - Personal
+       示例：/Users/david/OneDrive - Personal
+
+    提示 — 查看精确完整路径的方法：
+      1. 在 Finder 中打开 OneDrive 文件夹后，在窗口空白处右键单击。
+      2. 点击"显示简介"，查看"位置"字段。
+      3. 或者，按住 Option 键并右键单击窗口顶部的文件夹名称，完整路径将显示出来。
+
+  Windows：
+    1. 打开文件资源管理器（任务栏中的文件夹图标）。
+    2. 点击左侧栏中的"OneDrive"或"OneDrive - Personal"。
+    3. 地址栏顶部会显示完整路径，通常为：
+         C:\\Users\\[您的用户名]\\OneDrive - Personal
+       示例：C:\\Users\\David\\OneDrive - Personal
+
+
+第六步：为 QCDMS 创建子文件夹
+--------------------------------
+  建议在 OneDrive 内为 QCDMS 创建一个专用子文件夹，而不是直接使用 OneDrive
+  根目录，这样可以保持整洁有序。
+
+  建议文件夹名称：DMS_Storage
+  （您也可以自定义名称，如"我的文档库"或"公司文件"等。）
+
+  Mac — 使用 Finder（访达）：
+    1. 打开 Finder，进入您的 OneDrive 文件夹。
+    2. 在窗口空白处右键单击。
+    3. 选择"新建文件夹"。
+    4. 输入文件夹名称（例如：DMS_Storage），按回车键确认。
+    5. 之后要填写的完整路径为：
+         /Users/[您的用户名]/OneDrive - Personal/DMS_Storage
+       示例：/Users/david/OneDrive - Personal/DMS_Storage
+
+  Windows — 使用文件资源管理器：
+    1. 打开文件资源管理器，进入您的 OneDrive 文件夹。
+    2. 在窗口空白处右键单击。
+    3. 选择"新建" > "文件夹"。
+    4. 输入文件夹名称（例如：DMS_Storage），按回车键确认。
+    5. 之后要填写的完整路径为：
+         C:\\Users\\[您的用户名]\\OneDrive - Personal\\DMS_Storage
+       示例：C:\\Users\\David\\OneDrive - Personal\\DMS_Storage
+
+  请记下此完整路径，下一步将粘贴到 QCDMS 中。
+
+--------------------------------------------------------------------------------
+第三部分 — 告知 QCDMS 使用 OneDrive 文件夹
+--------------------------------------------------------------------------------
+
+第七步：启动 QCDMS
+--------------------
+  按照平时的方式启动 QCDMS：
+    Mac：     双击 DMS.app（或运行 start_dms.command）
+    Windows： 双击 DMS.exe（或运行 start_dms.bat）
+
+  QCDMS 将自动在浏览器中打开。
+
+
+第八步（A）：首次使用 QCDMS（尚无数据）
+-----------------------------------------
+  首次打开 QCDMS 时，将显示"设置存储位置"界面。
+
+    1. 点击文本框（显示灰色示例路径）。
+
+    2. 输入或粘贴您在第六步中创建的 OneDrive 文件夹完整路径，例如：
+         Mac：     /Users/david/OneDrive - Personal/DMS_Storage
+         Windows： C:\\Users\\David\\OneDrive - Personal\\DMS_Storage
+
+    3. 点击"保存并继续"。
+
+    4. 如果文件夹不存在，QCDMS 将自动创建，然后进入主界面。设置完成！
+
+    提示：在 Mac 上可用 ~ 代替主文件夹路径：
+         ~/OneDrive - Personal/DMS_Storage
+
+
+第八步（B）：已有 QCDMS 数据（从本地迁移到 OneDrive）
+--------------------------------------------------------
+  如果您之前已在使用 QCDMS 并在本地存有文档，请按以下步骤将数据迁移到 OneDrive。
+
+  重要提示：操作前，请先备份现有的 QCDMS 数据文件夹。
+
+  步骤 B-1：找到当前存储文件夹。
+    - 查看 QCDMS 窗口底部状态栏。
+    - 您会看到一个硬盘图标后跟一个文件夹路径，例如：
+        /Users/david/Documents/Company01
+    - 这就是当前存储文件夹，请先将其复制到安全位置作为备份。
+
+  步骤 B-2：将现有数据复制到 OneDrive。
+    方式一 — 先复制再切换（推荐用于大量文档）：
+      1. 打开 Finder（Mac）或文件资源管理器（Windows）。
+      2. 进入当前 QCDMS 存储文件夹。
+      3. 全选其中所有文件和文件夹（Mac：Cmd+A；Windows：Ctrl+A）。
+      4. 复制（Mac：Cmd+C；Windows：Ctrl+C）。
+      5. 进入新的 OneDrive DMS 文件夹（如 OneDrive/DMS_Storage）。
+      6. 粘贴（Mac：Cmd+V；Windows：Ctrl+V）。
+      7. 等待复制完成后再继续。
+
+    方式二 — 让 QCDMS 自动迁移（适用于少量文档）：
+      QCDMS 可自动将当前数据复制到新位置。
+      跳过此步骤，直接进行步骤 B-3，让程序自动处理。
+
+  步骤 B-3：在 QCDMS 中更改存储路径。
+    1. 查看 QCDMS 窗口底部状态栏，点击硬盘图标旁边显示的路径。
+    2. 出现"更改存储位置"界面。
+    3. 清除文本框内容，输入新的 OneDrive 路径：
+         Mac：     /Users/david/OneDrive - Personal/DMS_Storage
+         Windows： C:\\Users\\David\\OneDrive - Personal\\DMS_Storage
+    4. 点击"保存"。
+    5. 如果 QCDMS 检测到新文件夹中已有 DMS 数据（即方式一已完成复制），
+       将询问是否切换到该数据，点击"继续"即可。
+    6. 如果新文件夹为空（方式二），QCDMS 将自动复制当前索引和文档列表。
+
+  步骤 B-4：验证迁移是否成功。
+    1. 检查 QCDMS 中的文件夹和文档是否正常显示。
+    2. 打开几份文档，确认可以正常查看。
+    3. 确认无误后，可以删除原本地存储文件夹，或保留作为额外备份。
+
+
+--------------------------------------------------------------------------------
+第四部分 — 验证 OneDrive 正在同步 QCDMS 数据
+--------------------------------------------------------------------------------
+
+第九步：确认同步正常
+----------------------
+  1. 在 QCDMS 中保存文档后，查看菜单栏（Mac）或系统托盘（Windows）中的
+     OneDrive 云朵图标。
+
+  2. 同步中时，图标会显示动态箭头或进度圆圈。
+
+  3. 同步完成后，图标会显示绿色对勾或静态云朵，并提示"已是最新"。
+
+  4. 在线确认方法：
+     a. 打开浏览器。
+     b. 访问 https://onedrive.live.com 并登录。
+     c. 查找 DMS_Storage 文件夹，应能看到 QCDMS 文件（尤其是 index.json
+        和包含上传文档的 docs 子文件夹）。
+
+
+--------------------------------------------------------------------------------
+第五部分 — 在第二台电脑上使用 QCDMS
+--------------------------------------------------------------------------------
+
+第十步：在另一台电脑上访问您的文档
+-------------------------------------
+  要在第二台 Mac 或 Windows 电脑上使用同一个 QCDMS 文档库：
+
+  1. 在第二台电脑上安装 QCDMS（复制 DMS.app 或 DMS.exe）。
+
+  2. 使用相同的微软账户在第二台电脑上安装并登录 OneDrive
+     （参见第一步至第四步）。OneDrive 将自动同步所有文件。
+
+  3. 在第二台电脑上启动 QCDMS，将显示设置界面。
+
+  4. 输入相同的 OneDrive DMS 文件夹路径：
+       Mac：     /Users/[此电脑的用户名]/OneDrive - Personal/DMS_Storage
+       Windows： C:\\Users\\[此电脑的用户名]\\OneDrive - Personal\\DMS_Storage
+     注意：路径中的用户名部分可能因电脑而异，但 OneDrive 文件夹名称
+     （OneDrive - Personal）是相同的。
+
+  5. 点击"保存并继续"，QCDMS 将识别已有数据并打开完整文档库。
+
+  重要提示 — 请勿在两台电脑上同时运行 QCDMS。
+  两台电脑同时通过 OneDrive 写入同一文件可能导致冲突。请每次只在一台电脑上使用。
+
+
+--------------------------------------------------------------------------------
+常见问题解答
+--------------------------------------------------------------------------------
+
+问：如果网络断开，会怎样？
+答：QCDMS 仍可正常使用，因为它读写的是电脑本地的 OneDrive 同步文件夹。
+   更改会先保存在本地，待网络恢复后自动上传到云端。
+
+问：如果使用 QCDMS 时 OneDrive 未运行，会怎样？
+答：QCDMS 仍将正常写入本地文件夹。OneDrive 再次启动后，会自动同步期间的更改。
+
+问：需要多少 OneDrive 存储空间？
+答：免费微软账户提供 5 GB OneDrive 空间。Microsoft 365 个人版提供 1 TB（1000 GB）。
+   对于大多数个人文档库，5 GB 已足够。您可以登录 https://onedrive.live.com，
+   点击右上角姓名或头像，选择"存储"查看已用空间。
+
+问：可以与他人共享 QCDMS 文档库吗？
+答：可以通过 OneDrive 的共享功能与他人共享文件夹。但请注意，两人不应同时在
+   同一文件夹上运行 QCDMS，否则可能导致文件冲突。
+
+问：OneDrive 会压缩或修改我的文档吗？
+答：不会。OneDrive 原样存储您的文件。PDF、图片及所有其他文件均不会被修改。
+
+问：如何在 Mac 上找到精确的 OneDrive 文件夹路径？
+答：打开终端（按 Cmd+空格键，输入"终端"，按回车），输入：
+     ls ~/OneDrive*
+   按回车键后，显示的文件夹名即在您的主目录下。
+   完整路径为：/Users/[您的用户名]/[显示的文件夹名]
+   示例：/Users/david/OneDrive - Personal
+
+问：如何在 Windows 上找到精确的 OneDrive 文件夹路径？
+答：打开文件资源管理器，点击左侧栏中的 OneDrive，地址栏将显示完整路径。
+   或者，右键单击系统托盘中的 OneDrive 图标，选择"设置"，
+   在"账户"选项卡中查看文件夹位置。
+
+问："OneDrive - Personal"与"OneDrive - [公司名]"有何区别？
+答："OneDrive - Personal"使用个人微软账户（Outlook、Hotmail、Live）。
+   "OneDrive - [公司名]"是由单位或学校管理的工作账户（Microsoft 365）。
+   两种账户均可与 QCDMS 配合使用，请确保使用正确的文件夹路径即可。
+
+--------------------------------------------------------------------------------
+路径快速参考
+--------------------------------------------------------------------------------
+
+  Mac（个人账户）：
+    /Users/david/OneDrive - Personal/DMS_Storage
+
+  Mac（工作/学校账户，将"Contoso"替换为您的公司名）：
+    /Users/david/OneDrive - Contoso/DMS_Storage
+
+  Windows（个人账户）：
+    C:\\Users\\David\\OneDrive - Personal\\DMS_Storage
+
+  Windows（工作/学校账户）：
+    C:\\Users\\David\\OneDrive - Contoso\\DMS_Storage
+
+--------------------------------------------------------------------------------
+技术支持
+--------------------------------------------------------------------------------
+
+  如有 QCDMS 相关问题，请联系您的 QCDMS 管理员。
+
+  如有 OneDrive 相关问题，请访问微软支持页面：
+    https://support.microsoft.com/zh-cn/onedrive
+
+================================================================================
+  指南结束
+================================================================================
+"""
+
+@app.route("/guides/onedrive-setup-cn", methods=["GET"])
+def download_onedrive_guide_cn():
+    buf = io.BytesIO(_ONEDRIVE_GUIDE_CN_TEXT.encode("utf-8"))
+    return send_file(buf, mimetype="text/plain; charset=utf-8",
+                     as_attachment=True,
+                     download_name="OneDrive设置指南.txt")
 
 
 # ---- Quit -----------------------------------------------------------------
