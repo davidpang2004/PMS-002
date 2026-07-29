@@ -662,6 +662,22 @@ const StorageAdapter = {
     return res.json();
   },
 
+  // Cross-document Q&A (Gemini, opt-in) -- reasons over many documents'
+  // existing text/metadata at once instead of exact-keyword matching.
+  async askAI(question, scopeNodeId = null) {
+    const res = await fetch(API_BASE + "/api/ask-ai", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question, scope_node_id: scopeNodeId }),
+    });
+    if (!res.ok) {
+      let detail = "";
+      try { detail = (await res.json()).error || ""; } catch {}
+      throw new Error(detail || tOutsideReact(`AI 问答失败: HTTP ${res.status}`, `AI Q&A failed: HTTP ${res.status}`));
+    }
+    return res.json();   // { ok, answer, citations:[{docId,name}], coverage:{withText,total} }
+  },
+
   async hierarchyPreview(text, dedupeNames = false) {
     return this._json("/api/hierarchy/preview", {
       method: "POST",
@@ -2661,11 +2677,23 @@ const MetadataEditor = ({ metadata, onChange, keyParameters = [] }) => {
  * UI: SEARCH PANEL
  * =============================================================================
  */
-const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree, scopeNodeId }) => {
+const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree, scopeNodeId, onOpenAISettings }) => {
   const { t } = useLang();
   const [q, setQ] = useState("");
   const [showUnref, setShowUnref] = useState(false);
   const [scopeToFolder, setScopeToFolder] = useState(false);
+  const [mode, setMode] = useState("keyword"); // "keyword" | "ai"
+
+  // --- AI Q&A mode state ------------------------------------------------
+  const [aiSettings, setAiSettings] = useState({ configured: false, library_installed: true });
+  const [question, setQuestion] = useState("");
+  const [asking, setAsking] = useState(false);
+  const [aiAnswer, setAiAnswer] = useState(null); // { answer, citations, coverage } | null
+  const [aiError, setAiError] = useState("");
+
+  useEffect(() => {
+    if (mode === "ai") StorageAdapter.getAISettings().then(setAiSettings).catch(() => {});
+  }, [mode]);
 
   const scopeNode = useMemo(
     () => (tree && scopeNodeId ? findNode(tree, scopeNodeId) : null),
@@ -2673,6 +2701,19 @@ const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree,
   );
 
   useEffect(() => { if (!scopeNode) setScopeToFolder(false); }, [scopeNode]);
+
+  const askQuestion = async () => {
+    if (!question.trim() || asking) return;
+    setAsking(true); setAiError(""); setAiAnswer(null);
+    try {
+      const data = await StorageAdapter.askAI(question.trim(), scopeToFolder && scopeNode ? scopeNode.id : null);
+      setAiAnswer(data);
+    } catch (e) {
+      setAiError(e.message || String(e));
+    } finally {
+      setAsking(false);
+    }
+  };
 
   const scopeDocIdSet = useMemo(() => {
     if (!scopeToFolder || !scopeNode) return null;
@@ -2715,16 +2756,25 @@ const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree,
 
   return (
     <div className="p-3 space-y-2">
-      <div className="relative">
-        <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-stone-400" />
-        <input
-          type="text"
-          value={q}
-          onChange={(e) => setQ(e.target.value)}
-          placeholder={t("按编号、名称、描述或元数据搜索…", "Search by number, name, description, or metadata…")}
-          className="w-full pl-8 pr-3 py-1.5 text-xs border border-stone-300 rounded focus:outline-none focus:border-amber-600"
-        />
+      <div className="flex rounded overflow-hidden border border-stone-300 w-fit">
+        <button
+          onClick={() => setMode("keyword")}
+          className={"text-[11px] px-2.5 py-1 flex items-center gap-1 " + (mode === "keyword"
+            ? "bg-stone-700 text-white"
+            : "bg-white text-stone-600 hover:bg-stone-100")}
+        >
+          <Search size={11} /> {t("关键词搜索", "Keyword search")}
+        </button>
+        <button
+          onClick={() => setMode("ai")}
+          className={"text-[11px] px-2.5 py-1 flex items-center gap-1 border-l border-stone-300 " + (mode === "ai"
+            ? "bg-purple-700 text-white"
+            : "bg-white text-stone-600 hover:bg-stone-100")}
+        >
+          <Sparkles size={11} /> {t("AI 问答", "Ask AI")}
+        </button>
       </div>
+
       {scopeNode && (
         <label className="flex items-center gap-1.5 text-[11px] text-stone-600 cursor-pointer">
           <input
@@ -2738,6 +2788,94 @@ const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree,
           </span>
         </label>
       )}
+
+      {mode === "ai" ? (
+        <div className="space-y-2">
+          <div className="relative">
+            <Sparkles size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-purple-500" />
+            <input
+              type="text"
+              value={question}
+              onChange={(e) => setQuestion(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") askQuestion(); }}
+              placeholder={t("用一句话提问，AI 会跨文档查找答案…", "Ask a question in plain language — AI will search across documents…")}
+              disabled={!aiSettings.configured}
+              className="w-full pl-8 pr-3 py-1.5 text-xs border border-stone-300 rounded focus:outline-none focus:border-purple-600 disabled:bg-stone-50 disabled:text-stone-400"
+            />
+          </div>
+
+          {!aiSettings.configured ? (
+            <div className="text-[11px] text-stone-600 bg-purple-50 border border-purple-200 rounded p-2 flex items-center gap-1.5">
+              <Sparkles size={11} className="text-purple-600 shrink-0" />
+              {t("需要先配置 Gemini API Key 才能使用 AI 问答。", "AI Q&A needs a Gemini API Key configured first.")}
+              {onOpenAISettings && (
+                <button onClick={onOpenAISettings} className="text-purple-700 hover:underline font-medium shrink-0">
+                  {t("配置 API Key", "Configure API Key")}
+                </button>
+              )}
+            </div>
+          ) : (
+            <button
+              onClick={askQuestion}
+              disabled={asking || !question.trim()}
+              className="text-xs px-3 py-1.5 rounded flex items-center gap-1.5 border border-purple-300 text-purple-800 bg-purple-50 hover:bg-purple-100 disabled:opacity-40"
+            >
+              {asking
+                ? (<><Loader size={13} className="animate-spin" /> {t("正在查找…", "Searching…")}</>)
+                : (<><Sparkles size={13} /> {t("提问", "Ask")}</>)}
+            </button>
+          )}
+
+          {aiError && (
+            <div className="text-xs bg-red-50 border border-red-200 rounded p-2 text-red-700">{aiError}</div>
+          )}
+
+          {aiAnswer && (
+            <div className="space-y-2">
+              <div className="text-xs bg-purple-50 border border-purple-200 rounded p-3 text-stone-800 whitespace-pre-wrap leading-relaxed">
+                {aiAnswer.answer}
+              </div>
+              <div className="text-[10px] text-stone-400">
+                {t(
+                  `基于 ${aiAnswer.coverage.total} 篇候选文档，其中 ${aiAnswer.coverage.withText} 篇有可提取文字`,
+                  `Based on ${aiAnswer.coverage.total} candidate document(s), ${aiAnswer.coverage.withText} with extractable text`
+                )}
+              </div>
+              {aiAnswer.citations.length > 0 && (
+                <div className="space-y-1">
+                  <div className="text-[10px] uppercase tracking-wider text-stone-500">{t("来源文档", "Source documents")}</div>
+                  {aiAnswer.citations.map((c) => {
+                    const refs = refMap.get(c.docId) || [];
+                    return (
+                      <div
+                        key={c.docId}
+                        className="border border-stone-200 rounded p-2 text-xs hover:bg-purple-50 hover:border-purple-300 cursor-pointer flex items-center gap-1.5"
+                        title={t("单击打开 · 双击跳转到节点", "Click to open · double-click to jump to node")}
+                        onClick={() => onOpenDoc(c.docId)}
+                        onDoubleClick={(e) => { e.preventDefault(); refs[0] && onJumpToNode(refs[0]); }}
+                      >
+                        <FileText size={12} className="text-stone-400 shrink-0" />
+                        <span className="font-medium text-stone-800 truncate">{c.name}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      ) : (
+      <>
+      <div className="relative">
+        <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-stone-400" />
+        <input
+          type="text"
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          placeholder={t("按编号、名称、描述或元数据搜索…", "Search by number, name, description, or metadata…")}
+          className="w-full pl-8 pr-3 py-1.5 text-xs border border-stone-300 rounded focus:outline-none focus:border-amber-600"
+        />
+      </div>
       <div className="flex items-center justify-between">
         <label className="flex items-center gap-1.5 text-[11px] text-stone-600 cursor-pointer">
           <input
@@ -2802,6 +2940,8 @@ const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree,
           );
         })}
       </div>
+      </>
+      )}
     </div>
   );
 };
@@ -8874,6 +9014,7 @@ function DMS({ storagePath, onChangeFolder }) {
                 onJumpToNode={expandToNode}
                 tree={tree}
                 scopeNodeId={selectedId}
+                onOpenAISettings={() => setShowAISettings(true)}
               />
             )}
 

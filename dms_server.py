@@ -379,6 +379,14 @@ def _find_node_by_id(root: dict, node_id: str) -> "dict | None":
     return None
 
 
+def _collect_doc_ids_under(node: dict) -> list:
+    """All document IDs referenced by this node and every descendant node."""
+    ids = [ref.get("id") for ref in (node.get("documents") or []) if ref.get("id")]
+    for child in (node.get("children") or []):
+        ids.extend(_collect_doc_ids_under(child))
+    return ids
+
+
 def _get_or_create_child_node(parent_node: dict, child_name: str) -> dict:
     """Return the direct child named child_name, creating it in-place if absent."""
     for child in (parent_node.get("children") or []):
@@ -4165,6 +4173,141 @@ def download_gemini_guide():
         "filename*=UTF-8''Gemini_API_Key%E8%AE%BE%E7%BD%AE%E6%8C%87%E5%8D%97.docx"
     )
     return resp
+
+
+# Cross-document Q&A tuning knobs. Small/cheap enough that a per-question
+# request stays fast even on projects with a few hundred documents.
+_ASK_AI_MAX_CANDIDATES = 40          # docs whose text actually goes in the prompt
+_ASK_AI_MAX_AUTO_EXTRACT = 15        # of those, at most this many get on-demand OCR
+_ASK_AI_SNIPPET_CHARS = 4000         # per-doc text truncation before assembly
+_ASK_AI_BUDGET_CHARS = 120_000       # total prompt text budget before pre-filtering
+
+
+def _doc_snippet_text(entry: dict) -> str:
+    """Flatten a docIndex entry's searchable fields into one text blob —
+    same fields SearchPanel already matches against client-side, so a
+    question can be answered from metadata alone even without OCR text."""
+    parts = [entry.get("sn") or "", entry.get("description") or ""]
+    for k, v in (entry.get("metadata") or {}).items():
+        if isinstance(v, dict):
+            parts.append(f"{k}: {v.get('design', '')} {v.get('actual', '')}")
+        else:
+            parts.append(f"{k}: {v}")
+    parts.append(entry.get("ocrText") or "")
+    return "\n".join(p for p in parts if p).strip()
+
+
+@app.route("/api/ask-ai", methods=["POST"])
+def ask_ai():
+    """Answer a natural-language question against this project's documents
+    using Gemini (opt-in, same key as /api/ai-settings). Unlike per-document
+    key extraction, this reasons over many documents' existing text/metadata
+    at once and cites which ones it used.
+
+    Body (JSON): { "question": str, "scope_node_id": str|null }
+    Returns { ok, answer, citations: [{docId, name}], coverage: {withText, total} }.
+    """
+    docs_dir = get_docs_dir()
+    if not docs_dir:
+        return jsonify({"error": "Storage path not configured"}), 503
+
+    data = request.get_json(force=True, silent=True) or {}
+    question = (data.get("question") or "").strip()
+    if not question:
+        return jsonify({"error": "Provide a non-empty 'question'"}), 400
+    scope_node_id = data.get("scope_node_id")
+
+    cfg = load_config()
+    enc = cfg.get("gemini_api_key_enc", "")
+    if not enc:
+        return jsonify({"error": "未配置 Gemini API Key，请先在设置中添加。"}), 400
+    try:
+        api_key = decrypt_secret(enc)
+    except Exception:
+        return jsonify({"error": "无法读取已保存的 API Key，请重新设置。"}), 400
+
+    idx = read_index()
+    doc_index = idx.get("docIndex") or []
+    docs_by_id = {d["id"]: d for d in doc_index if d.get("id")}
+
+    if scope_node_id:
+        scope_node = _find_node_by_id(idx.get("tree"), scope_node_id)
+        candidate_ids = [i for i in _collect_doc_ids_under(scope_node)] if scope_node else []
+    else:
+        candidate_ids = list(docs_by_id.keys())
+    candidates = [docs_by_id[i] for i in dict.fromkeys(candidate_ids) if i in docs_by_id]
+
+    if not candidates:
+        return jsonify({"error": "此范围内没有文档可供检索。"}), 400
+
+    # Pre-filter to a manageable set by simple keyword overlap with the
+    # question — only kicks in for large projects; small ones just use
+    # everything and let Gemini's own context window do the reasoning.
+    question_words = [w for w in re.findall(r"\w+", question.lower()) if len(w) > 1]
+
+    def _score(entry):
+        haystack = (entry.get("name", "") + " " + _doc_snippet_text(entry)).lower()
+        return sum(1 for w in question_words if w in haystack)
+
+    total_chars = sum(len(_doc_snippet_text(d)) for d in candidates)
+    if len(candidates) > _ASK_AI_MAX_CANDIDATES or total_chars > _ASK_AI_BUDGET_CHARS:
+        candidates = sorted(candidates, key=_score, reverse=True)[:_ASK_AI_MAX_CANDIDATES]
+
+    # Auto-extract text for candidates that don't have any yet (bounded to
+    # avoid a slow request on a large batch of un-OCR'd scans).
+    extracted_any = False
+    auto_extract_budget = _ASK_AI_MAX_AUTO_EXTRACT
+    for entry in candidates:
+        if auto_extract_budget <= 0:
+            break
+        if entry.get("ocrText"):
+            continue
+        mime = (entry.get("mime") or "").lower()
+        if mime != "application/pdf" and not mime.startswith("image/"):
+            continue
+        matches = list(docs_dir.rglob(f"{entry['id']}__*")) or list(docs_dir.rglob(f"{entry['id']}*"))
+        if not matches:
+            continue
+        auto_extract_budget -= 1
+        try:
+            import pdf_extraction
+            text, _info = pdf_extraction.extract_text_from_file(matches[0])
+        except Exception:
+            continue
+        if text:
+            entry["ocrText"] = text
+            # Keep the shared in-memory docIndex entry (docs_by_id[id] is the
+            # same dict) in sync so write_index below persists it too.
+            extracted_any = True
+
+    if extracted_any:
+        write_index(idx)
+
+    snippets = [
+        {"doc_id": d["id"], "name": d.get("name", ""), "text": _doc_snippet_text(d)[:_ASK_AI_SNIPPET_CHARS]}
+        for d in candidates
+    ]
+    with_text = sum(1 for s in snippets if s["text"])
+
+    try:
+        import ai_extraction
+        result = ai_extraction.answer_question_with_gemini(question, snippets, api_key)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    candidate_id_set = {d["id"] for d in candidates}
+    citations = [
+        {"docId": cid, "name": docs_by_id[cid].get("name", "")}
+        for cid in result["cited_doc_ids"]
+        if cid in candidate_id_set
+    ]
+
+    return jsonify({
+        "ok": True,
+        "answer": result["answer"],
+        "citations": citations,
+        "coverage": {"withText": with_text, "total": len(candidates)},
+    })
 
 
 @app.route("/api/docs/<doc_id>/extract-keys-ai", methods=["POST"])

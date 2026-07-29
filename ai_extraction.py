@@ -130,3 +130,84 @@ def extract_keys_with_gemini(image_bytes_list: list[bytes], keys: list[str],
             val_str = "NF"
         results[k] = {"value": val_str, "found": val_str != "NF"}
     return results
+
+
+def answer_question_with_gemini(question: str, snippets: list[dict],
+                                 api_key: str, model: str = DEFAULT_MODEL) -> dict:
+    """Answer a natural-language question against a set of documents' text.
+
+    snippets: [{"doc_id": str, "name": str, "text": str}, ...] -- already
+    assembled by the caller (name/SN/description/metadata/OCR text). Unlike
+    extract_keys_with_gemini, this sends text only, no page images, so it can
+    reason over many documents at once within one prompt.
+
+    Returns {"answer": str, "cited_doc_ids": [str, ...]}. Callers should
+    treat cited_doc_ids as untrusted and cross-check them against the actual
+    candidate set before showing them as clickable citations.
+    """
+    if not api_key:
+        raise AIExtractionError("未配置 Gemini API Key，请先在设置中添加。")
+    question = (question or "").strip()
+    if not question:
+        raise AIExtractionError("请输入问题。")
+    if not snippets:
+        raise AIExtractionError("没有可供检索的文档（可能都还没有可提取的文字）。")
+
+    try:
+        from google import genai
+    except ImportError:
+        raise AIExtractionError(
+            "未安装 google-genai 库。请在运行此程序的 Python 中执行：pip install google-genai")
+
+    doc_blocks = []
+    for s in snippets:
+        text = (s.get("text") or "").strip() or "(no extracted text)"
+        doc_blocks.append(f"### {s.get('name', '')} (ID: {s.get('doc_id', '')})\n{text}")
+
+    prompt = (
+        "You are answering a question using ONLY the documents provided "
+        "below -- do not use outside knowledge. Each document is delimited "
+        "by a heading giving its name and ID.\n\n"
+        "If the answer isn't in any of the documents, say so plainly instead "
+        "of guessing.\n\n"
+        f"Question: {question}\n\n"
+        "Documents:\n\n" + "\n\n".join(doc_blocks) + "\n\n"
+        "Respond with ONLY a single JSON object of the form "
+        '{"answer": "<your answer, in the same language as the question>", '
+        '"cited_doc_ids": ["<ID of each document you actually used>", ...]}. '
+        "No explanation, no markdown code fences, just the JSON object."
+    )
+
+    client = genai.Client(api_key=api_key)
+    candidates = [model] + [m for m in FALLBACK_MODELS if m != model]
+    response = None
+    last_error = None
+    for candidate in candidates:
+        try:
+            response = client.models.generate_content(model=candidate, contents=[prompt])
+            last_error = None
+            break
+        except Exception as e:
+            last_error = e
+            msg = str(e)
+            if "NOT_FOUND" in msg or "404" in msg or "no longer available" in msg:
+                continue
+            break
+
+    if last_error is not None:
+        raise AIExtractionError(f"调用 Gemini API 失败：{last_error}")
+
+    raw = getattr(response, "text", None) or ""
+    parsed = _extract_json_object(raw)
+    if not isinstance(parsed, dict):
+        raise AIExtractionError("AI 返回的内容格式不正确（不是一个 JSON 对象）。")
+
+    answer = str(parsed.get("answer") or "").strip()
+    if not answer:
+        raise AIExtractionError("AI 未返回有效的回答。")
+    cited = parsed.get("cited_doc_ids") or []
+    if not isinstance(cited, list):
+        cited = []
+    cited_doc_ids = [str(c).strip() for c in cited if str(c).strip()]
+
+    return {"answer": answer, "cited_doc_ids": cited_doc_ids}
