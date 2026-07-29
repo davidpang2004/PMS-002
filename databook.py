@@ -1,7 +1,9 @@
 """
 Databook generation — assembles selected documents from the DMS into a single
-deliverable PDF with cover page, table of contents, section headers per node,
-bookmarks, and page-number/document-name footers on every page.
+deliverable PDF with cover page, table of contents, bookmarks, and a
+page-number/SN header on every page. Folder/section names are intentionally
+never shown anywhere in the output — only each document's own name (in the
+TOC/bookmarks) and its SN (stamped at the top of every page).
 
 Public entry point:
     build_databook(selection, docs_dir, doc_index, tree, options) -> bytes
@@ -21,6 +23,7 @@ from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.lib.colors import HexColor, black, grey
+from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
@@ -38,6 +41,25 @@ MARGIN = 0.75 * inch
 _FONT      = "Helvetica"       # regular — used in canvas.setFont() and ParagraphStyle
 _FONT_BOLD = "Helvetica-Bold"  # bold    — used in canvas.setFont() and bold ParagraphStyle
 _FONTS_READY = False
+
+_HEIF_READY = False
+
+
+def _ensure_heif_support() -> None:
+    """Register Pillow's HEIC/HEIF opener so Image.open() can read iPhone
+    photos. Without this, HEIC images silently fall back to the "could not
+    render" placeholder in _image_to_pdf_bytes. Idempotent and safe to call
+    even if pillow_heif isn't installed (HEIC just won't embed in that case,
+    same as before)."""
+    global _HEIF_READY
+    if _HEIF_READY:
+        return
+    try:
+        import pillow_heif
+        pillow_heif.register_heif_opener()
+    except ImportError:
+        pass
+    _HEIF_READY = True
 
 
 def _init_fonts() -> None:
@@ -134,10 +156,12 @@ def _path_for_node(tree: dict, node_id: str) -> str:
 def _doc_path(docs_dir: Path, doc_id: str) -> Path | None:
     """Find the on-disk file for a given DOC ID.
 
-    Files are stored as '<DOC-ID>__<original-name>.<ext>', so we need a
-    prefix glob rather than an extension-only glob.
+    Files are stored as '<DOC-ID>__<original-name>.<ext>' inside per-node
+    subdirectories of docs_dir (see dms_server._migrate_flat_docs), so this
+    must search recursively — matching the rglob pattern used by every doc
+    resolution site in dms_server.py — rather than globbing docs_dir itself.
     """
-    matches = list(docs_dir.glob(f"{doc_id}*"))
+    matches = list(docs_dir.rglob(f"{doc_id}__*")) or list(docs_dir.rglob(f"{doc_id}*"))
     return matches[0] if matches else None
 
 
@@ -181,6 +205,58 @@ def _image_to_pdf_bytes(img_path: Path, caption: str) -> bytes:
     return buf.getvalue()
 
 
+def build_front_page_pdf_bytes(file_bytes: bytes, mime: str, filename: str = "") -> bytes:
+    """
+    Normalize a user-supplied front-page file into page bytes suitable for
+    prepending to a databook. Accepts a PDF (returned as-is) or a raster image
+    (wrapped into a single full-bleed page, no caption — the file is assumed
+    to already be a designed cover/letterhead). Anything else raises
+    ValueError with a message safe to show the user directly.
+    """
+    mime = (mime or "").lower()
+    name = (filename or "").lower()
+    is_pdf = mime == "application/pdf" or name.endswith(".pdf")
+    is_image = mime.startswith("image/") or name.endswith((
+        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".webp", ".heic", ".heif",
+    ))
+
+    if is_pdf:
+        try:
+            reader = PdfReader(io.BytesIO(file_bytes))
+            if len(reader.pages) == 0:
+                raise ValueError("the PDF has no pages")
+            reader.close()
+        except Exception as e:
+            raise ValueError(f"Could not read front page PDF: {e}")
+        return file_bytes
+
+    if is_image:
+        _ensure_heif_support()
+        try:
+            with Image.open(io.BytesIO(file_bytes)) as im:
+                iw, ih = im.size
+                scale = min(PAGE_W / iw, PAGE_H / ih)
+                draw_w, draw_h = iw * scale, ih * scale
+                buf = io.BytesIO()
+                c = canvas.Canvas(buf, pagesize=letter)
+                c.drawImage(
+                    ImageReader(im),
+                    (PAGE_W - draw_w) / 2, (PAGE_H - draw_h) / 2,
+                    width=draw_w, height=draw_h,
+                    preserveAspectRatio=True, anchor="c",
+                )
+                c.showPage()
+                c.save()
+        except Exception as e:
+            raise ValueError(f"Could not read front page image: {e}")
+        return buf.getvalue()
+
+    raise ValueError(
+        f"Unsupported front page file type ({mime or name or 'unknown'}). "
+        "Please provide a PDF or image file — export Word/Pages documents to PDF first."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Cover page + TOC + section header pages — built with reportlab platypus
 # ---------------------------------------------------------------------------
@@ -214,10 +290,6 @@ def _build_cover_pdf(title: str, subtitle: str, sections: list[dict]) -> bytes:
         "DBMeta", parent=styles["Normal"],
         fontName=_FONT, fontSize=10, leading=14, textColor=SUBTLE, alignment=1,
     )
-    h_section = ParagraphStyle(
-        "DBSection", parent=styles["Heading2"],
-        fontName=_FONT_BOLD, fontSize=14, leading=18, textColor=ACCENT, spaceBefore=10, spaceAfter=4,
-    )
     p_doc = ParagraphStyle(
         "DBDoc", parent=styles["Normal"],
         fontName=_FONT, fontSize=10, leading=14, textColor=black,
@@ -248,16 +320,11 @@ def _build_cover_pdf(title: str, subtitle: str, sections: list[dict]) -> bytes:
 
     toc_rows: list = []
     for sec in sections:
-        sn_part = f" &nbsp;<font color='#b45309'>· SN {_escape(sec['sn'])}</font>" if sec.get("sn") else ""
-        toc_rows.append([Paragraph(f"<b>{_escape(sec['path'])}</b>{sn_part}", p_doc), ""])
         for d in sec["docs"]:
             doc_sn = (d.get("sn") or sec.get("sn") or "").strip()
             sn_label = f"<font color='#78716c'>{_escape(doc_sn)}</font>" if doc_sn else ""
             toc_rows.append([
-                Paragraph(
-                    "&nbsp;&nbsp;&nbsp;&nbsp;" + _escape(d["name"]),
-                    p_doc,
-                ),
+                Paragraph(_escape(d["name"]), p_doc),
                 Paragraph(sn_label or f"<font color='#78716c'>{_escape(d['id'])}</font>", p_doc),
             ])
 
@@ -276,76 +343,34 @@ def _build_cover_pdf(title: str, subtitle: str, sections: list[dict]) -> bytes:
     return buf.getvalue()
 
 
-def _build_section_header_pdf(node_path: str, node_id: str, node_sn: str, doc_count: int) -> bytes:
-    """One-page divider that introduces a node's section."""
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=letter)
-
-    # Accent stripe
-    c.setFillColor(ACCENT)
-    c.rect(MARGIN, PAGE_H - MARGIN - 4, 60, 4, fill=1, stroke=0)
-
-    c.setFont(_FONT, 8)
-    c.setFillColor(ACCENT)
-    c.drawString(MARGIN, PAGE_H - MARGIN - 30, "SECTION")
-
-    # Path / title
-    c.setFillColor(black)
-    c.setFont(_FONT_BOLD, 22)
-    parts = node_path.split(" / ") if node_path else ["(unnamed)"]
-    y = PAGE_H - MARGIN - 70
-    for i, part in enumerate(parts):
-        c.setFont(_FONT_BOLD, 22 if i == len(parts) - 1 else 14)
-        c.setFillColor(black if i == len(parts) - 1 else SUBTLE)
-        c.drawString(MARGIN + (i * 12), y, part)
-        y -= 30 if i == len(parts) - 1 else 22
-
-    # SN badge (prominent if set)
-    if node_sn:
-        y -= 10
-        c.setFont(_FONT_BOLD, 9)
-        c.setFillColor(ACCENT)
-        c.drawString(MARGIN, y, "SERIAL NUMBER")
-        c.setFont(_FONT, 16)
-        c.setFillColor(black)
-        c.drawString(MARGIN, y - 22, node_sn)
-
-    # Footer info
-    c.setFont(_FONT, 9)
-    c.setFillColor(SUBTLE)
-    c.drawString(MARGIN, MARGIN + 20, f"Node ID: {node_id}")
-    c.drawString(MARGIN, MARGIN, f"{doc_count} document{'' if doc_count == 1 else 's'} in this section")
-
-    c.showPage()
-    c.save()
-    return buf.getvalue()
-
-
 def _escape(s: str) -> str:
     """Minimal XML/HTML escape for reportlab Paragraph contents."""
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 # ---------------------------------------------------------------------------
-# Footer overlay — adds page number + document name to every page
+# Header overlay — stamps the document's SN + page number at the top of
+# every page (no folder/document names, per the databook's privacy design)
 # ---------------------------------------------------------------------------
-def _make_footer_overlay(page_num: int, total_pages: int, doc_name: str) -> bytes:
-    """Tiny single-page PDF that gets stamped underneath each merged page."""
+def _make_header_overlay(page_num: int, total_pages: int, sn: str) -> bytes:
+    """Tiny single-page PDF that gets stamped over each merged page."""
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=letter)
     c.setFont(_FONT, 8)
     c.setFillColor(SUBTLE)
 
-    # Top thin line + bottom rule
+    # Rule near the top of the page
+    line_y = PAGE_H - 0.45 * inch
     c.setStrokeColor(BORDER)
     c.setLineWidth(0.5)
-    c.line(MARGIN, 0.45 * inch, PAGE_W - MARGIN, 0.45 * inch)
+    c.line(MARGIN, line_y, PAGE_W - MARGIN, line_y)
 
-    # Document name (left), page number (right) — both in footer
-    name = (doc_name or "")[:80]
-    c.drawString(MARGIN, 0.30 * inch, name)
+    # SN (left), page number (right) — both in the header
+    text_y = line_y + 0.12 * inch
+    if sn:
+        c.drawString(MARGIN, text_y, (sn or "")[:80])
     c.drawRightString(
-        PAGE_W - MARGIN, 0.30 * inch,
+        PAGE_W - MARGIN, text_y,
         f"Page {page_num} of {total_pages}",
     )
     c.showPage()
@@ -363,13 +388,18 @@ def build_databook(
     tree: dict,
     title: str = "",
     subtitle: str = "",
+    front_page_pdf_bytes: bytes | None = None,
 ) -> bytes:
     """
     selection: ordered list of {nodeId, docIds: [str, ...]} representing the
                user's tree-order selection. Empty docIds lists are skipped.
+    front_page_pdf_bytes: optional pre-normalized PDF page(s) (see
+               build_front_page_pdf_bytes) inserted before the auto-generated
+               cover/TOC page.
     Returns the assembled PDF as bytes.
     """
     _init_fonts()
+    _ensure_heif_support()
     docs_by_id = {d["id"]: d for d in doc_index}
 
     # Build the structured "sections" list (skip empty selections)
@@ -396,33 +426,34 @@ def build_databook(
     # Track where each section starts (page number) for bookmarking.
     writer = PdfWriter()
 
-    # 1a — cover + TOC
+    # 1a — optional user-supplied front page, inserted before the auto cover/TOC
+    front_page_count = 0
+    if front_page_pdf_bytes:
+        front_reader = PdfReader(io.BytesIO(front_page_pdf_bytes))
+        for p in front_reader.pages:
+            writer.add_page(p)
+        front_page_count = len(front_reader.pages)
+        front_reader.close()
+
+    # 1b — cover + TOC
     cover_bytes = _build_cover_pdf(title, subtitle, sections)
     cover_reader = PdfReader(io.BytesIO(cover_bytes))
-    cover_start_page = 0
+    cover_start_page = front_page_count
     cover_page_count = len(cover_reader.pages)
     for p in cover_reader.pages:
         writer.add_page(p)
     cover_reader.close()
 
-    # 1b — for each section: header page + each document
-    section_starts: list[int] = []
-    doc_starts: list[tuple[int, str, str, str]] = []  # (page_num, doc_name, section_path, doc_sn)
+    # 1c — for each section: each document. No section divider pages are
+    # inserted, and no folder/section names appear anywhere in the output —
+    # only each document's own SN, stamped at the top of its pages.
+    doc_starts: list[tuple[int, str, str]] = []  # (page_num, doc_name, doc_sn)
 
     for sec in sections:
-        section_starts.append(len(writer.pages))
-        # Section header
-        hdr = _build_section_header_pdf(sec["path"], sec["node_id"], sec["sn"], len(sec["docs"]))
-        hdr_reader = PdfReader(io.BytesIO(hdr))
-        for p in hdr_reader.pages:
-            writer.add_page(p)
-        hdr_reader.close()
-
-        # Documents in this section
         for doc in sec["docs"]:
             # Effective SN: doc's own SN if set, otherwise section's SN
             doc_sn = (doc.get("sn") or sec.get("sn") or "").strip()
-            doc_starts.append((len(writer.pages), doc["name"], sec["path"], doc_sn))
+            doc_starts.append((len(writer.pages), doc["name"], doc_sn))
             doc_path = _doc_path(docs_dir, doc["id"])
             if doc_path is None:
                 # Missing file — insert a placeholder page
@@ -461,51 +492,44 @@ def build_databook(
 
     total_pages = len(writer.pages)
 
-    # ---- Phase 2: bookmarks (outline) ----
-    cover_bm = writer.add_outline_item("Cover & Table of Contents", cover_start_page)
-    for sec, start in zip(sections, section_starts):
-        sec_label = f"{sec['path']} · SN {sec['sn']}" if sec.get("sn") else sec["path"]
-        sec_bm = writer.add_outline_item(sec_label, start)
-        # Each doc within the section gets a sub-bookmark
-        for doc in sec["docs"]:
-            for ds_page, ds_name, ds_path, _ds_sn in doc_starts:
-                if ds_path == sec["path"] and ds_name == doc["name"]:
-                    writer.add_outline_item(ds_name, ds_page, parent=sec_bm)
-                    break
+    # ---- Phase 2: bookmarks (outline) — flat by document; no folder/section
+    # names appear as bookmarks, only the document name and its SN.
+    if front_page_count:
+        writer.add_outline_item("Front Page", 0)
+    writer.add_outline_item("Cover & Table of Contents", cover_start_page)
+    for ds_page, ds_name, ds_sn in doc_starts:
+        label = f"{ds_sn} · {ds_name}" if ds_sn else ds_name
+        writer.add_outline_item(label, ds_page)
 
-    # ---- Phase 3: stamp footers directly onto writer's pages (in-place) ----
+    # ---- Phase 3: stamp headers directly onto writer's pages (in-place) ----
     # We never serialize to an intermediate buffer — this avoids holding 3-5×
     # the output size in RAM simultaneously (the previous triple-copy pattern
     # was the cause of extreme memory usage on large databooks).
 
-    # Build a flat page→owner lookup so footers show the right document name.
+    # Build a flat page→SN lookup so headers show the right document's SN.
     page_owner: dict[int, str] = {}
-    cover_pages = set(range(cover_start_page, cover_start_page + cover_page_count))
+    cover_pages = set(range(0, front_page_count + cover_page_count))
 
-    for sec, start in zip(sections, section_starts):
-        page_owner[start] = sec["path"]
-    for ds_page, ds_name, ds_path, ds_sn in doc_starts:
+    for ds_page, ds_name, ds_sn in doc_starts:
         next_boundaries = sorted(
-            [p for p, _, _, _ in doc_starts if p > ds_page]
-            + [s for s in section_starts if s > ds_page]
+            [p for p, _, _ in doc_starts if p > ds_page]
             + [total_pages]
         )
         end = next_boundaries[0] if next_boundaries else total_pages
-        footer_text = f"{ds_sn} · {ds_name}" if ds_sn else ds_name
         for p in range(ds_page, end):
-            page_owner[p] = footer_text
+            page_owner[p] = ds_sn
 
-    # Cache overlay PDFs by (page_num, owner_name) so we create at most one
-    # PdfReader per unique footer label rather than one per page.
+    # Cache overlay PDFs by (page_num, sn) so we create at most one PdfReader
+    # per unique header label rather than one per page.
     _overlay_cache: dict[tuple, object] = {}
 
     for i, page in enumerate(writer.pages):
         if i in cover_pages:
             continue  # leave cover/TOC pristine
-        owner_name = page_owner.get(i, "")
-        cache_key = (i + 1, total_pages, owner_name)
+        owner_sn = page_owner.get(i, "")
+        cache_key = (i + 1, total_pages, owner_sn)
         if cache_key not in _overlay_cache:
-            overlay_bytes = _make_footer_overlay(i + 1, total_pages, owner_name)
+            overlay_bytes = _make_header_overlay(i + 1, total_pages, owner_sn)
             _overlay_cache[cache_key] = PdfReader(io.BytesIO(overlay_bytes)).pages[0]
         page.merge_page(_overlay_cache[cache_key])
 

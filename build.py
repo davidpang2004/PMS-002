@@ -48,6 +48,8 @@ DATA_FILES = [
     ("dms.html", "."),             # dms.html → _MEIPASS/dms.html
     ("vendor", "vendor"),          # vendor/ dir → _MEIPASS/vendor/ (offline JS)
     ("deepface_worker.py", "."),   # deepface subprocess worker
+    ("PMS用户手册_更新版.docx", "."),  # served by /api/download-user-manual
+    ("Gemini_API_Key_设置指南.docx", "."),  # served by /api/download-gemini-guide
 ]
 
 # Icon files (optional). Add an .icns for Mac and .ico for Windows if you have them.
@@ -65,16 +67,22 @@ def ensure_venv():
     if sys.platform.startswith("win"):
         venv_python = venv_dir / "Scripts" / "python.exe"
 
-    if not venv_python.exists():
+    is_new = not venv_python.exists()
+    if is_new:
         print("Creating build virtual environment at .build_venv ...")
         subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True)
-        print("Installing build dependencies into venv ...")
-        subprocess.run(
-            [str(venv_python), "-m", "pip", "install", "--quiet", "--upgrade",
-             "pip", "pyinstaller", "flask", "waitress", "pypdf", "reportlab", "Pillow",
-             "pillow-heif", "PyMuPDF", "qrcode", "numpy"],
-            check=True,
-        )
+
+    # Always (re-)run this, not just on first creation — an existing venv from
+    # before a new dependency was added (e.g. cryptography) would otherwise
+    # never pick it up. pip no-ops quickly on packages already satisfied.
+    print("Installing build dependencies into venv ..." if is_new
+          else "Checking build venv dependencies ...")
+    subprocess.run(
+        [str(venv_python), "-m", "pip", "install", "--quiet", "--upgrade",
+         "pip", "pyinstaller", "flask", "waitress", "pypdf", "reportlab", "Pillow",
+         "pillow-heif", "PyMuPDF", "qrcode", "numpy", "cryptography", "google-genai"],
+        check=True,
+    )
 
     print("Re-launching build inside virtual environment ...\n")
     result = subprocess.run([str(venv_python)] + sys.argv)
@@ -113,6 +121,7 @@ def check_dependencies():
         "pypdf": "pypdf",
         "reportlab": "reportlab",
         "PIL": "Pillow",
+        "cryptography": "cryptography",
     }
     missing = []
     for import_name, pkg_name in required.items():
@@ -335,7 +344,8 @@ def build_pyinstaller_command() -> list[str]:
     # --collect-all was tried earlier but caused ~93 GB virtual-memory usage
     # because it copies every .py/.html/data file and Python maps them all.
     for pkg in ("flask", "werkzeug", "jinja2", "click", "itsdangerous",
-                "markupsafe", "waitress", "pypdf", "reportlab", "PIL"):
+                "markupsafe", "waitress", "pypdf", "reportlab", "PIL",
+                "cryptography"):
         cmd.extend(["--collect-submodules", pkg])
     # PIL data files (fonts, image format plugins) still need to be present.
     cmd.extend(["--copy-metadata", "Pillow"])
@@ -386,6 +396,18 @@ def build_pyinstaller_command() -> list[str]:
     except ImportError:
         print("  pyngrok not installed — Remote Upload will not be available in the built app.")
 
+    # google-genai is OPTIONAL -- it powers the opt-in "AI-assisted extraction"
+    # (Gemini) feature. Everything else works fully offline without it.
+    try:
+        import google.genai  # noqa: F401
+        cmd.extend(["--collect-submodules", "google.genai"])
+        cmd.extend(["--collect-all", "google.genai"])
+        cmd.extend(["--hidden-import", "google.genai"])
+        print("  google-genai found — AI-assisted extraction (Gemini) will be available.")
+    except ImportError:
+        print("  google-genai not installed — AI-assisted extraction unavailable. "
+              "Run: pip install google-genai")
+
     # Only exclude large third-party packages that are definitely unused.
     # Stdlib exclusions are risky — http/email/uu modules form an import chain
     # that werkzeug pulls in at module level, so excluding any one of them
@@ -407,7 +429,7 @@ def build_pyinstaller_command() -> list[str]:
     for mod in ("tkinter", "tkinter.ttk", "tkinter.scrolledtext",
                 "tkinter.font", "tkinter.messagebox",
                 "flask", "dms_server", "databook", "pdf_extraction",
-                "_dms_trial"):
+                "ai_extraction", "_dms_trial"):
         cmd.extend(["--hidden-import", mod])
 
     # The entry point is the launcher
@@ -472,12 +494,43 @@ def prompt_trial_period():
     return expiry_iso, max_launches
 
 
-def write_trial_module(expiry_iso, max_launches=0):
+def prompt_max_documents():
+    """Ask for the lifetime document-upload cap and return it (0 = unlimited)."""
+    print("=" * 60)
+    print("  Document upload limit")
+    print("=" * 60)
+    while True:
+        raw = input(
+            "  Enter max total documents this build may ever upload (0 = unlimited): "
+        ).strip()
+        if not raw:
+            raw = "0"
+        try:
+            max_documents = int(raw)
+            if max_documents < 0:
+                print("  Please enter 0 or a positive number.")
+                continue
+            break
+        except ValueError:
+            print("  Please enter a whole number.")
+
+    if max_documents == 0:
+        print("  No document upload limit.")
+    else:
+        print(f"  Max documents: {max_documents} (counts every upload ever made; "
+              "deleting documents does not free up quota)")
+    print()
+
+    return max_documents
+
+
+def write_trial_module(expiry_iso, max_launches=0, max_documents=0):
     """Write _dms_trial.py which gets bundled into the app by PyInstaller."""
     content = (
         "# Auto-generated by build.py — do not edit manually.\n"
         f"EXPIRY = {repr(expiry_iso)}\n"
         f"MAX_LAUNCHES = {max_launches!r}\n"
+        f"MAX_DOCUMENTS = {max_documents!r}\n"
     )
     (HERE / "_dms_trial.py").write_text(content)
 
@@ -506,7 +559,8 @@ def main():
         sys.exit(1)
 
     expiry, max_launches = prompt_trial_period()
-    write_trial_module(expiry, max_launches)
+    max_documents = prompt_max_documents()
+    write_trial_module(expiry, max_launches, max_documents)
 
     # Reset the persisted launch counter so the new build starts from zero.
     # The counter lives in ~/.pms_dms_trial.json on the build machine; without

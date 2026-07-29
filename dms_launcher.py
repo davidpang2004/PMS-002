@@ -596,8 +596,7 @@ class LauncherWindow:
         FG     = "#1c1917"
         SUB    = "#78716c"
         ACCENT = "#0064c8"
-        QUIT_BG = "#dc2626"
-        QUIT_FG = "#dc2626"  # macOS ignores bg on native buttons; use red fg instead
+        QUIT_FG = "#dc2626"
 
         self.root.configure(bg=BG)
 
@@ -633,9 +632,8 @@ class LauncherWindow:
         tk.Button(
             btn_row, text="Quit DMS",
             command=self._quit,
-            bg=QUIT_BG, fg=QUIT_FG,
-            activebackground="#b91c1c", activeforeground=QUIT_FG,
-            relief="flat", padx=14, pady=5, cursor="hand2",
+            fg=QUIT_FG, activeforeground=QUIT_FG,
+            relief="groove", padx=14, pady=5, cursor="hand2",
         ).pack(side="right")
 
         tk.Button(
@@ -687,7 +685,7 @@ class LauncherWindow:
         tk.Label(
             dlg, text="Remote Upload",
             font=("Helvetica", 13, "bold"), bg=BG, fg=FG,
-        ).pack(padx=24, pady=(18, 2), anchor="w")
+        ).pack(padx=24, pady=(10, 2), anchor="w")
 
         tk.Label(
             dlg,
@@ -695,9 +693,7 @@ class LauncherWindow:
             font=("Helvetica", 10), bg=BG, fg=SUB, justify="left",
         ).pack(padx=24, anchor="w")
 
-        tk.Frame(dlg, bg="#e7e5e4", height=1).pack(fill="x", padx=18, pady=10)
-
-        tk.Frame(dlg, bg="#e7e5e4", height=1).pack(fill="x", padx=18, pady=(4, 8))
+        tk.Frame(dlg, bg="#e7e5e4", height=1).pack(fill="x", padx=18, pady=8)
 
         # ── Phone number ─────────────────────────────────────────────────────
         tk.Label(dlg, text="Phone number", font=("Helvetica", 10, "bold"),
@@ -709,7 +705,7 @@ class LauncherWindow:
         saved_phone = _load_cfg().get("remote_phone", "")
         phone_var = tk.StringVar(value=saved_phone)
         tk.Entry(dlg, textvariable=phone_var, width=24,
-                 font=("Helvetica", 12)).pack(padx=24, pady=(4, 10), anchor="w")
+                 font=("Helvetica", 12)).pack(padx=24, pady=(4, 6), anchor="w")
 
         # ── Folder selector ──────────────────────────────────────────────────
         tk.Label(dlg, text="Target folder", font=("Helvetica", 10, "bold"),
@@ -736,9 +732,9 @@ class LauncherWindow:
         folder_labels = [lbl for _, lbl in folder_options]
         folder_combo = ttk.Combobox(dlg, values=folder_labels, state="readonly", width=40)
         folder_combo.set(folder_labels[0])
-        folder_combo.pack(padx=24, pady=(4, 10), anchor="w")
+        folder_combo.pack(padx=24, pady=(4, 6), anchor="w")
 
-        tk.Frame(dlg, bg="#e7e5e4", height=1).pack(fill="x", padx=18, pady=(0, 8))
+        tk.Frame(dlg, bg="#e7e5e4", height=1).pack(fill="x", padx=18, pady=(0, 6))
 
         # ── QR / URL area ────────────────────────────────────────────────────
         qr_label_widgets: list[tk.Label] = []
@@ -758,7 +754,7 @@ class LauncherWindow:
             try:
                 import qrcode  # type: ignore
                 from PIL import ImageTk  # type: ignore
-                qr_img = qrcode.make(url).resize((192, 192))
+                qr_img = qrcode.make(url).resize((130, 130))
                 photo = ImageTk.PhotoImage(qr_img)
                 if qr_label_widgets:
                     qr_label_widgets[0].config(image=photo)
@@ -854,9 +850,18 @@ class LauncherWindow:
                         sms_btn.config(state="normal")
                         wechat_btn.config(state="normal")
                     copy_btn.config(state="normal")
-                    status_var.set("Link ready — valid for 24 hours.")
+                    status_var.set("Link ready — valid for 7 days.")
                     status_lbl.config(fg="#15803d")
                     generate_btn.config(state="normal")
+                    # Re-center dialog after QR code expands its height
+                    dlg.update_idletasks()
+                    w = dlg.winfo_width()
+                    h = dlg.winfo_height()
+                    sw = dlg.winfo_screenwidth()
+                    sh = dlg.winfo_screenheight()
+                    x = (sw - w) // 2
+                    y = max(20, (sh - h) // 2)
+                    dlg.geometry(f"+{x}+{y}")
 
                 _ui(_finish)
 
@@ -955,11 +960,20 @@ class LauncherWindow:
         copy_btn.pack(side="left", padx=4)
 
         close_row = tk.Frame(dlg, bg=BG)
-        close_row.pack(pady=(2, 18))
+        close_row.pack(pady=(2, 10))
         tk.Button(close_row, text="Close", command=dlg.destroy,
                   relief="groove", padx=14, pady=5).pack()
 
     def _quit(self) -> None:
+        # Save an auto-backup .dms file before exiting. This runs for every
+        # quit path (red X, "Quit DMS" button, Cmd+Q, dock quit, SIGTERM/
+        # SIGINT) since they all funnel through here — previously only the
+        # web UI's "退出 DMS" button (which hits /api/quit) triggered a backup.
+        try:
+            _dms_server._auto_backup()
+        except Exception:
+            pass
+
         # Kill the cloudflared tunnel process object directly (instant).
         global _tunnel_proc
         if _tunnel_proc is not None:

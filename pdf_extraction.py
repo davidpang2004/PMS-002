@@ -686,6 +686,60 @@ def extract_text_from_file(file_path: Path, max_pages: int = 50,
     }
 
 
+def render_pages_for_ai(file_path: Path, max_pages: int = 3) -> list[bytes]:
+    """Render a document's pages to PNG image bytes for a multimodal AI model.
+
+    Unlike the OCR pipeline (which turns pages into text via Tesseract), this
+    keeps the page as an image so a vision-capable model can read it directly.
+    Returns up to max_pages PNG byte-strings, or [] if the file type isn't a
+    PDF/image or no PDF rasterizer is available.
+    """
+    ext = file_path.suffix.lower()
+
+    if ext in IMAGE_EXTS:
+        try:
+            from PIL import Image, ImageOps
+        except ImportError:
+            return []
+        try:
+            with Image.open(str(file_path)) as im:
+                im = ImageOps.exif_transpose(im)
+                if im.mode not in ("RGB", "L"):
+                    im = im.convert("RGB")
+                buf = io.BytesIO()
+                im.save(buf, format="PNG")
+                return [buf.getvalue()]
+        except Exception:
+            return []
+
+    if ext != ".pdf":
+        return []
+
+    try:
+        from pypdf import PdfReader, PdfWriter
+    except ImportError:
+        return []
+
+    try:
+        reader = PdfReader(str(file_path))
+    except Exception:
+        return []
+
+    images: list[bytes] = []
+    for i in range(min(len(reader.pages), max_pages)):
+        try:
+            writer = PdfWriter()
+            writer.add_page(reader.pages[i])
+            single_page_pdf = io.BytesIO()
+            writer.write(single_page_pdf)
+            img_bytes = _render_pdf_page_to_image(single_page_pdf.getvalue())
+        except Exception:
+            img_bytes = None
+        if img_bytes:
+            images.append(img_bytes)
+    return images
+
+
 def ocr_status() -> dict:
     """Report OCR capability so the UI can tell the user what works.
 
