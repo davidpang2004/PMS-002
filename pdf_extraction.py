@@ -805,8 +805,9 @@ _UNIT_PATTERNS = [
     r"°C", r"°F", r"deg\s?C", r"deg\s?F", r"K",
     # Length/dimension (longer first)
     r"mm", r"cm", r"in(?:ch(?:es)?)?", r"ft", r"m", r"\"",
-    # Mass
-    r"kg", r"lb(?:s)?", r"lbm", r"g",
+    # Mass / force (lbf before lb(?:s)? -- longer/more specific must come first,
+    # otherwise "lbf" would match only its "lb" prefix and strand a bare "f")
+    r"kg", r"lbf", r"lb(?:s)?", r"lbm", r"g",
     # Percent / ratio
     r"%", r"pct",
     # Misc electrical
@@ -816,8 +817,14 @@ _UNIT_PATTERNS = [
 # Precompile a unit alternative
 _UNIT_ALT = "(?:" + "|".join(_UNIT_PATTERNS) + ")"
 
-# A number: integer or decimal, optional sign, optional thousands separators
-_NUMBER = r"[-+]?\d{1,3}(?:[,]\d{3})*(?:\.\d+)?|[-+]?\d+(?:\.\d+)?"
+# A number: integer or decimal, optional sign, optional thousands separators.
+# The comma-grouped alternative requires AT LEAST one ",ddd" group (note the
+# trailing `+`, not `*`) so it only fires for actually-comma-grouped numbers
+# like "1,234"; otherwise a plain 4+ digit number such as "1000" would match
+# the comma-grouped alternative first and get truncated to "100" (regex
+# alternation takes the first alternative that matches at all, not the
+# longest — it wouldn't fall through to try the second alternative).
+_NUMBER = r"[-+]?\d{1,3}(?:,\d{3})+(?:\.\d+)?|[-+]?\d+(?:\.\d+)?"
 
 
 def extract_parameters(text: str, parameters: list[str]) -> dict[str, dict]:
@@ -1047,26 +1054,24 @@ def _clean_following_value(s: str) -> str:
     return s.strip()
 
 
-def _find_following_value(text: str, key: str, max_value_len: int = 200,
-                          same_line_only: bool = True) -> Optional[str]:
-    """Find `key` in `text` (case-insensitive) and return the value after it.
+def _find_all_following_values(text: str, key: str, max_value_len: int = 200,
+                               same_line_only: bool = True) -> list[str]:
+    """Find EVERY occurrence of `key` in `text` (case-insensitive) and return
+    the value found after each one, in document order.
 
-    - Whitespace inside the key is matched flexibly, so OCR turning
-      "Assembly Id" into "Assembly  Id" or a line-broken "Assembly\\nId"
-      still matches.
-    - Word boundaries are applied only at alphanumeric edges, so short keys
-      don't match inside longer words.
-    - The value is taken from the SAME line as the key (after any separator and
-      spaces), which is the common "Label:  value" / "Label   value" layout.
-    - Only if `same_line_only` is False and the same line has nothing after the
-      key do we fall back to the next non-empty line (useful for table layouts
-      where OCR puts a column header above its value).
+    Same matching rules as before (flexible whitespace, CJK-aware, word
+    boundaries, same-line-first with optional next-line fallback) but scans
+    the whole document instead of stopping at the first hit, so a key that
+    appears multiple times (e.g. a repeated table header, or a value measured
+    at several points) yields one entry per occurrence. Occurrences where no
+    usable value follows are skipped (they don't produce an empty entry).
 
-    Returns the cleaned value string, or None if the key isn't present at all.
+    Returns a list of cleaned value strings (possibly empty if the key never
+    appears, or appears but never has a value after it).
     """
     tokens = key.split()
     if not tokens:
-        return None
+        return []
 
     # Build a pattern that tolerates flexible whitespace. Between space-split
     # tokens we already allow \s+. Additionally, OCR frequently inserts spaces
@@ -1094,26 +1099,76 @@ def _find_following_value(text: str, key: str, max_value_len: int = 200,
     post = _edge(tokens[-1][-1:])
     pattern = re.compile(pre + flex + post, re.IGNORECASE)
 
-    m = pattern.search(text)
+    values: list[str] = []
+    for m in pattern.finditer(text):
+        after = text[m.end():]
+        nl = after.find("\n")
+        same_line = after if nl == -1 else after[:nl]
+        val = _clean_following_value(same_line)
+
+        # Same-line was empty AND the caller allows it → look at the next line(s).
+        if not val and not same_line_only and nl != -1:
+            for ln in after[nl + 1:].splitlines():
+                c = _clean_following_value(ln)
+                if c:
+                    val = c
+                    break
+
+        if len(val) > max_value_len:
+            val = val[:max_value_len].rstrip()
+        if val:
+            values.append(val)
+    return values
+
+
+# A string that is nothing but a number (used to still recognize a bare
+# count/ID/measurement like "1000" as a value even without a unit attached).
+_BARE_NUMBER = re.compile(r"^(?:" + _NUMBER + r")$")
+
+# A number immediately (0-1 space) followed by a recognized unit. Requiring
+# the unit to sit right next to the number — rather than searching a wider
+# window — keeps this from misfiring on digits embedded in an identifier
+# like "ASTM A516-70" or "AISI 4140", which have no real unit next to them.
+_NUMBER_UNIT_RE = re.compile(r"(" + _NUMBER + r")\s?(" + _UNIT_ALT + r")", re.IGNORECASE)
+
+
+def split_value_unit_description(raw: str) -> dict:
+    """Split a captured key-value string into value / unit / description.
+
+    Structured, per-field output is far more useful downstream (charts,
+    filtering, feature columns for AI training) than one free-text blob, so
+    this pulls apart strings like:
+      "250 MPa"              -> value="250", unit="MPa", description=""
+      "Min 36 ksi"           -> value="36",  unit="ksi", description="Min"
+      "30 mm dia."           -> value="30",  unit="mm",  description="dia."
+      "1000"                 -> value="1000", unit="",   description=""
+      "Carbon Steel Grade A" -> value="",    unit="",    description="Carbon Steel Grade A"
+      "ASTM A516-70"         -> value="",    unit="",    description="ASTM A516-70"
+
+    Strategy: a value is only pulled out when it's unambiguous — either the
+    whole captured string is just a number (a bare count/ID/measurement), or
+    a number sits right next to a recognized engineering unit. Everything
+    else (identifiers, dates, free text, numbers embedded in a code) is left
+    as the description rather than guessed at, matching this module's
+    "prefer no match over a wrong one" philosophy.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return {"value": "", "unit": "", "description": ""}
+
+    if _BARE_NUMBER.match(s):
+        return {"value": s.replace(",", ""), "unit": "", "description": ""}
+
+    m = _NUMBER_UNIT_RE.search(s)
     if not m:
-        return None  # key truly absent → caller maps to NF
+        return {"value": "", "unit": "", "description": s}
 
-    after = text[m.end():]
-    nl = after.find("\n")
-    same_line = after if nl == -1 else after[:nl]
-    val = _clean_following_value(same_line)
-
-    # Same-line was empty AND the caller allows it → look at the next line(s).
-    if not val and not same_line_only and nl != -1:
-        for ln in after[nl + 1:].splitlines():
-            c = _clean_following_value(ln)
-            if c:
-                val = c
-                break
-
-    if len(val) > max_value_len:
-        val = val[:max_value_len].rstrip()
-    return val
+    value = m.group(1).replace(",", "")
+    unit = m.group(2)
+    before = s[:m.start()].strip()
+    after = s[m.end():].strip()
+    description = " ".join(p for p in (before, after) if p)
+    return {"value": value, "unit": unit, "description": description}
 
 
 def extract_key_strings(text: str, keys: list[str],
@@ -1121,16 +1176,29 @@ def extract_key_strings(text: str, keys: list[str],
                         same_line_only: bool = True) -> dict[str, dict]:
     """Extract a value for each user-defined key string.
 
-    For every key: if it appears in `text`, capture the string/value that
-    follows it ON THE SAME LINE; otherwise (or if nothing usable follows)
-    report "NF". Set same_line_only=False to also search the next line when
-    the same line has no value.
+    For every key, the WHOLE document is searched (not just up to the first
+    hit): each occurrence that has a usable value after it becomes its own
+    metadata entry. The first occurrence keeps the plain key name; each
+    further occurrence gets the key name suffixed with a two-digit counter
+    ("Pressure", "Pressure01", "Pressure02", ...), so repeated labels (a value
+    measured at several points, a header that recurs across pages) are all
+    captured instead of only the first one. A key that never appears, or
+    appears but never has a value after it, reports "NF" under the plain key
+    name. Set same_line_only=False to also search the next line when the
+    same line has no value.
 
-    Returns an ordered dict keyed by the original key string:
-      { key: {"value": <str or "NF">, "found": <bool>} }
+    Each captured string is further split into three parts (see
+    split_value_unit_description) so the result is structured data rather
+    than one free-text blob — more useful for downstream filtering, charts,
+    or as feature columns for AI training.
+
+    Returns an ordered dict keyed by the (possibly suffixed) key string:
+      { key: {"value": str, "unit": str, "description": str,
+              "raw": <the full captured string, or "NF">, "found": bool} }
 
     `found` is True only when a non-empty value was captured, so the UI can
-    distinguish "matched with a value" from "NF".
+    distinguish "matched with something" from "NF". `raw` is kept alongside
+    the split for reference/debugging (e.g. if the split looks wrong).
     """
     results: dict[str, dict] = {}
     if not keys:
@@ -1143,12 +1211,20 @@ def extract_key_strings(text: str, keys: list[str],
             continue
         if key in results:          # de-dupe, keep first
             continue
-        val = (_find_following_value(body, key, max_value_len, same_line_only)
-               if body else None)
-        if val:
-            results[key] = {"value": val, "found": True}
+        values = (_find_all_following_values(body, key, max_value_len, same_line_only)
+                  if body else [])
+        if values:
+            def _entry(captured: str) -> dict:
+                parts = split_value_unit_description(captured)
+                return {**parts, "raw": captured, "found": True}
+            results[key] = _entry(values[0])
+            for i, val in enumerate(values[1:], start=1):
+                dupe_key = f"{key}{i:02d}"
+                if dupe_key not in results:   # don't clobber a real user key
+                    results[dupe_key] = _entry(val)
         else:
-            results[key] = {"value": NOT_FOUND, "found": False}
+            results[key] = {"value": "", "unit": "", "description": "",
+                             "raw": NOT_FOUND, "found": False}
     return results
 
 

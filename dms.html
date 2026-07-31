@@ -31,6 +31,47 @@ const { useState, useEffect, useCallback, useMemo, useRef } = React;
  * separate keyed dictionary to maintain.
  * =============================================================================
  */
+// Recombine a {value, unit, description} extraction row into a single
+// display/search string (used for the metadata "actual" field, which is
+// read as plain text in many other places in this app -- search, databook,
+// the general metadata editor, etc). The structured value/unit/description
+// fields are stored ALONGSIDE this string, not instead of it.
+const composeActualString = (value, unit, description) => {
+  const v = (value || "").trim();
+  const u = (unit || "").trim();
+  const d = (description || "").trim();
+  const head = v ? (u ? `${v} ${u}` : v) : u;
+  return [head, d].filter(Boolean).join(" ").trim();
+};
+
+// JS mirror of pdf_extraction.split_value_unit_description (Python), used
+// only so the metadata editor can show a value/unit/description breakdown
+// for "actual" text that predates this field split (extraction-saved rows
+// already carry the parts; this is the fallback for older/manually-typed
+// entries). Same conservative rule: a value only comes out when the whole
+// string is a bare number, or a number sits right next to a known unit.
+const _UNIT_ALT_JS = "(?:kg/m\\^?3|kg/m³|g/cm\\^?3|g/cm³|lb/in\\^?3|lb/ft\\^?3|" +
+  "m/s|ft/s|mph|kph|ft[-\\s]?lb(?:s)?|ft·lb|N·m|Nm|J|" +
+  "GPa|MPa|kPa|ksi|psi|bar|Pa|HRC|HRB|HV|HB|BHN|Shore\\s?[A-D]?|" +
+  "°C|°F|deg\\s?C|deg\\s?F|K|mm|cm|in(?:ch(?:es)?)?|ft|m|\"|" +
+  "kg|lbf|lb(?:s)?|lbm|g|%|pct|MHz|kHz|Hz|kW|hp|V|A|W)";
+const _NUMBER_JS = "[-+]?\\d{1,3}(?:,\\d{3})+(?:\\.\\d+)?|[-+]?\\d+(?:\\.\\d+)?";
+const _BARE_NUMBER_RE_JS = new RegExp(`^(?:${_NUMBER_JS})$`);
+const _NUMBER_UNIT_RE_JS = new RegExp(`(${_NUMBER_JS})\\s?(${_UNIT_ALT_JS})`, "i");
+
+const splitActualString = (raw) => {
+  const s = (raw || "").trim();
+  if (!s) return { value: "", unit: "", description: "" };
+  if (_BARE_NUMBER_RE_JS.test(s)) return { value: s.replace(/,/g, ""), unit: "", description: "" };
+  const m = s.match(_NUMBER_UNIT_RE_JS);
+  if (!m) return { value: "", unit: "", description: s };
+  const value = m[1].replace(/,/g, "");
+  const unit = m[2];
+  const before = s.slice(0, m.index).trim();
+  const after = s.slice(m.index + m[0].length).trim();
+  return { value, unit, description: [before, after].filter(Boolean).join(" ") };
+};
+
 const LangContext = React.createContext({ lang: "zh", t: (zh) => zh, setLang: () => {} });
 const useLang = () => React.useContext(LangContext);
 // For plain (non-component) code, like StorageAdapter, that has no access to useLang().
@@ -1553,7 +1594,7 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
   const [selectedKeys, setSelectedKeys] = useState([]);   // which to extract
   const [newKeyInput, setNewKeyInput] = useState("");     // add-new box
   const [sameLineOnly, setSameLineOnly] = useState(true); // #4: same line default
-  const [keyRows, setKeyRows] = useState(null);           // [{key, value, found}]
+  const [keyRows, setKeyRows] = useState(null);           // [{key, value, unit, description, found}]
   const [keyRunning, setKeyRunning] = useState(false);
   const [keyError, setKeyError] = useState("");
   const [keyHint, setKeyHint] = useState("");
@@ -1772,11 +1813,21 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
       // otherwise the server reads the file directly.
       const useText = ocrText && ocrText.trim() ? ocrText : null;
       const r = await StorageAdapter.extractKeys(doc.id, keys, { force, text: useText, sameLineOnly });
-      const rows = keys.map((k) => ({
-        key: k,
-        value: (r.results[k] && r.results[k].value) || "NF",
-        found: !!(r.results[k] && r.results[k].found),
-      }));
+      // r.results may contain more entries than `keys`: a key found more than
+      // once in the document comes back as "Key", "Key01", "Key02", ... (one
+      // row per occurrence) -- include all of them, not just the originally
+      // requested names, so repeated values are all shown and saved. Each
+      // result is already split server-side into value/unit/description.
+      const rows = Object.keys(r.results || {}).map((k) => {
+        const res = r.results[k] || {};
+        return {
+          key: k,
+          value: res.value || "",
+          unit: res.unit || "",
+          description: res.description || "",
+          found: !!res.found,
+        };
+      });
       setKeyRows(rows);
       setKeyHint(r.hint || "");
       setKeyDiag({
@@ -1801,11 +1852,16 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
     setKeyRunning(true); setKeyError(""); setKeyHint(""); setKeyDiag(null); setParamsSaved(false);
     try {
       const r = await StorageAdapter.extractKeysAI(doc.id, keys);
-      const rows = keys.map((k) => ({
-        key: k,
-        value: (r.results[k] && r.results[k].value) || "NF",
-        found: !!(r.results[k] && r.results[k].found),
-      }));
+      const rows = Object.keys(r.results || {}).map((k) => {
+        const res = r.results[k] || {};
+        return {
+          key: k,
+          value: res.value || "",
+          unit: res.unit || "",
+          description: res.description || "",
+          found: !!res.found,
+        };
+      });
       setKeyRows(rows);
       setKeyHint(r.pages_used ? t(`AI 已读取 ${r.pages_used} 页文档图像进行识别。`, `AI read ${r.pages_used} page image(s) of the document for recognition.`) : "");
     } catch (e) {
@@ -1815,25 +1871,38 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
     }
   };
 
-  const editRowValue = (idx, val) => {
-    setKeyRows((rows) => rows.map((r, i) =>
-      i === idx ? { ...r, value: val, found: val.trim() !== "" && val.trim() !== "NF" } : r));
+  // field is "value" | "unit" | "description".
+  const editRowField = (idx, field, val) => {
+    setKeyRows((rows) => rows.map((r, i) => {
+      if (i !== idx) return r;
+      const next = { ...r, [field]: val };
+      next.found = [next.value, next.unit, next.description].some((s) => (s || "").trim() !== "");
+      return next;
+    }));
     setParamsSaved(false);
   };
 
-  // Save extracted values into the document's parameter fields. Each value
-  // lands in the "Actual (实测值)" slot, since these are the document's
-  // reported/as-certified values. Existing "Design / Req." values are kept.
+  // Save extracted values into the document's parameter fields. Each row
+  // lands in the "Actual (实测值)" slot as both a composed display string
+  // AND its own value/unit/description fields, since these are the
+  // document's reported/as-certified values. Existing "Design / Req."
+  // values are kept.
   const saveParams = async ({ includeNF = true } = {}) => {
     if (!onSaveParams || !keyRows) return;
     const meta = { ...((doc.metadata) || {}) };
     for (const row of keyRows) {
-      if (!includeNF && (row.value === "NF" || row.value.trim() === "")) continue;
+      if (!includeNF && !row.found) continue;
       const prev = meta[row.key];
       const prevObj = (prev && typeof prev === "object")
         ? prev
         : { design: typeof prev === "string" ? prev : "", actual: "" };
-      meta[row.key] = { ...prevObj, actual: row.value };
+      meta[row.key] = {
+        ...prevObj,
+        actual: row.found ? composeActualString(row.value, row.unit, row.description) : "NF",
+        value: row.value || "",
+        unit: row.unit || "",
+        description: row.description || "",
+      };
     }
     await onSaveParams(doc.id, meta);
     setParamsSaved(true);
@@ -2364,26 +2433,51 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
                     <thead>
                       <tr className="text-stone-500 text-left border-b border-stone-200">
                         <th className="py-1 pr-2 font-medium">{t("关键字", "Keyword")}</th>
-                        <th className="py-1 font-medium">{t("提取值（实测值）", "Extracted value (actual)")}</th>
+                        <th className="py-1 pr-2 font-medium w-[18%]">{t("值", "Value")}</th>
+                        <th className="py-1 pr-2 font-medium w-[14%]">{t("单位", "Unit")}</th>
+                        <th className="py-1 font-medium">{t("描述", "Description")}</th>
                       </tr>
                     </thead>
                     <tbody>
                       {keyRows.map((row, idx) => (
                         <tr key={row.key + idx} className="border-b border-stone-100 align-top">
-                          <td className="py-1 pr-2 font-mono text-stone-700 break-all w-2/5">{row.key}</td>
-                          <td className="py-1">
+                          <td className="py-1 pr-2 font-mono text-stone-700 break-all w-1/4">
                             <div className="flex items-center gap-1">
-                              <input
-                                type="text"
-                                value={row.value}
-                                onChange={(e) => editRowValue(idx, e.target.value)}
-                                className={"flex-1 text-[11px] px-1.5 py-0.5 border rounded focus:outline-none focus:border-emerald-500 " +
-                                  (row.found ? "border-stone-300 text-stone-800" : "border-stone-200 text-stone-400 italic")}
-                              />
+                              <span>{row.key}</span>
                               {!row.found && (
                                 <span className="text-[9px] text-stone-400 shrink-0">NF</span>
                               )}
                             </div>
+                          </td>
+                          <td className="py-1 pr-2">
+                            <input
+                              type="text"
+                              value={row.value}
+                              onChange={(e) => editRowField(idx, "value", e.target.value)}
+                              placeholder="—"
+                              className={"w-full text-[11px] px-1.5 py-0.5 border rounded focus:outline-none focus:border-emerald-500 " +
+                                (row.found ? "border-stone-300 text-stone-800" : "border-stone-200 text-stone-400 italic")}
+                            />
+                          </td>
+                          <td className="py-1 pr-2">
+                            <input
+                              type="text"
+                              value={row.unit}
+                              onChange={(e) => editRowField(idx, "unit", e.target.value)}
+                              placeholder="—"
+                              className={"w-full text-[11px] px-1.5 py-0.5 border rounded focus:outline-none focus:border-emerald-500 " +
+                                (row.found ? "border-stone-300 text-stone-800" : "border-stone-200 text-stone-400 italic")}
+                            />
+                          </td>
+                          <td className="py-1">
+                            <input
+                              type="text"
+                              value={row.description}
+                              onChange={(e) => editRowField(idx, "description", e.target.value)}
+                              placeholder="—"
+                              className={"w-full text-[11px] px-1.5 py-0.5 border rounded focus:outline-none focus:border-emerald-500 " +
+                                (row.found ? "border-stone-300 text-stone-800" : "border-stone-200 text-stone-400 italic")}
+                            />
                           </td>
                         </tr>
                       ))}
@@ -2557,10 +2651,44 @@ const MetadataEditor = ({ metadata, onChange, keyParameters = [] }) => {
     delete m[oldKey];
     onChange(m);
   };
-  const updateValue = (key, subField, val) => {
+  // Both "design" and "actual" are stored as a composed display string PLUS
+  // their own value/unit/description parts (design's parts are prefixed
+  // "design" to not collide with actual's). PART_FIELDS maps which part-field
+  // names go with which composed string.
+  const PART_FIELDS = {
+    actual: { value: "value", unit: "unit", description: "description" },
+    design: { value: "designValue", unit: "designUnit", description: "designDescription" },
+  };
+  const partsOf = (valObj, composedKey) => {
+    const pf = PART_FIELDS[composedKey];
+    return (valObj[pf.value] || valObj[pf.unit] || valObj[pf.description])
+      ? { value: valObj[pf.value] || "", unit: valObj[pf.unit] || "", description: valObj[pf.description] || "" }
+      : splitActualString(valObj[composedKey]);
+  };
+
+  // Update one part (value/unit/description) of either the design or the
+  // actual composed string, keeping the composed string (the plain text
+  // search/display everywhere else in the app reads) recomposed from them.
+  // Falls back to splitting the existing composed text the first time an
+  // older entry (saved before this split existed) is edited, so its content
+  // isn't lost.
+  const updatePart = (key, composedKey, field, val) => {
     const prev = (metadata || {})[key];
-    const prevObj = (prev && typeof prev === "object") ? prev : { design: typeof prev === "string" ? prev : "", actual: "" };
-    onChange({ ...(metadata || {}), [key]: { ...prevObj, [subField]: val } });
+    const prevObj = (prev && typeof prev === "object")
+      ? prev
+      : { design: typeof prev === "string" ? prev : "", actual: "" };
+    const pf = PART_FIELDS[composedKey];
+    const nextParts = { ...partsOf(prevObj, composedKey), [field]: val };
+    onChange({
+      ...(metadata || {}),
+      [key]: {
+        ...prevObj,
+        [pf.value]: nextParts.value,
+        [pf.unit]: nextParts.unit,
+        [pf.description]: nextParts.description,
+        [composedKey]: composeActualString(nextParts.value, nextParts.unit, nextParts.description),
+      },
+    });
   };
 
   const nextUnusedKey = () => {
@@ -2637,6 +2765,13 @@ const MetadataEditor = ({ metadata, onChange, keyParameters = [] }) => {
 
       {entries.map(([key, val]) => {
         const valObj = (val && typeof val === "object") ? val : { design: typeof val === "string" ? val : "", actual: "" };
+        // The actual value is stored as three parts (value/unit/description)
+        // alongside the composed "design"/"actual" strings -- same breakdown
+        // as the "Extract key parameters" panel. Older/manually-typed
+        // entries that only have the composed string get split on the fly
+        // for display.
+        const designParts = partsOf(valObj, "design");
+        const actualParts = partsOf(valObj, "actual");
         return (
           <div key={key} className="space-y-1">
             <div className="flex gap-1.5 items-center">
@@ -2645,23 +2780,51 @@ const MetadataEditor = ({ metadata, onChange, keyParameters = [] }) => {
                 <X size={12} />
               </button>
             </div>
-            <div className="flex gap-1.5 items-center pl-1">
-              <span className="text-[10px] text-stone-500 w-[90px] shrink-0 text-right pr-1">{t("设计 / 要求", "Design / spec")}</span>
-              <ImeInput
-                value={valObj.design}
-                onCommit={(v) => updateValue(key, "design", v)}
-                placeholder={t("设计值或标准要求", "Design value or spec requirement")}
-                className="text-xs px-2 py-1 border border-stone-300 rounded flex-1 focus:outline-none focus:border-amber-600"
-              />
+            <div className="flex gap-1.5 items-start pl-1">
+              <span className="text-[10px] text-stone-500 w-[90px] shrink-0 text-right pr-1 pt-1">{t("设计 / 要求", "Design / spec")}</span>
+              <div className="flex-1 grid grid-cols-[2fr_1.2fr_3fr] gap-1">
+                <ImeInput
+                  value={designParts.value}
+                  onCommit={(v) => updatePart(key, "design", "value", v)}
+                  placeholder={t("值", "Value")}
+                  className="text-xs px-2 py-1 border border-stone-300 rounded focus:outline-none focus:border-amber-600"
+                />
+                <ImeInput
+                  value={designParts.unit}
+                  onCommit={(v) => updatePart(key, "design", "unit", v)}
+                  placeholder={t("单位", "Unit")}
+                  className="text-xs px-2 py-1 border border-stone-300 rounded focus:outline-none focus:border-amber-600"
+                />
+                <ImeInput
+                  value={designParts.description}
+                  onCommit={(v) => updatePart(key, "design", "description", v)}
+                  placeholder={t("描述", "Description")}
+                  className="text-xs px-2 py-1 border border-stone-300 rounded focus:outline-none focus:border-amber-600"
+                />
+              </div>
             </div>
-            <div className="flex gap-1.5 items-center pl-1 pb-1 border-b border-stone-100">
-              <span className="text-[10px] text-stone-500 w-[90px] shrink-0 text-right pr-1">{t("实测值", "Actual value")}</span>
-              <ImeInput
-                value={valObj.actual}
-                onCommit={(v) => updateValue(key, "actual", v)}
-                placeholder={t("实测值", "Actual value")}
-                className="text-xs px-2 py-1 border border-stone-300 rounded flex-1 focus:outline-none focus:border-amber-600"
-              />
+            <div className="flex gap-1.5 items-start pl-1 pb-1 border-b border-stone-100">
+              <span className="text-[10px] text-stone-500 w-[90px] shrink-0 text-right pr-1 pt-1">{t("实测值", "Actual value")}</span>
+              <div className="flex-1 grid grid-cols-[2fr_1.2fr_3fr] gap-1">
+                <ImeInput
+                  value={actualParts.value}
+                  onCommit={(v) => updatePart(key, "actual", "value", v)}
+                  placeholder={t("值", "Value")}
+                  className="text-xs px-2 py-1 border border-stone-300 rounded focus:outline-none focus:border-amber-600"
+                />
+                <ImeInput
+                  value={actualParts.unit}
+                  onCommit={(v) => updatePart(key, "actual", "unit", v)}
+                  placeholder={t("单位", "Unit")}
+                  className="text-xs px-2 py-1 border border-stone-300 rounded focus:outline-none focus:border-amber-600"
+                />
+                <ImeInput
+                  value={actualParts.description}
+                  onCommit={(v) => updatePart(key, "actual", "description", v)}
+                  placeholder={t("描述", "Description")}
+                  className="text-xs px-2 py-1 border border-stone-300 rounded focus:outline-none focus:border-amber-600"
+                />
+              </div>
             </div>
           </div>
         );

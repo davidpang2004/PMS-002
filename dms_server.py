@@ -4321,7 +4321,8 @@ def post_doc_extract_keys_ai(doc_id):
     API when this endpoint is called.
 
     Body (JSON): { "keys": ["Pressure", ...] }
-    Returns { ok, results: { key: {value, found} }, found_count, pages_used }.
+    Returns { ok, results: { key: {value, unit, description, raw, found} },
+    found_count, pages_used }.
     """
     docs_dir = get_docs_dir()
     if not docs_dir:
@@ -4390,8 +4391,13 @@ def post_doc_extract_keys(doc_id):
                                  #   already reviewed/corrected in the panel)
       }
 
-    Returns { ok, doc_id, results: { key: {value, found} }, info, hint }.
-    Keys that aren't found come back with value "NF".
+    Returns { ok, doc_id, results: { key: {value, unit, description, raw, found} },
+    info, hint }. Each captured string is split into value/unit/description
+    (raw keeps the original captured text) so results are structured rather
+    than one free-text blob. Keys that aren't found come back with found=false
+    and empty value/unit/description (raw="NF"). A key that appears more than
+    once in the document produces one result entry per occurrence: the first
+    as the plain key name, further ones as "<key>01", "<key>02", ...
     """
     docs_dir = get_docs_dir()
     if not docs_dir:

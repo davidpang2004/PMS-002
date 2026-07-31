@@ -12,6 +12,8 @@ from __future__ import annotations
 import json
 import re
 
+from pdf_extraction import split_value_unit_description
+
 # Google periodically retires older model IDs for new accounts/projects.
 # Try the current flash-tier model first, then fall back to older ones still
 # active for some accounts -- so a single retirement doesn't hard-break this
@@ -55,8 +57,10 @@ def extract_keys_with_gemini(image_bytes_list: list[bytes], keys: list[str],
     """Send document page images to Gemini and ask it to read each key's
     value directly off the page (bypassing OCR text-matching entirely).
 
-    Returns { key: {"value": str, "found": bool} } -- the same shape as
-    pdf_extraction.extract_key_strings, so callers can treat both uniformly.
+    Returns { key: {"value": str, "unit": str, "description": str, "raw": str,
+    "found": bool} } -- the same shape as pdf_extraction.extract_key_strings
+    (each value split into value/unit/description), so callers can treat
+    both uniformly.
     """
     if not image_bytes_list:
         raise AIExtractionError("没有可发送给 AI 的页面图像（文档可能不是 PDF 或图片）。")
@@ -128,7 +132,11 @@ def extract_keys_with_gemini(image_bytes_list: list[bytes], keys: list[str],
         val_str = str(val).strip() if val is not None else "NF"
         if not val_str:
             val_str = "NF"
-        results[k] = {"value": val_str, "found": val_str != "NF"}
+        if val_str == "NF":
+            results[k] = {"value": "", "unit": "", "description": "", "raw": "NF", "found": False}
+        else:
+            parts = split_value_unit_description(val_str)
+            results[k] = {**parts, "raw": val_str, "found": True}
     return results
 
 
