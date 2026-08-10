@@ -219,3 +219,81 @@ def answer_question_with_gemini(question: str, snippets: list[dict],
     cited_doc_ids = [str(c).strip() for c in cited if str(c).strip()]
 
     return {"answer": answer, "cited_doc_ids": cited_doc_ids}
+
+
+def comment_on_trend_with_gemini(param_name: str, unit: str, points: list[dict],
+                                  api_key: str, lang: str = "zh", model: str = DEFAULT_MODEL) -> dict:
+    """Fit a trend to a parameter-vs-time series (from FolderPlotDialog) and
+    get a plain-language comment on it.
+
+    points: [{"date": "YYYY-MM-DD", "value": float}, ...], already sorted
+    chronologically by the caller. Sent as plain numbers -- no document
+    text/images involved, so this is cheap even on a large series.
+
+    Returns {"comment": str}.
+    """
+    if not api_key:
+        raise AIExtractionError("未配置 Gemini API Key，请先在设置中添加。")
+    param_name = (param_name or "").strip()
+    if not param_name:
+        raise AIExtractionError("缺少参数名称。")
+    if not points:
+        raise AIExtractionError("没有可供分析的数据点。")
+
+    try:
+        from google import genai
+    except ImportError:
+        raise AIExtractionError(
+            "未安装 google-genai 库。请在运行此程序的 Python 中执行：pip install google-genai")
+
+    unit_suffix = f" {unit}" if unit else ""
+    rows = "\n".join(f"- {p.get('date')}: {p.get('value')}{unit_suffix}" for p in points)
+    lang_instruction = "Respond in English." if lang == "en" else "Respond in Chinese (简体中文)."
+
+    prompt = (
+        "You are a data analyst reviewing a time series of measured values "
+        f"for the parameter \"{param_name}\"{f' (unit: {unit})' if unit else ''}, "
+        "one value per document, sorted chronologically:\n\n"
+        f"{rows}\n\n"
+        "Fit a trend to this data (say whether it looks roughly linear, "
+        "flat, or something else, and give an approximate rate of change "
+        "over time if a linear fit is reasonable), then give a short, "
+        "plain-language comment covering the overall direction, any "
+        "anomalies or outliers, and anything worth a reviewer's attention. "
+        "Keep it concise -- a few sentences to a short paragraph, meant as "
+        "a quick read next to a chart, not a formal report.\n\n"
+        f"{lang_instruction}\n\n"
+        "Respond with ONLY a single JSON object of the form "
+        '{"comment": "<your analysis>"}. No explanation, no markdown code '
+        "fences, just the JSON object."
+    )
+
+    client = genai.Client(api_key=api_key)
+    candidates = [model] + [m for m in FALLBACK_MODELS if m != model]
+    response = None
+    last_error = None
+    for candidate in candidates:
+        try:
+            response = client.models.generate_content(model=candidate, contents=[prompt])
+            last_error = None
+            break
+        except Exception as e:
+            last_error = e
+            msg = str(e)
+            if "NOT_FOUND" in msg or "404" in msg or "no longer available" in msg:
+                continue
+            break
+
+    if last_error is not None:
+        raise AIExtractionError(f"调用 Gemini API 失败：{last_error}")
+
+    raw = getattr(response, "text", None) or ""
+    parsed = _extract_json_object(raw)
+    if not isinstance(parsed, dict):
+        raise AIExtractionError("AI 返回的内容格式不正确（不是一个 JSON 对象）。")
+
+    comment = str(parsed.get("comment") or "").strip()
+    if not comment:
+        raise AIExtractionError("AI 未返回有效的分析结果。")
+
+    return {"comment": comment}

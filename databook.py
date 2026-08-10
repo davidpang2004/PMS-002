@@ -348,6 +348,26 @@ def _escape(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _normalize_to_portrait(page):
+    """Rotate a landscape source page so it displays portrait.
+
+    Bakes the rotation into the page's own content/media box (via
+    transfer_rotation_to_content) rather than just flipping the /Rotate
+    flag, so the header overlay in _make_header_overlay -- which is always
+    drawn on a portrait letter canvas -- lands correctly regardless of the
+    source PDF's original page orientation. No-op for already-portrait or
+    square pages.
+    """
+    try:
+        box = page.mediabox
+        if float(box.width) > float(box.height):
+            page.rotate(90)
+            page.transfer_rotation_to_content()
+    except Exception:
+        pass  # leave the page as-is rather than fail the whole merge
+    return page
+
+
 # ---------------------------------------------------------------------------
 # Header overlay — stamps the document's SN + page number at the top of
 # every page (no folder/document names, per the databook's privacy design)
@@ -389,6 +409,8 @@ def build_databook(
     title: str = "",
     subtitle: str = "",
     front_page_pdf_bytes: bytes | None = None,
+    include_cover: bool = True,
+    force_portrait: bool = False,
 ) -> bytes:
     """
     selection: ordered list of {nodeId, docIds: [str, ...]} representing the
@@ -396,6 +418,14 @@ def build_databook(
     front_page_pdf_bytes: optional pre-normalized PDF page(s) (see
                build_front_page_pdf_bytes) inserted before the auto-generated
                cover/TOC page.
+    include_cover: when False, skips the auto-generated "ENGINEERING
+               DATABOOK" title + table-of-contents pages entirely -- the
+               output starts directly with the first document's own pages.
+               Per-document bookmarks (the PDF outline) are still added
+               either way, so navigation doesn't depend on the cover page.
+    force_portrait: when True, any source PDF page wider than it is tall is
+               rotated to display portrait (see _normalize_to_portrait), so
+               the whole merged output has a single, consistent orientation.
     Returns the assembled PDF as bytes.
     """
     _init_fonts()
@@ -431,18 +461,22 @@ def build_databook(
     if front_page_pdf_bytes:
         front_reader = PdfReader(io.BytesIO(front_page_pdf_bytes))
         for p in front_reader.pages:
+            if force_portrait:
+                p = _normalize_to_portrait(p)
             writer.add_page(p)
         front_page_count = len(front_reader.pages)
         front_reader.close()
 
-    # 1b — cover + TOC
-    cover_bytes = _build_cover_pdf(title, subtitle, sections)
-    cover_reader = PdfReader(io.BytesIO(cover_bytes))
+    # 1b — cover + TOC (skippable — see include_cover)
     cover_start_page = front_page_count
-    cover_page_count = len(cover_reader.pages)
-    for p in cover_reader.pages:
-        writer.add_page(p)
-    cover_reader.close()
+    cover_page_count = 0
+    if include_cover:
+        cover_bytes = _build_cover_pdf(title, subtitle, sections)
+        cover_reader = PdfReader(io.BytesIO(cover_bytes))
+        cover_page_count = len(cover_reader.pages)
+        for p in cover_reader.pages:
+            writer.add_page(p)
+        cover_reader.close()
 
     # 1c — for each section: each document. No section divider pages are
     # inserted, and no folder/section names appear anywhere in the output —
@@ -469,6 +503,8 @@ def build_databook(
                 try:
                     src = PdfReader(str(doc_path))
                     for p in src.pages:
+                        if force_portrait:
+                            p = _normalize_to_portrait(p)
                         writer.add_page(p)
                     src.close()
                 except Exception:
@@ -496,7 +532,8 @@ def build_databook(
     # names appear as bookmarks, only the document name and its SN.
     if front_page_count:
         writer.add_outline_item("Front Page", 0)
-    writer.add_outline_item("Cover & Table of Contents", cover_start_page)
+    if include_cover:
+        writer.add_outline_item("Cover & Table of Contents", cover_start_page)
     for ds_page, ds_name, ds_sn in doc_starts:
         label = f"{ds_sn} · {ds_name}" if ds_sn else ds_name
         writer.add_outline_item(label, ds_page)

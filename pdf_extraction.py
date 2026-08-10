@@ -18,6 +18,7 @@ Three stages of extraction, in order of cost:
 """
 from __future__ import annotations
 
+import datetime
 import io
 import os
 import re
@@ -413,6 +414,14 @@ def extract_text_from_pdf(
       - 'used_ocr': True if OCR was used on at least one page
       - 'ocr_available': whether Tesseract was found at all
       - 'garbage_text_layer': True if a text layer was present but unreadable
+      - 'page_ranges': [{"page": <1-based page number>, "start": <char
+        offset in `text`>, "end": <char offset, exclusive>}, ...] — lets a
+        caller that found a match at some character offset in `text` (e.g.
+        the floating preview's fuzzy search) work out which PDF page that
+        offset falls on, to jump the viewer there. Only pages that actually
+        contributed text have an entry (a page skipped entirely — blank,
+        unreadable, no OCR — has none), so this does NOT simply map to
+        every page 1..pages_extracted.
     """
     info = {
         "pages": 0,
@@ -422,6 +431,7 @@ def extract_text_from_pdf(
         "used_ocr": False,
         "ocr_available": tesseract_available(),
         "garbage_text_layer": False,
+        "page_ranges": [],
     }
 
     try:
@@ -441,6 +451,7 @@ def extract_text_from_pdf(
     info["pages_extracted"] = pages_to_read
 
     text_parts: list[str] = []
+    page_numbers: list[int] = []  # 1-based PDF page number for each text_parts entry, parallel list
     pages_with_text = 0
     pages_via_ocr = 0
     pages_garbage = 0
@@ -461,6 +472,7 @@ def extract_text_from_pdf(
 
         if usable_text:
             text_parts.append(page_text)
+            page_numbers.append(i + 1)
             pages_with_text += 1
         elif info["ocr_available"]:
             # Either an image-only page, a corrupted text layer, or force_ocr:
@@ -468,14 +480,17 @@ def extract_text_from_pdf(
             ocr_text = _ocr_page(pdf_path, i)
             if ocr_text and not _looks_like_garbage(ocr_text):
                 text_parts.append(ocr_text)
+                page_numbers.append(i + 1)
                 pages_via_ocr += 1
             elif non_ws >= 30 and not is_garbage:
                 # OCR couldn't help (e.g. no rasterizer) but the text layer
                 # was actually fine — keep it.
                 text_parts.append(page_text)
+                page_numbers.append(i + 1)
                 pages_with_text += 1
             elif ocr_text:
                 text_parts.append(ocr_text)
+                page_numbers.append(i + 1)
                 pages_via_ocr += 1
             # else: both empty/garbage → contribute nothing for this page
         else:
@@ -483,6 +498,7 @@ def extract_text_from_pdf(
             # never emit gibberish into the result.
             if non_ws >= 30 and not is_garbage:
                 text_parts.append(page_text)
+                page_numbers.append(i + 1)
                 pages_with_text += 1
 
     info["has_text_layer"] = pages_with_text > 0
@@ -498,6 +514,16 @@ def extract_text_from_pdf(
         info["method"] = "garbage"
     else:
         info["method"] = "failed"
+
+    # Offsets into the FINAL joined string ("\n\n".join(text_parts)) for each
+    # contributing page, so a character offset found by a text search can be
+    # mapped back to a PDF page number.
+    offset = 0
+    for idx, part in enumerate(text_parts):
+        start = offset
+        end = start + len(part)
+        info["page_ranges"].append({"page": page_numbers[idx], "start": start, "end": end})
+        offset = end + (2 if idx < len(text_parts) - 1 else 0)  # "\n\n" separator
 
     return "\n\n".join(text_parts), info
 
@@ -1226,6 +1252,141 @@ def extract_key_strings(text: str, keys: list[str],
             results[key] = {"value": "", "unit": "", "description": "",
                              "raw": NOT_FOUND, "found": False}
     return results
+
+
+# ---------------------------------------------------------------------------
+# Document date detection — for the "parameter vs. time" plot feature, every
+# uploaded document is scanned once for its OWN date (an issue date, a test
+# date, a certificate date) so a time axis can be built without the user
+# typing one in by hand. This only PROPOSES a value: the DMS UI always gives
+# the user a chance to review/correct it before treating it as verified.
+# ---------------------------------------------------------------------------
+
+# Labels that precede a document's own date across engineering / certificate
+# style paperwork (English + Chinese). Checked most-specific-first, since a
+# generic "Date" (or 日期) also matches inside "Issue Date" etc. — putting it
+# last means a specific label wins whenever both would otherwise fire on the
+# same text. Reuses extract_key_strings' same-line value capture, so the
+# same "value must sit right after the label" discipline applies here too.
+_DATE_LABELS = [
+    "Issue Date", "Effective Date", "Test Date", "Inspection Date",
+    "Certificate Date", "Cert Date", "Report Date", "Manufacture Date",
+    "Signed Date", "Dated", "Issued", "Manufactured", "Signed",
+    "签发日期", "检验日期", "检测日期", "报告日期", "生产日期", "出厂日期", "签署日期",
+    "Date", "日期",
+]
+
+_MONTH_NAMES = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+    "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+}
+
+# Numeric/textual date shapes, tried in order from least to most ambiguous.
+_ISO_DATE_RE = re.compile(r"(?P<y>\d{4})[-/.](?P<m>\d{1,2})[-/.](?P<d>\d{1,2})\b")
+_CJK_DATE_RE = re.compile(r"(?P<y>\d{4})\s*年\s*(?P<m>\d{1,2})\s*月(?:\s*(?P<d>\d{1,2})\s*日)?")
+_TEXT_DATE_RE = re.compile(
+    r"\b(?P<mon1>[A-Za-z]{3,9})\.?\s+(?P<d1>\d{1,2})(?:st|nd|rd|th)?,?\s+(?P<y1>\d{4})\b"
+    r"|\b(?P<d2>\d{1,2})(?:st|nd|rd|th)?\s+(?P<mon2>[A-Za-z]{3,9})\.?,?\s+(?P<y2>\d{4})\b"
+)
+# D/M/Y or M/D/Y — genuinely ambiguous, so tried last (see _parse_date_snippet).
+_SLASH_DATE_RE = re.compile(r"\b(?P<a>\d{1,2})[-/](?P<b>\d{1,2})[-/](?P<y>\d{4})\b")
+
+
+def _to_iso_date(year: int, month: int, day: int) -> Optional[str]:
+    """Validate a (year, month, day) triple as a real calendar date, formatted
+    as YYYY-MM-DD, or None if it isn't one (e.g. day=31 in February) — never
+    guess at an invalid date."""
+    try:
+        return datetime.date(year, month, day).isoformat()
+    except ValueError:
+        return None
+
+
+def _parse_date_snippet(s: str) -> Optional[tuple]:
+    """Try each known date shape against a text snippet (a label's captured
+    value, or a whole document for the unlabeled fallback scan) and return
+    the first parseable (iso_date, matched_substring), or None.
+
+    Order matters: unambiguous formats (ISO, Chinese, spelled-out month) are
+    tried before the ambiguous D/M-vs-M/D slash format, so e.g. "2024-05-13"
+    is never mis-read as day-first.
+    """
+    m = _ISO_DATE_RE.search(s)
+    if m:
+        iso = _to_iso_date(int(m["y"]), int(m["m"]), int(m["d"]))
+        if iso:
+            return iso, m.group(0)
+
+    m = _CJK_DATE_RE.search(s)
+    if m:
+        iso = _to_iso_date(int(m["y"]), int(m["m"]), int(m["d"]) if m["d"] else 1)
+        if iso:
+            return iso, m.group(0)
+
+    m = _TEXT_DATE_RE.search(s)
+    if m:
+        if m["mon1"]:
+            mon, day, year = m["mon1"], m["d1"], m["y1"]
+        else:
+            mon, day, year = m["mon2"], m["d2"], m["y2"]
+        month = _MONTH_NAMES.get(mon.lower())
+        if month:
+            iso = _to_iso_date(int(year), month, int(day))
+            if iso:
+                return iso, m.group(0)
+
+    m = _SLASH_DATE_RE.search(s)
+    if m:
+        a, b, year = int(m["a"]), int(m["b"]), int(m["y"])
+        # Ambiguous D/M vs M/D. If only one side can be a month, the other
+        # must be the day; otherwise assume month-first (US convention,
+        # matching this app's English-first engineering-document focus).
+        if a > 12 and b <= 12:
+            month, day = b, a
+        else:
+            month, day = a, b
+        iso = _to_iso_date(year, month, day)
+        if iso:
+            return iso, m.group(0)
+
+    return None
+
+
+def find_document_date(text: str) -> dict:
+    """Scan a document's extracted text for its own date.
+
+    Two passes, same "prefer no match over a wrong one" spirit as the rest
+    of this module:
+      1. High confidence — a value captured right after a recognized date
+         label (Issue Date, Dated, 日期, ...).
+      2. Low confidence — no labeled date found, so fall back to the first
+         date-shaped substring found anywhere in the document.
+
+    Returns {"date": "YYYY-MM-DD" | None, "raw": <matched text> | None,
+    "confidence": "high" | "low" | None}. `raw` is kept so the UI can show
+    the user what text the guess came from when asking them to verify it.
+    """
+    empty = {"date": None, "raw": None, "confidence": None}
+    if not text:
+        return empty
+
+    labeled = extract_key_strings(text, _DATE_LABELS, same_line_only=True)
+    for label in _DATE_LABELS:
+        row = labeled.get(label)
+        if row and row.get("found"):
+            parsed = _parse_date_snippet(row["raw"])
+            if parsed:
+                iso, raw = parsed
+                return {"date": iso, "raw": raw, "confidence": "high"}
+
+    parsed = _parse_date_snippet(text)
+    if parsed:
+        iso, raw = parsed
+        return {"date": iso, "raw": raw, "confidence": "low"}
+
+    return empty
 
 
 # ---------------------------------------------------------------------------

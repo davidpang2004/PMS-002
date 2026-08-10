@@ -2514,6 +2514,146 @@ def get_doc(doc_id):
     )
 
 
+def _default_downloads_dir() -> Path:
+    """Best-effort OS "Downloads" folder, falling back to the home directory."""
+    d = Path.home() / "Downloads"
+    return d if d.exists() else Path.home()
+
+
+def _safe_file_name(name: str) -> str:
+    """Return a filesystem-safe file name, preserving the extension where possible."""
+    safe = re.sub(r'[/\\:*?"<>|\x00-\x1f]', '_', (name or "").strip()).strip('. ') or "document"
+    if len(safe) > 150:
+        stem, dot, ext = safe.rpartition('.')
+        safe = (stem[:150 - len(ext) - 1] + '.' + ext) if (dot and len(ext) <= 10) else safe[:150]
+    return safe
+
+
+def _unique_dest_path(dest: Path) -> Path:
+    """If dest already exists, append ' (n)' before the extension until the name is free."""
+    if not dest.exists():
+        return dest
+    stem, suffix, n = dest.stem, dest.suffix, 1
+    while True:
+        candidate = dest.with_name(f"{stem} ({n}){suffix}")
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
+@app.route("/api/default-download-folder", methods=["GET"])
+def default_download_folder():
+    """Return the OS default Downloads folder, used to prefill the download dialog."""
+    return jsonify({"path": str(_default_downloads_dir())})
+
+
+@app.route("/api/docs/download-to-folder", methods=["POST"])
+def download_docs_to_folder():
+    """Copy the selected documents' files to a folder on disk (defaults to Downloads).
+
+    Request JSON:
+      { "doc_ids": ["DOC-...", ...], "target_path": "<optional, absolute path>", "reveal": bool }
+
+    Response: { "ok": true, "count": N, "skipped": [doc_id, ...], "folder": "<path>" }
+    """
+    docs_dir = get_docs_dir()
+    if not docs_dir:
+        return jsonify({"error": "Storage path not configured"}), 503
+
+    data = request.get_json(force=True) or {}
+    doc_ids = data.get("doc_ids") or []
+    if not doc_ids:
+        return jsonify({"error": "No documents selected"}), 400
+
+    target_path = (data.get("target_path") or "").strip() or str(_default_downloads_dir())
+    target = Path(target_path).expanduser().resolve()
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return jsonify({"error": f"Cannot create target folder: {e}"}), 400
+    if not os.access(target, os.W_OK):
+        return jsonify({"error": f"Folder is not writable: {target}"}), 400
+
+    idx = read_index()
+    meta_by_id = {d.get("id"): d for d in idx.get("docIndex", [])}
+
+    copied, skipped = [], []
+    for doc_id in doc_ids:
+        matches = list(docs_dir.rglob(f"{doc_id}__*")) or list(docs_dir.rglob(f"{doc_id}*"))
+        if not matches:
+            skipped.append(doc_id)
+            continue
+        src = matches[0]
+        name = _safe_file_name((meta_by_id.get(doc_id) or {}).get("name") or src.name)
+        dest = _unique_dest_path(target / name)
+        try:
+            shutil.copy2(src, dest)
+            copied.append(dest.name)
+        except OSError:
+            skipped.append(doc_id)
+
+    if data.get("reveal") and copied:
+        try:
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", str(target)])
+            elif sys.platform == "win32":
+                subprocess.Popen(["explorer", str(target)])
+            else:
+                subprocess.Popen(["xdg-open", str(target)])
+        except OSError:
+            pass
+
+    return jsonify({"ok": True, "count": len(copied), "skipped": skipped, "folder": str(target)})
+
+
+@app.route("/api/docs/<doc_id>/rename-file", methods=["POST"])
+def rename_doc_file(doc_id):
+    """Rename the physical file stored on disk for a document.
+
+    This only touches the file — it does NOT update docIndex's "name"
+    field. The client owns docIndex as one client-side array persisted via
+    saveDocumentIndex (see updateDocSn/updateDocMetadata etc.), so the
+    caller is expected to persist the display-name change itself, the same
+    way every other document-metadata edit already works in this app.
+    Splitting it this way avoids a race where this endpoint writes
+    index.json directly and a concurrent full-array save from the client
+    (holding a stale copy) clobbers it right back.
+
+    Request JSON: { "name": "New Name.pdf" }
+    Response: { "ok": true, "filename": "<new disk filename>" }
+    """
+    docs_dir = get_docs_dir()
+    if not docs_dir:
+        return jsonify({"error": "Storage path not configured"}), 503
+    if "/" in doc_id or "\\" in doc_id or ".." in doc_id:
+        return jsonify({"error": "Invalid doc_id"}), 400
+
+    data = request.get_json(force=True) or {}
+    new_name = (data.get("name") or "").strip()
+    if not new_name:
+        return jsonify({"error": "name is required"}), 400
+
+    matches = list(docs_dir.rglob(f"{doc_id}__*")) or list(docs_dir.rglob(f"{doc_id}*"))
+    if not matches:
+        return jsonify({"error": "Document file not found"}), 404
+    src = matches[0]
+
+    safe_name = _safe_filename_part(new_name)
+    if not Path(safe_name).suffix and src.suffix:
+        safe_name = f"{safe_name}{src.suffix}"
+    dest = src.parent / f"{doc_id}__{safe_name}"
+
+    if dest != src:
+        if dest.exists():
+            return jsonify({"error": "A file with that name already exists"}), 409
+        try:
+            src.rename(dest)
+        except OSError as e:
+            return jsonify({"error": f"Rename failed: {e}"}), 500
+
+    return jsonify({"ok": True, "filename": dest.name})
+
+
 @app.route("/api/docs", methods=["POST"])
 def post_doc():
     """Upload a document. Expects multipart form: file=<binary>, doc_id=<DOC-ID>."""
@@ -2591,6 +2731,26 @@ def post_doc():
     out_path = out_dir / f"{doc_id}__{safe_name}"
     out_path.write_bytes(file_data)
 
+    # Scan the document's own text for a date (for the "parameter vs. time"
+    # plot feature) so the client can propose it as the document's date right
+    # away, without a separate round trip. Only the first page is read (a
+    # document's own date is almost always on its cover/header, and this
+    # keeps the cost bounded — full extraction, run on demand elsewhere in
+    # the app, reads up to 50 pages and can be much slower). Best-effort:
+    # any failure here must never fail the upload itself.
+    detected_date, detected_date_raw, detected_date_confidence = None, None, None
+    try:
+        import pdf_extraction
+        if out_path.suffix.lower() == ".pdf" or out_path.suffix.lower() in pdf_extraction.IMAGE_EXTS:
+            date_text, _date_info = pdf_extraction.extract_text_from_file(out_path, max_pages=1)
+            if date_text:
+                date_guess = pdf_extraction.find_document_date(date_text)
+                detected_date = date_guess.get("date")
+                detected_date_raw = date_guess.get("raw")
+                detected_date_confidence = date_guess.get("confidence")
+    except Exception as e:
+        print(f"[DMS] Date scan failed for {orig_name!r} (non-fatal): {e}")
+
     location = None
     gps_lat, gps_lon = None, None
     if photo_lat and photo_lon:
@@ -2616,7 +2776,9 @@ def post_doc():
 
     return jsonify({"ok": True, "filename": out_path.name, "size": out_path.stat().st_size,
                     "path": str(out_path), "location": location,
-                    "lat": gps_lat, "lon": gps_lon})
+                    "lat": gps_lat, "lon": gps_lon,
+                    "detectedDate": detected_date, "detectedDateRaw": detected_date_raw,
+                    "detectedDateConfidence": detected_date_confidence})
 
 
 @app.route("/api/docs/<doc_id>/preview", methods=["GET"])
@@ -4310,6 +4472,61 @@ def ask_ai():
     })
 
 
+@app.route("/api/ai-fit-trend", methods=["POST"])
+def ai_fit_trend():
+    """Fit a trend to a parameter-vs-time series and get Gemini's plain-
+    language comment on it (opt-in, same key as /api/ai-settings). The
+    frontend (FolderPlotDialog) has already computed the points -- this
+    just sends the numbers off for a read, no document access needed.
+
+    Body: { "param": str, "unit": str, "points": [{"date": str, "value":
+    number}, ...], "lang": "zh"|"en" }
+    Returns { ok, comment }.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    param = (data.get("param") or "").strip()
+    unit = (data.get("unit") or "").strip()
+    lang = (data.get("lang") or "zh").strip()
+    points = data.get("points")
+    if not param:
+        return jsonify({"error": "Provide a non-empty 'param'"}), 400
+    if not isinstance(points, list) or not points:
+        return jsonify({"error": "没有可供分析的数据点。"}), 400
+
+    cfg = load_config()
+    enc = cfg.get("gemini_api_key_enc", "")
+    if not enc:
+        return jsonify({"error": "未配置 Gemini API Key，请先在设置中添加。"}), 400
+    try:
+        api_key = decrypt_secret(enc)
+    except Exception:
+        return jsonify({"error": "无法读取已保存的 API Key，请重新设置。"}), 400
+
+    # Defensive cap -- a folder plot is normally a few dozen points; a huge
+    # payload would just spend tokens repeating what a sample already shows.
+    clean_points = []
+    for p in points[:500]:
+        if not isinstance(p, dict):
+            continue
+        date = str(p.get("date") or "").strip()
+        try:
+            value = float(p.get("value"))
+        except (TypeError, ValueError):
+            continue
+        if date:
+            clean_points.append({"date": date, "value": value})
+    if not clean_points:
+        return jsonify({"error": "没有可供分析的数据点。"}), 400
+
+    try:
+        import ai_extraction
+        result = ai_extraction.comment_on_trend_with_gemini(param, unit, clean_points, api_key, lang=lang)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"ok": True, "comment": result["comment"]})
+
+
 @app.route("/api/docs/<doc_id>/extract-keys-ai", methods=["POST"])
 def post_doc_extract_keys_ai(doc_id):
     """AI-assisted key-parameter extraction via Gemini (opt-in).
@@ -4644,6 +4861,13 @@ def combine_to_folder():
             tree=idx.get("tree"),
             title=title or "Combined",
             subtitle="",
+            # "Merge documents" is a quick action, not a formal deliverable
+            # like the Databook export — skip the auto-generated title/TOC
+            # cover sheet (per-document bookmarks still provide navigation),
+            # and normalize every page to portrait so mixed-orientation
+            # source PDFs don't leave the merged file with sideways pages.
+            include_cover=False,
+            force_portrait=True,
         )
     except ImportError as e:
         return jsonify({
@@ -4660,13 +4884,19 @@ def combine_to_folder():
         traceback.print_exc()
         return jsonify({"error": f"Combine failed: {e}"}), 500
 
-    # Persist the combined PDF in the docs directory
+    tree = idx.get("tree")
+
+    # Persist the combined PDF into the on-disk folder for the target node
+    # (mirrors how uploads are placed via _get_node_docs_dir) so the merged
+    # file actually shows up in the corresponding hard-drive folder instead
+    # of landing in the flat docs root.
     new_doc_id = "DOC-" + datetime.now().strftime("%Y%m%d") + "-" + secrets.token_hex(4).upper()
     display_name = title.strip() or "Combined"
     if not display_name.lower().endswith(".pdf"):
         display_name += ".pdf"
     safe_fn = _safe_filename_part(display_name)
-    out_path = docs_dir / f"{new_doc_id}__{safe_fn}"
+    out_dir = _get_node_docs_dir(node_id, tree) or docs_dir
+    out_path = out_dir / f"{new_doc_id}__{safe_fn}"
     out_path.write_bytes(pdf_bytes)
 
     # Add the new combined doc to docIndex
@@ -4688,8 +4918,49 @@ def combine_to_folder():
         dids = entry.get("docIds") or []
         if nid and dids:
             to_unlink.setdefault(nid, set()).update(dids)
+    unlinked_doc_ids = {d for ids in to_unlink.values() for d in ids}
 
-    # Walk the tree: unlink source docs and attach the new combined doc
+    # The merged-away source documents are unlinked from the tree but kept in
+    # the library (per the confirmation text shown in the UI). Move them into
+    # the "Not Show in Tree" recycle bin — in the tree/docIndex bookkeeping
+    # *and* physically on disk — so they stop appearing in their old
+    # hard-drive folder instead of drifting out of sync with it. This mirrors
+    # the soft-delete behavior in delete_node().
+    not_show_id = None
+    if tree and unlinked_doc_ids:
+        for child in (tree.get("children") or []):
+            if child.get("name") == NOT_SHOW_FOLDER_NAME:
+                not_show_id = child["id"]
+                break
+        if not_show_id is None:
+            not_show_id = f"NODE-{secrets.token_hex(4).upper()}"
+            tree.setdefault("children", []).append(
+                {"id": not_show_id, "name": NOT_SHOW_FOLDER_NAME, "children": [], "documents": []}
+            )
+
+        recycle_folder = _get_node_docs_dir(not_show_id, tree)
+        if recycle_folder:
+            recycle_folder.mkdir(parents=True, exist_ok=True)
+
+        for doc_id in unlinked_doc_ids:
+            matches = list(docs_dir.rglob(f"{doc_id}__*")) or list(docs_dir.rglob(f"{doc_id}*"))
+            if not matches or not recycle_folder:
+                continue
+            dest = recycle_folder / matches[0].name
+            if dest.exists():
+                continue
+            try:
+                shutil.move(str(matches[0]), str(dest))
+            except OSError as e:
+                print(f"[DMS] Warning: could not move {doc_id} to recycle bin: {e}")
+
+        # Redirect docIndex bookkeeping to match the new physical location.
+        for d in idx.get("docIndex", []):
+            if d.get("id") in unlinked_doc_ids:
+                d["originalNodeId"] = not_show_id
+
+    # Walk the tree: unlink source docs, attach the new combined doc, and (if
+    # applicable) list the unlinked docs under the recycle bin node.
     def _update_node(node):
         nid = node.get("id", "")
         if nid in to_unlink:
@@ -4699,11 +4970,16 @@ def combine_to_folder():
             ]
         if nid == node_id:
             node.setdefault("documents", []).append({"id": new_doc_id})
+        if not_show_id and nid == not_show_id:
+            existing = {d.get("id") for d in (node.get("documents") or [])}
+            node.setdefault("documents", []).extend(
+                {"id": d} for d in unlinked_doc_ids if d not in existing
+            )
         for child in (node.get("children") or []):
             _update_node(child)
 
-    if idx.get("tree"):
-        _update_node(idx["tree"])
+    if tree:
+        _update_node(tree)
 
     write_index(idx)
 
