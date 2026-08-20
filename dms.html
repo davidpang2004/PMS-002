@@ -72,6 +72,27 @@ const splitActualString = (raw) => {
   return { value, unit, description: [before, after].filter(Boolean).join(" ") };
 };
 
+// ---- Per-folder metadata overrides (for documents linked into multiple
+// folders) ---------------------------------------------------------------
+// A document's `metadata` on its docIndex record is the shared/base value,
+// same as before this feature existed. A doc that's linked into more than
+// one folder can *additionally* carry `metaOverrides: { [nodeId]: {...} }`
+// — small per-field overrides that only apply when viewing/editing the doc
+// through that one folder. Folders with no override for a field just fall
+// through to the shared base value (copy-on-write: nothing forks until
+// someone actually edits a field while looking at a specific folder).
+// A removed field is recorded as `{ __deleted: true }` so "this folder
+// doesn't show this field" can be distinguished from "no override yet".
+const effectiveMetadata = (baseMetadata, override) => {
+  if (!override) return baseMetadata || {};
+  const merged = { ...(baseMetadata || {}) };
+  for (const [k, v] of Object.entries(override)) {
+    if (v && v.__deleted) delete merged[k];
+    else merged[k] = v;
+  }
+  return merged;
+};
+
 const LangContext = React.createContext({ lang: "zh", t: (zh) => zh, setLang: () => {} });
 const useLang = () => React.useContext(LangContext);
 // For plain (non-component) code, like StorageAdapter, that has no access to useLang().
@@ -179,6 +200,12 @@ const Hash = (p) => (
   <I {...p}>
     <line x1="4" y1="9" x2="20" y2="9" /><line x1="4" y1="15" x2="20" y2="15" />
     <line x1="10" y1="3" x2="8" y2="21" /><line x1="16" y1="3" x2="14" y2="21" />
+  </I>
+);
+const Lock = (p) => (
+  <I {...p}>
+    <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
+    <path d="M7 11V7a5 5 0 0 1 10 0v4" />
   </I>
 );
 const Calendar = (p) => (
@@ -649,6 +676,11 @@ const StorageAdapter = {
     return this._json("/api/default-download-folder");
   },
 
+  async browseFolder(path) {
+    const qs = path ? `?path=${encodeURIComponent(path)}` : "";
+    return this._json(`/api/browse-folder${qs}`);
+  },
+
   async downloadDocsToFolder(docIds, targetPath, reveal = true) {
     return this._json("/api/docs/download-to-folder", {
       method: "POST",
@@ -888,6 +920,17 @@ const collectAllDocIds = (node, acc = []) => {
   if (!node) return acc;
   (node.documents || []).forEach((d) => acc.push(d.id));
   (node.children || []).forEach((c) => collectAllDocIds(c, acc));
+  return acc;
+};
+
+// Same walk, but keeps which node each reference came through — needed so a
+// document linked into two folders in scope (e.g. one summary report linked
+// under two different accounts) can resolve each occurrence's own
+// per-folder metadata override rather than collapsing to a single doc id.
+const collectAllDocRefs = (node, acc = []) => {
+  if (!node) return acc;
+  (node.documents || []).forEach((d) => acc.push({ id: d.id, nodeId: node.id }));
+  (node.children || []).forEach((c) => collectAllDocRefs(c, acc));
   return acc;
 };
 
@@ -1148,6 +1191,22 @@ const moveNodeToPosition = (root, dragId, targetId, position) => {
   return next;
 };
 
+// The recycle bin ("Not Show in Tree" — shown to the user as "Deleted
+// files") is a holding area, not a regular folder. It's always created as
+// a direct child of root (see getOrCreateNotShowNode), but manual
+// reordering or drag-and-drop could otherwise leave it anywhere among its
+// siblings. Sorting it to the end at render time — rather than trying to
+// block every mutation path that could move it — guarantees it always
+// shows up last regardless of what order is actually stored.
+const NOT_SHOW_FOLDER_NAME = "Not Show in Tree";
+const sortRecycleBinLast = (children) => {
+  const list = children || [];
+  if (list.length < 2) return list;
+  const bin = list.filter((c) => c.name === NOT_SHOW_FOLDER_NAME);
+  if (!bin.length) return list;
+  return [...list.filter((c) => c.name !== NOT_SHOW_FOLDER_NAME), ...bin];
+};
+
 // Deep-merge `dragged` node into `existing` node (same name).
 // Returns { mergedNode, docRemap: Map<docId, newNodeId> } where docRemap
 // holds every doc whose originalNodeId must be updated in the index.
@@ -1265,7 +1324,7 @@ const TreeNode = ({
   const docCount = (node.documents || []).length;
   const isLast = siblingIndex === siblingCount - 1;
   const isPhotoRoot = node.id === photoRootNodeId;
-  const isRecycleBin = node.name === "Not Show in Tree";
+  const isRecycleBin = node.name === NOT_SHOW_FOLDER_NAME;
   const currentParentLines = parentLines || [];
   const isDragging = draggingId === node.id;
   const isDropTarget = dropInfo?.targetId === node.id;
@@ -1511,7 +1570,7 @@ const TreeNode = ({
         </div>
       )}
 
-      {isExpanded && (node.children || []).map((child, i) => (
+      {isExpanded && sortRecycleBinLast(node.children).map((child, i) => (
         <TreeNode
           key={child.id}
           node={child}
@@ -1520,7 +1579,7 @@ const TreeNode = ({
           expandedIds={expandedIds}
           isRoot={false}
           siblingIndex={i}
-          siblingCount={(node.children || []).length}
+          siblingCount={sortRecycleBinLast(node.children).length}
           parentLines={isRoot ? [] : [...currentParentLines, !isLast]}
           renamingId={renamingId}
           addingChildToId={addingChildToId}
@@ -2784,10 +2843,17 @@ const ImeInput = ({ value, onCommit, placeholder, className }) => {
   );
 };
 
-const MetadataEditor = ({ metadata, onChange, keyParameters = [] }) => {
+// `baseMetadata`: when set (doc is linked into other folders too), each
+// field is compared against the doc's shared base value so a small
+// "folder-specific" badge can be shown next to any field that has already
+// forked away from the shared value for this folder. `null`/omitted means
+// the doc isn't multi-linked (or we're not in a folder context) — no badges.
+const MetadataEditor = ({ metadata, onChange, keyParameters = [], baseMetadata = null }) => {
   const { t } = useLang();
   const entries = Object.entries(metadata || {});
   const suggestions = normalizeKeyParameters(keyParameters);
+  const isOverridden = (key, val) =>
+    !!baseMetadata && JSON.stringify(baseMetadata[key]) !== JSON.stringify(val);
 
   const updateKey = (oldKey, newKey) => {
     const clean = (newKey || "").trim();
@@ -2922,6 +2988,14 @@ const MetadataEditor = ({ metadata, onChange, keyParameters = [] }) => {
           <div key={key} className="space-y-1">
             <div className="flex gap-1.5 items-center">
               <FieldKeyPicker currentKey={key} />
+              {isOverridden(key, val) && (
+                <span
+                  className="text-[9px] px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700 border border-amber-300 shrink-0"
+                  title={t("此字段的值仅对当前文件夹生效，其他链接此文档的文件夹不受影响", "This field's value only applies to the current folder — other folders linking this document are unaffected")}
+                >
+                  {t("本文件夹专属", "This folder only")}
+                </span>
+              )}
               <button onClick={() => removeField(key)} className="text-stone-400 hover:text-red-600 p-1 ml-auto">
                 <X size={12} />
               </button>
@@ -3793,10 +3867,19 @@ const formatAxisDate = (iso, spanDays) => {
   return `${m}-${d}`;
 };
 
-const TimeSeriesChart = ({ points, paramName, unit, onPointClick, width = 680, height = 300 }) => {
+const TimeSeriesChart = ({ points, paramName, unit, onPointClick, width = 680, height = 300, timeRange = null, valueRange = null }) => {
+  const { t } = useLang();
   const svgRef = useRef(null);
   const [hoverIdx, setHoverIdx] = useState(null);
   const [tooltipPos, setTooltipPos] = useState(null); // {x, y} in SVG viewBox coords
+
+  // Click a point to set it as the "base" for annualized-return %s shown
+  // near every later point (points after it, chronologically). Reset
+  // whenever the series itself changes (new parameter/field/scope) — `points`
+  // is memoized by the caller, so this only fires on a real change, not on
+  // every re-render.
+  const [baseIdx, setBaseIdx] = useState(null);
+  useEffect(() => { setBaseIdx(null); }, [points]);
 
   const margin = { top: 18, right: 24, bottom: 28, left: 60 };
   const innerW = width - margin.left - margin.right;
@@ -3804,17 +3887,35 @@ const TimeSeriesChart = ({ points, paramName, unit, onPointClick, width = 680, h
 
   if (!points || points.length === 0) return null;
 
+  // A manually-set axis range (see AxisRangeControls) overrides the default
+  // auto-fit-to-data domain below -- like setting axis min/max in a
+  // spreadsheet chart. Data outside the range stays in the line path (so it
+  // still reads as one continuous series) but ends up outside the SVG's own
+  // 0..width / 0..height box, which browsers clip to by default -- no
+  // explicit clipPath needed. Dots/hover/the end-of-line label are drawn
+  // only for points actually inside the domain (see visiblePoints below),
+  // so nothing interactive ever points at something the clip hid.
+  const hasTimeRange = timeRange && Number.isFinite(timeRange.min) && Number.isFinite(timeRange.max) && timeRange.max > timeRange.min;
+  const hasValueRange = valueRange && Number.isFinite(valueRange.min) && Number.isFinite(valueRange.max) && valueRange.max > valueRange.min;
+
   // `points` is already sorted chronologically by the caller, and min/max are
   // taken with a reduce rather than Math.min(...values) -- spreading into a
   // function call has a browser-dependent argument-count ceiling that a
   // folder with a few thousand documents could realistically hit.
-  let tMin = points[0].t, tMax = points[points.length - 1].t;
+  let tMin = hasTimeRange ? timeRange.min : points[0].t;
+  let tMax = hasTimeRange ? timeRange.max : points[points.length - 1].t;
   if (tMin === tMax) { tMin -= 86400000; tMax += 86400000; } // pad 1 day so a single point isn't div-by-zero
   const spanDays = (tMax - tMin) / 86400000;
 
-  let vMin = Infinity, vMax = -Infinity;
-  for (const p of points) { if (p.value < vMin) vMin = p.value; if (p.value > vMax) vMax = p.value; }
-  const { min: yMin, max: yMax, ticks: yTicks } = niceTicks(vMin, vMax, 5);
+  let yMin, yMax, yTicks;
+  if (hasValueRange) {
+    yMin = valueRange.min; yMax = valueRange.max;
+    yTicks = Array.from({ length: 5 }, (_, i) => yMin + (i / 4) * (yMax - yMin));
+  } else {
+    let vMin = Infinity, vMax = -Infinity;
+    for (const p of points) { if (p.value < vMin) vMin = p.value; if (p.value > vMax) vMax = p.value; }
+    ({ min: yMin, max: yMax, ticks: yTicks } = niceTicks(vMin, vMax, 5));
+  }
   const yRange = (yMax - yMin) || 1;
 
   const xScale = (tms) => margin.left + ((tms - tMin) / (tMax - tMin)) * innerW;
@@ -3822,9 +3923,24 @@ const TimeSeriesChart = ({ points, paramName, unit, onPointClick, width = 680, h
 
   const linePath = points.map((p, i) => `${i === 0 ? "M" : "L"}${xScale(p.t)},${yScale(p.value)}`).join(" ");
 
+  // Points actually inside the visible domain -- dots, hover targeting, and
+  // the "value at line's end" label are all scoped to these, not the full
+  // series, whenever a custom range is active.
+  const visiblePoints = (hasTimeRange || hasValueRange)
+    ? points.filter((p) => p.t >= tMin && p.t <= tMax && p.value >= yMin && p.value <= yMax)
+    : points;
+
+  if (visiblePoints.length === 0) {
+    return (
+      <div className="w-full h-full min-h-[120px] flex items-center justify-center text-center text-xs text-stone-400 border border-dashed border-stone-200 rounded p-4">
+        {t("所选坐标轴范围内没有数据点。", "No data points fall within the selected axis range.")}
+      </div>
+    );
+  }
+
   // A handful of evenly-spaced x ticks across the time domain (not one per
   // point — that would collide on any folder with more than a few documents).
-  const xTickCount = Math.min(6, Math.max(2, points.length));
+  const xTickCount = Math.min(6, Math.max(2, visiblePoints.length));
   const xTicks = Array.from({ length: xTickCount }, (_, i) => tMin + (i / (xTickCount - 1)) * (tMax - tMin));
 
   const handleMove = (e) => {
@@ -3832,30 +3948,63 @@ const TimeSeriesChart = ({ points, paramName, unit, onPointClick, width = 680, h
     if (!svg) return;
     const rect = svg.getBoundingClientRect();
     const pt = ((e.clientX - rect.left) / rect.width) * width; // viewBox-space x
-    // nearest point by x
+    // nearest visible point by x
     let nearest = 0, nearestDist = Infinity;
-    points.forEach((p, i) => {
+    visiblePoints.forEach((p, i) => {
       const dist = Math.abs(xScale(p.t) - pt);
       if (dist < nearestDist) { nearestDist = dist; nearest = i; }
     });
     setHoverIdx(nearest);
-    setTooltipPos({ x: xScale(points[nearest].t), y: yScale(points[nearest].value) });
+    setTooltipPos({ x: xScale(visiblePoints[nearest].t), y: yScale(visiblePoints[nearest].value) });
   };
   const handleLeave = () => { setHoverIdx(null); setTooltipPos(null); };
 
-  const lastPoint = points[points.length - 1];
+  const lastPoint = visiblePoints[visiblePoints.length - 1];
   const lastLabel = unit ? `${lastPoint.value} ${unit}` : `${lastPoint.value}`;
 
+  const basePoint = baseIdx != null ? visiblePoints[baseIdx] : null;
+
+  // Annualized return (CAGR) of point `p` relative to the base point:
+  // (value/baseValue)^(365.25/daysElapsed) - 1. Only meaningful for points
+  // strictly after the base and when both values are positive (a fractional
+  // power of a non-positive ratio isn't a real percentage) — returns null
+  // otherwise, so the caller just skips the label.
+  const yearlyReturnPct = (p) => {
+    if (!basePoint || p.t <= basePoint.t || basePoint.value === 0) return null;
+    const ratio = p.value / basePoint.value;
+    if (ratio <= 0) return null;
+    const years = (p.t - basePoint.t) / 86400000 / 365.25;
+    if (years <= 0) return null;
+    return (Math.pow(ratio, 1 / years) - 1) * 100;
+  };
+
+  // Point-to-point (chained) annualized return: same CAGR math as
+  // yearlyReturnPct, but measured from the *immediately preceding* point
+  // instead of the fixed base — i.e. "how fast did this leg of the series
+  // grow", as opposed to "how fast has it grown since the base overall".
+  // Independent of which point is the base; only needs a predecessor to
+  // exist, so it's shown for every point after the first.
+  const chainedReturnPct = (i) => {
+    if (i <= 0) return null;
+    const prev = visiblePoints[i - 1], cur = visiblePoints[i];
+    if (prev.value === 0) return null;
+    const ratio = cur.value / prev.value;
+    if (ratio <= 0) return null;
+    const years = (cur.t - prev.t) / 86400000 / 365.25;
+    if (years <= 0) return null;
+    return (Math.pow(ratio, 1 / years) - 1) * 100;
+  };
+
   return (
-    <div className="relative">
+    <div className="relative w-full h-full">
       <svg
         ref={svgRef}
         viewBox={`0 0 ${width} ${height}`}
-        className="w-full h-auto touch-none"
+        className="w-full h-full touch-none"
         onMouseMove={handleMove}
         onMouseLeave={handleLeave}
         role="img"
-        aria-label={`${paramName}${unit ? ` (${unit})` : ""} vs. time, ${points.length} data point${points.length === 1 ? "" : "s"}`}
+        aria-label={`${paramName}${unit ? ` (${unit})` : ""} vs. time, ${visiblePoints.length} data point${visiblePoints.length === 1 ? "" : "s"}`}
       >
         {/* Gridlines + y-axis labels */}
         {yTicks.map((tv) => (
@@ -3883,24 +4032,67 @@ const TimeSeriesChart = ({ points, paramName, unit, onPointClick, width = 680, h
         {/* Crosshair */}
         {hoverIdx != null && (
           <line
-            x1={xScale(points[hoverIdx].t)} x2={xScale(points[hoverIdx].t)}
+            x1={xScale(visiblePoints[hoverIdx].t)} x2={xScale(visiblePoints[hoverIdx].t)}
             y1={margin.top} y2={height - margin.bottom}
             stroke="#a8a29e" strokeWidth="1"
+          />
+        )}
+
+        {/* Persistent base-point marker (distinct dashed line, stays put
+            regardless of hover) so it's clear which point the %/yr labels
+            below are measured from. */}
+        {basePoint && (
+          <line
+            x1={xScale(basePoint.t)} x2={xScale(basePoint.t)}
+            y1={margin.top} y2={height - margin.bottom}
+            stroke="#6366f1" strokeWidth="1" strokeDasharray="4 3"
           />
         )}
 
         {/* Line */}
         <path d={linePath} fill="none" stroke="#d97706" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
 
-        {/* Dots (>=8px, 2px surface ring) + hit targets */}
-        {points.map((p, i) => (
-          <g key={p.docId + i} className={onPointClick ? "cursor-pointer" : ""}
-            onClick={() => onPointClick && onPointClick(p.docId)}>
-            <circle cx={xScale(p.t)} cy={yScale(p.value)} r="12" fill="transparent" />
-            <circle cx={xScale(p.t)} cy={yScale(p.value)} r={i === hoverIdx ? 6 : 5}
-              fill="#d97706" stroke="#fff" strokeWidth="2" />
-          </g>
-        ))}
+        {/* Dots (>=8px, 2px surface ring) + hit targets. Click sets/clears the
+            base point (for the %/yr labels); double-click still opens the
+            source document, same as a plain click used to. */}
+        {visiblePoints.map((p, i) => {
+          const isBase = i === baseIdx;
+          // Both labels only appear once a base is selected — keeps the
+          // chart uncluttered by default and keeps the two %s scoped to the
+          // same "following points" range, so they read as two answers to
+          // the same question rather than two unrelated overlays.
+          const pctVsBase = basePoint && i > baseIdx ? yearlyReturnPct(p) : null;
+          const pctChained = basePoint && i > baseIdx ? chainedReturnPct(i) : null;
+          return (
+            <g key={p.docId + i} className="cursor-pointer"
+              onClick={() => setBaseIdx((cur) => (cur === i ? null : i))}
+              onDoubleClick={() => onPointClick && onPointClick(p.docId)}>
+              <circle cx={xScale(p.t)} cy={yScale(p.value)} r="12" fill="transparent" />
+              <circle cx={xScale(p.t)} cy={yScale(p.value)} r={isBase ? 7 : i === hoverIdx ? 6 : 5}
+                fill={isBase ? "#4f46e5" : "#d97706"} stroke="#fff" strokeWidth="2" />
+              {isBase && (
+                <text x={xScale(p.t)} y={yScale(p.value) - 14} textAnchor="middle"
+                  className="fill-indigo-700 font-semibold" fontSize="10" fontFamily="ui-monospace, monospace">
+                  {t("基准", "Base")}
+                </text>
+              )}
+              {/* vs. base (fixed reference, indigo) */}
+              {pctVsBase != null && (
+                <text x={xScale(p.t)} y={yScale(p.value) - 14} textAnchor="middle"
+                  className="fill-indigo-700 font-medium" fontSize="10" fontFamily="ui-monospace, monospace">
+                  {`${pctVsBase >= 0 ? "+" : ""}${pctVsBase.toFixed(1)}%/yr`}
+                </text>
+              )}
+              {/* vs. previous point (chained, teal) — stacked above the base-relative label */}
+              {pctChained != null && (
+                <text x={xScale(p.t)} y={yScale(p.value) - 26} textAnchor="middle"
+                  className="fill-teal-700 font-medium" fontSize="10" fontFamily="ui-monospace, monospace">
+                  {`Δ ${pctChained >= 0 ? "+" : ""}${pctChained.toFixed(1)}%/yr`}
+                </text>
+              )}
+            </g>
+          );
+        })}
 
         {/* Value at the line's end */}
         <text x={xScale(lastPoint.t) + 8} y={yScale(lastPoint.value) - 8}
@@ -3919,11 +4111,240 @@ const TimeSeriesChart = ({ points, paramName, unit, onPointClick, width = 680, h
             maxWidth: "220px",
           }}
         >
-          <div className="font-semibold">{unit ? `${points[hoverIdx].value} ${unit}` : points[hoverIdx].value}</div>
-          <div className="text-stone-300 font-mono">{points[hoverIdx].date}</div>
-          <div className="text-stone-300 truncate">{points[hoverIdx].docName}</div>
+          <div className="font-semibold">{unit ? `${visiblePoints[hoverIdx].value} ${unit}` : visiblePoints[hoverIdx].value}</div>
+          <div className="text-stone-300 font-mono">{visiblePoints[hoverIdx].date}</div>
+          <div className="text-stone-300 truncate">{visiblePoints[hoverIdx].docName}</div>
         </div>
       )}
+
+      <div className="mt-1.5 text-[11px]">
+        {basePoint ? (
+          <span className="flex items-center gap-2 flex-wrap text-stone-600">
+            <span className="text-indigo-700">
+              {t(`基准：${basePoint.date} · ${unit ? `${basePoint.value} ${unit}` : basePoint.value}`,
+                 `Base: ${basePoint.date} · ${unit ? `${basePoint.value} ${unit}` : basePoint.value}`)}
+            </span>
+            <span className="text-stone-400">·</span>
+            <span className="text-indigo-700">{t("靛蓝 = 相对基准的年化收益率", "indigo = annualized return vs. base")}</span>
+            <span className="text-stone-400">·</span>
+            <span className="text-teal-700">{t("青色 Δ = 相对上一点的年化收益率（链式）", "teal Δ = annualized return vs. the previous point (chained)")}</span>
+            <button onClick={() => setBaseIdx(null)} className="text-stone-400 hover:text-stone-600 underline shrink-0">
+              {t("清除基准", "Clear base")}
+            </button>
+          </span>
+        ) : (
+          <span className="text-stone-400">
+            {t("点击一个数据点将其设为基准，之后的数据点会显示相对该基准的年化收益率（双击数据点可打开对应文档）。",
+               "Click a data point to set it as the base — later points will show their annualized return relative to it (double-click a point to open its document).")}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// Plain (not "nice"-rounded) min/max of a series -- used only to seed the
+// custom-range inputs with real numbers the moment "Auto" is unchecked, so
+// there's something to edit immediately instead of two empty boxes (see
+// makeAxisToggleSetter below).
+const autoValueBounds = (points) => {
+  let min = Infinity, max = -Infinity;
+  for (const p of points) { if (p.value < min) min = p.value; if (p.value > max) max = p.value; }
+  return { min: points.length ? min : 0, max: points.length ? max : 0 };
+};
+const autoTimeBounds = (points) => ({
+  min: points.length ? points[0].date : "",
+  max: points.length ? points[points.length - 1].date : "",
+});
+
+// Wraps a setYAxis/setXAxis state setter so that unchecking "Auto" seeds
+// min/max with the current auto-fit range instead of leaving them blank.
+// A custom range only takes effect once BOTH fields are non-empty (see
+// TimeSeriesChart's hasTimeRange/hasValueRange) -- without this, switching
+// to custom and typing into just one box silently does nothing, since the
+// other one is still blank.
+const makeAxisToggleSetter = (setAxis, bounds) => (updater) => {
+  setAxis((prev) => {
+    const next = typeof updater === "function" ? updater(prev) : updater;
+    if (prev.mode === "auto" && next.mode === "custom" && next.min === "" && next.max === "") {
+      const { min, max } = bounds();
+      return { mode: "custom", min: String(min), max: String(max) };
+    }
+    return next;
+  });
+};
+
+/* =============================================================================
+ * UI: AXIS RANGE CONTROLS — small "Auto"/custom min-max toggle for each axis
+ * of a TimeSeriesChart, shared between the in-page FolderPlotDialog and the
+ * popped-out chart window (see PlotPopoutApp). `xAxis`/`yAxis` are plain
+ * { mode: "auto" | "custom", min, max } state objects owned by the caller.
+ * =============================================================================
+ */
+const AxisRangeControls = ({ xAxis, setXAxis, yAxis, setYAxis, unit }) => {
+  const { t } = useLang();
+  const numInput = "w-20 text-xs border border-stone-300 rounded px-1.5 py-0.5 focus:outline-none focus:border-amber-600";
+  return (
+    <div className="flex items-center gap-4 flex-wrap text-[11px]">
+      <div className="flex items-center gap-1.5">
+        <span className="text-stone-500 uppercase tracking-wider">{t("纵轴", "Y axis")}{unit ? ` (${unit})` : ""}</span>
+        <label className="flex items-center gap-1 cursor-pointer text-stone-600">
+          <input
+            type="checkbox"
+            className="accent-amber-600"
+            checked={yAxis.mode === "auto"}
+            onChange={(e) => setYAxis((a) => ({ ...a, mode: e.target.checked ? "auto" : "custom" }))}
+          />
+          {t("自动", "Auto")}
+        </label>
+        {yAxis.mode === "custom" && (
+          <>
+            <input
+              type="number" value={yAxis.min} placeholder={t("最小", "min")}
+              onChange={(e) => setYAxis((a) => ({ ...a, min: e.target.value }))}
+              className={numInput}
+            />
+            <span className="text-stone-300">–</span>
+            <input
+              type="number" value={yAxis.max} placeholder={t("最大", "max")}
+              onChange={(e) => setYAxis((a) => ({ ...a, max: e.target.value }))}
+              className={numInput}
+            />
+          </>
+        )}
+      </div>
+      <div className="flex items-center gap-1.5">
+        <span className="text-stone-500 uppercase tracking-wider">{t("横轴（时间）", "X axis (time)")}</span>
+        <label className="flex items-center gap-1 cursor-pointer text-stone-600">
+          <input
+            type="checkbox"
+            className="accent-amber-600"
+            checked={xAxis.mode === "auto"}
+            onChange={(e) => setXAxis((a) => ({ ...a, mode: e.target.checked ? "auto" : "custom" }))}
+          />
+          {t("自动", "Auto")}
+        </label>
+        {xAxis.mode === "custom" && (
+          <>
+            <input
+              type="date" value={xAxis.min}
+              onChange={(e) => setXAxis((a) => ({ ...a, min: e.target.value }))}
+              className="text-xs border border-stone-300 rounded px-1.5 py-0.5 focus:outline-none focus:border-amber-600"
+            />
+            <span className="text-stone-300">–</span>
+            <input
+              type="date" value={xAxis.max}
+              onChange={(e) => setXAxis((a) => ({ ...a, max: e.target.value }))}
+              className="text-xs border border-stone-300 rounded px-1.5 py-0.5 focus:outline-none focus:border-amber-600"
+            />
+          </>
+        )}
+      </div>
+    </div>
+  );
+};
+
+/* =============================================================================
+ * UI: FOLDER BROWSER DIALOG — server-side drive/folder explorer used to pick
+ * a filesystem path (e.g. for the download-to-folder dialog) without having
+ * to type it by hand. Purely for navigation: it only ever lists folders.
+ * =============================================================================
+ */
+const FolderBrowserModal = ({ startPath, onSelect, onClose }) => {
+  const { t } = useLang();
+  const [state, setState] = useState({ loading: true, path: null, parent: null, entries: [], roots: [], error: "" });
+  const [pathInput, setPathInput] = useState(startPath || "");
+
+  const load = async (path) => {
+    setState((s) => ({ ...s, loading: true, error: "" }));
+    try {
+      const r = await StorageAdapter.browseFolder(path);
+      setState({ loading: false, path: r.path, parent: r.parent, entries: r.entries || [], roots: r.roots || [], error: "" });
+      if (r.path) setPathInput(r.path);
+    } catch (e) {
+      setState((s) => ({ ...s, loading: false, error: e.message || String(e) }));
+    }
+  };
+
+  useEffect(() => { load(startPath); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  return (
+    <div className="fixed inset-0 bg-black/50 z-[60] flex items-center justify-center" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="bg-white rounded-lg shadow-xl w-[36rem] max-h-[32rem] flex flex-col">
+        <div className="px-4 py-3 border-b border-stone-200 flex items-center gap-2 shrink-0">
+          <h3 className="font-semibold text-sm text-stone-800 flex-1">{t("选择文件夹", "Choose a folder")}</h3>
+          <button onClick={onClose} className="text-stone-400 hover:text-stone-600 text-lg leading-none px-1">×</button>
+        </div>
+        <div className="flex flex-1 min-h-0">
+          <div className="w-36 border-r border-stone-200 overflow-y-auto py-2 shrink-0">
+            {state.roots.map((r) => (
+              <button
+                key={r.path}
+                onClick={() => load(r.path)}
+                className={`w-full text-left px-3 py-1.5 text-xs truncate hover:bg-stone-50 ${state.path === r.path ? "bg-amber-50 text-amber-800" : "text-stone-600"}`}
+                title={r.path}
+              >
+                {r.name}
+              </button>
+            ))}
+          </div>
+          <div className="flex-1 flex flex-col min-w-0">
+            <div className="px-3 py-2 border-b border-stone-100 flex items-center gap-1.5 shrink-0">
+              <button
+                onClick={() => state.parent && load(state.parent)}
+                disabled={!state.parent}
+                title={t("上一级", "Up one level")}
+                className="text-xs px-2 py-1 rounded border border-stone-200 hover:bg-stone-50 disabled:opacity-30 disabled:cursor-not-allowed shrink-0"
+              >
+                ↑
+              </button>
+              <input
+                type="text"
+                value={pathInput}
+                onChange={(e) => setPathInput(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") load(pathInput); }}
+                className="flex-1 min-w-0 text-xs px-2 py-1 border border-stone-300 rounded font-mono"
+              />
+              <button onClick={() => load(pathInput)} className="text-xs px-2 py-1 rounded border border-stone-200 hover:bg-stone-50 shrink-0">
+                {t("前往", "Go")}
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto py-1">
+              {state.loading ? (
+                <div className="text-xs text-stone-400 text-center py-6">{t("加载中…", "Loading…")}</div>
+              ) : state.error ? (
+                <div className="text-xs text-red-600 px-3 py-2">{state.error}</div>
+              ) : state.entries.length === 0 ? (
+                <div className="text-xs text-stone-400 text-center py-6">{t("此文件夹内没有子文件夹", "No subfolders here")}</div>
+              ) : (
+                state.entries.map((entry) => (
+                  <button
+                    key={entry.path}
+                    onClick={() => setPathInput(entry.path)}
+                    onDoubleClick={() => load(entry.path)}
+                    className={`w-full text-left px-3 py-1.5 text-xs flex items-center gap-1.5 hover:bg-stone-50 ${pathInput === entry.path ? "bg-amber-50 text-amber-800" : "text-stone-700"}`}
+                  >
+                    <Folder size={12} className="shrink-0 text-stone-400" />
+                    <span className="truncate">{entry.name}</span>
+                  </button>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+        <div className="px-4 py-3 border-t border-stone-200 flex justify-end gap-2 shrink-0">
+          <button onClick={onClose} className="text-xs px-3 py-1.5 rounded border border-stone-300 hover:bg-stone-50 text-stone-600">
+            {t("取消", "Cancel")}
+          </button>
+          <button
+            onClick={() => onSelect(pathInput)}
+            disabled={!pathInput.trim()}
+            className="text-xs px-3 py-1.5 rounded bg-amber-600 hover:bg-amber-700 text-white disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            {t("选择此文件夹", "Select this folder")}
+          </button>
+        </div>
+      </div>
     </div>
   );
 };
@@ -3935,6 +4356,8 @@ const TimeSeriesChart = ({ points, paramName, unit, onPointClick, width = 680, h
  * failing that, from a "YYYY-MM" folder it lives in (see resolveDocTime).
  * =============================================================================
  */
+const PLOT_DIALOG_MIN_W = 480;
+const PLOT_DIALOG_MIN_H = 380;
 const FolderPlotDialog = ({ open, node, tree, docIndex, onClose, onOpenDoc, onOpenAISettings }) => {
   const { t, lang } = useLang();
   const [includeSub, setIncludeSub] = useState(true);
@@ -3947,15 +4370,110 @@ const FolderPlotDialog = ({ open, node, tree, docIndex, onClose, onOpenDoc, onOp
   const [aiComment, setAiComment] = useState("");
   const [aiError, setAiError] = useState("");
 
+  // --- Custom axis ranges (see AxisRangeControls) ------------------------
+  const AXIS_DEFAULT = { mode: "auto", min: "", max: "" };
+  const [yAxis, setYAxis] = useState(AXIS_DEFAULT);
+  const [xAxis, setXAxis] = useState(AXIS_DEFAULT);
+
+  // --- Floating window geometry (drag to move, edges/corner to resize) --
+  // This component stays mounted the whole time DMS is open (`open` just
+  // toggles visibility, see the render call below), so position/size
+  // persist across close/reopen for the session, like a real window that
+  // stays where you left it -- same pattern as FloatingDocPreview.
+  const [pos, setPos] = useState({ x: null, y: null }); // null = centered default
+  const [size, setSize] = useState(() => ({
+    w: typeof window !== "undefined" ? Math.min(880, window.innerWidth - 48) : 880,
+    h: typeof window !== "undefined" ? Math.min(640, window.innerHeight - 48) : 640,
+  }));
+  const [interacting, setInteracting] = useState(null); // null | "move" | "x" | "y" | "xy"
+  const dragRef = useRef(null);
+  const [popoutError, setPopoutError] = useState("");
+
+  // Clamped so the header (the only drag handle) always stays reachable --
+  // recomputed every render, not just while dragging, so a position that
+  // went bad (dragged off-screen, or the browser window later shrank) heals
+  // itself the moment this reopens instead of staying stuck there for the
+  // rest of the session (this component never unmounts, see above).
+  const rawPos = pos.x != null ? pos : {
+    x: (window.innerWidth - size.w) / 2,
+    y: (window.innerHeight - size.h) / 2,
+  };
+  const curPos = {
+    x: Math.min(Math.max(rawPos.x, -(size.w - 120)), window.innerWidth - 120),
+    y: Math.min(Math.max(rawPos.y, 0), Math.max(0, window.innerHeight - 60)),
+  };
+
+  const onDragStart = (e) => {
+    e.preventDefault();
+    const start = curPos;
+    dragRef.current = { startX: e.clientX, startY: e.clientY, origX: start.x, origY: start.y };
+    setInteracting("move");
+    const onMove = (ev) => {
+      const d = dragRef.current;
+      if (!d) return;
+      setPos({ x: d.origX + (ev.clientX - d.startX), y: d.origY + (ev.clientY - d.startY) });
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      dragRef.current = null;
+      setInteracting(null);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
+  // axis: "x" (right edge, width only), "y" (bottom edge, height only), or
+  // "xy" (corner, both at once) -- stretchable independently either way.
+  const onResizeStart = (axis) => (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragRef.current = { startX: e.clientX, startY: e.clientY, origW: size.w, origH: size.h };
+    setInteracting(axis);
+    const onMove = (ev) => {
+      const d = dragRef.current;
+      if (!d) return;
+      const dx = ev.clientX - d.startX;
+      const dy = ev.clientY - d.startY;
+      setSize((prev) => ({
+        w: axis !== "y" ? Math.max(PLOT_DIALOG_MIN_W, d.origW + dx) : prev.w,
+        h: axis !== "x" ? Math.max(PLOT_DIALOG_MIN_H, d.origH + dy) : prev.h,
+      }));
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      dragRef.current = null;
+      setInteracting(null);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
+  const interactCursor = interacting === "x" ? "ew-resize"
+    : interacting === "y" ? "ns-resize"
+    : interacting === "xy" ? "nwse-resize"
+    : interacting === "move" ? "grabbing"
+    : "default";
+
+  // Chart area fills whatever room the resizable window currently gives it
+  // (see the toolbar/table chrome this subtracts) so the plot itself
+  // stretches both ways as the window is resized, not just its frame.
+  const chartAreaHeight = Math.max(200, size.h - 300);
+  const chartWrapRef = useRef(null);
+  const [chartSize, setChartSize] = useState({ w: 680, h: chartAreaHeight });
+
   useEffect(() => {
     if (open) StorageAdapter.getAISettings().then(setAiSettings).catch(() => {});
   }, [open]);
 
-  // The previous analysis is about a different series once the parameter,
-  // field, or scope changes -- drop it rather than leaving a stale comment
-  // sitting under a chart it no longer describes.
+  // The previous analysis (and any custom axis range) is about a different
+  // series once the parameter, field, or scope changes -- drop it rather
+  // than leaving a stale comment/range sitting under a chart it no longer
+  // describes.
   useEffect(() => {
     setAiComment(""); setAiError("");
+    setYAxis(AXIS_DEFAULT); setXAxis(AXIS_DEFAULT);
   }, [param, field, includeSub, node]);
 
   // Skip the (potentially large) scope/point computation entirely while the
@@ -3963,11 +4481,26 @@ const FolderPlotDialog = ({ open, node, tree, docIndex, onClose, onOpenDoc, onOp
   // component re-renders on every docIndex change (any metadata edit,
   // upload, ...), which would otherwise mean scanning every document in the
   // selected folder on every keystroke elsewhere in the app.
+  // One entry per (document, folder link) in scope, with that link's
+  // per-folder metadata override already applied on top of the shared base
+  // (see effectiveMetadata). A document linked into two folders in scope —
+  // e.g. one summary report linked under two different accounts, each with
+  // its own "Balance" — shows up here twice, once per folder, each with its
+  // own effective value. Folders that never touched a given field just read
+  // the shared base value, so a doc linked in several places with no
+  // per-folder differences still resolves to the same value everywhere.
   const scopeDocs = useMemo(() => {
     if (!open || !node) return [];
-    const ids = new Set(includeSub ? collectAllDocIds(node) : (node.documents || []).map((d) => d.id));
+    const refs = includeSub ? collectAllDocRefs(node) : (node.documents || []).map((d) => ({ id: d.id, nodeId: node.id }));
     const byId = new Map(docIndex.map((d) => [d.id, d]));
-    return Array.from(ids).map((id) => byId.get(id)).filter(Boolean);
+    return refs
+      .map(({ id, nodeId }) => {
+        const base = byId.get(id);
+        if (!base) return null;
+        const override = (base.metaOverrides || {})[nodeId];
+        return override ? { ...base, metadata: effectiveMetadata(base.metadata, override) } : base;
+      })
+      .filter(Boolean);
   }, [open, node, includeSub, docIndex]);
 
   const availableParams = useMemo(() => {
@@ -4004,9 +4537,19 @@ const FolderPlotDialog = ({ open, node, tree, docIndex, onClose, onOpenDoc, onOp
     if (!param) return { points: [], undated: [] };
     const pts = [];
     const undatedDocs = [];
+    // A document linked into several folders in scope can appear in
+    // scopeDocs more than once (see above). If every occurrence resolves to
+    // the same value for THIS parameter, plot it once — it's the same fact
+    // about the same file. Only occurrences that actually diverge (e.g. a
+    // different account's balance) get their own point.
+    const seenPerDoc = new Map(); // docId -> Set of values already plotted
     for (const d of scopeDocs) {
       const v = getNumericParamValue((d.metadata || {})[param], { field });
       if (v == null) continue; // this doc doesn't carry the parameter at all
+      const seenValues = seenPerDoc.get(d.id) || new Set();
+      if (seenValues.has(v)) continue;
+      seenValues.add(v);
+      seenPerDoc.set(d.id, seenValues);
       const date = resolveDocTime(d, tree);
       if (!date) { undatedDocs.push(d); continue; }
       // Parse as UTC (explicit "Z") so the point's position on the time axis
@@ -4036,14 +4579,84 @@ const FolderPlotDialog = ({ open, node, tree, docIndex, onClose, onOpenDoc, onOp
     }
   };
 
+  // Track the chart wrapper's actual rendered box (its height is set
+  // explicitly from chartAreaHeight above; its width comes from the window's
+  // current width) so TimeSeriesChart's viewBox always matches real pixels
+  // in both dimensions instead of just scaling horizontally.
+  const chartVisible = open && availableParams.length > 0 && points.length > 0;
+  useEffect(() => {
+    if (!chartVisible || !chartWrapRef.current) return;
+    const el = chartWrapRef.current;
+    const ro = new ResizeObserver((entries) => {
+      const cr = entries[0].contentRect;
+      if (cr.width > 40 && cr.height > 40) setChartSize({ w: Math.round(cr.width), h: Math.round(cr.height) });
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [chartVisible]);
+
+  const yRangeOverride = yAxis.mode === "custom" && yAxis.min !== "" && yAxis.max !== ""
+    ? { min: Number(yAxis.min), max: Number(yAxis.max) } : null;
+  const xRangeOverride = xAxis.mode === "custom" && xAxis.min && xAxis.max
+    ? { min: new Date(xAxis.min + "T00:00:00Z").getTime(), max: new Date(xAxis.max + "T23:59:59Z").getTime() } : null;
+  const setYAxisSeeded = makeAxisToggleSetter(setYAxis, () => autoValueBounds(points));
+  const setXAxisSeeded = makeAxisToggleSetter(setXAxis, () => autoTimeBounds(points));
+
+  // "Pop out" -- hand a snapshot of the current series off to a real,
+  // separate browser window (via localStorage + a `?popout=plot` URL the
+  // bootstrap at the bottom of this file recognizes) so it can be dragged
+  // to another monitor, maximized, etc. using the OS/browser's own window
+  // chrome, not anything DMS draws itself. See PlotPopoutApp.
+  const popOut = () => {
+    if (points.length === 0) return;
+    const key = `dms_plot_popout_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const payload = {
+      points: points.map((p) => ({ t: p.t, date: p.date, value: p.value, docName: p.docName })),
+      paramName: param,
+      unit,
+      nodeName: node ? node.name : "",
+      lang,
+    };
+    try {
+      localStorage.setItem(key, JSON.stringify(payload));
+    } catch (e) {
+      setPopoutError(t("无法打开新窗口（浏览器存储不可用）。", "Couldn't open a new window (browser storage unavailable)."));
+      return;
+    }
+    const w = window.open(
+      `${location.pathname}?popout=plot&key=${encodeURIComponent(key)}`,
+      "_blank",
+      "popup,width=860,height=560,menubar=no,toolbar=no,location=no,status=no"
+    );
+    if (!w) {
+      try { localStorage.removeItem(key); } catch (e) {}
+      setPopoutError(t("弹出窗口被浏览器拦截，请允许本站的弹出窗口后重试。", "The pop-up was blocked by the browser — please allow pop-ups for this site and try again."));
+    } else {
+      setPopoutError("");
+    }
+  };
+
   if (!open) return null;
 
   const openAndClose = (docId) => { onOpenDoc(docId); onClose(); };
 
   return (
-    <div className="fixed inset-0 bg-stone-900/70 z-50 flex items-center justify-center p-4" onClick={onClose}>
-      <div className="bg-white w-full max-w-3xl rounded shadow-2xl flex flex-col max-h-[85vh]" onClick={(e) => e.stopPropagation()}>
-        <div className="px-5 py-4 border-b border-stone-200 flex items-center justify-between shrink-0">
+    <>
+      {/* Dim backdrop -- click it to close. The panel itself is a freely
+          positioned/sized floating window (drag the header, resize from
+          any edge/corner), not centered inside this, so it can be dragged
+          off-center or resized without the backdrop constraining it. */}
+      <div className="fixed inset-0 bg-stone-900/70 z-40" onClick={onClose} />
+
+      <div
+        className="fixed z-50 bg-white rounded shadow-2xl flex flex-col"
+        style={{ left: curPos.x, top: curPos.y, width: size.w, height: size.h }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div
+          className="px-5 py-4 border-b border-stone-200 flex items-center justify-between shrink-0 cursor-move select-none"
+          onMouseDown={onDragStart}
+        >
           <div>
             <div className="text-[10px] tracking-[0.2em] uppercase text-stone-500 mb-0.5">{t("图表", "Chart")}</div>
             <h2 className="text-sm font-semibold text-stone-900">
@@ -4051,10 +4664,27 @@ const FolderPlotDialog = ({ open, node, tree, docIndex, onClose, onOpenDoc, onOp
               {node && <span className="text-stone-400 font-normal"> · {node.name}</span>}
             </h2>
           </div>
-          <button onClick={onClose} className="text-stone-400 hover:text-stone-800 p-1"><X size={16} /></button>
+          <div className="flex items-center gap-1 shrink-0">
+            <button
+              onClick={popOut}
+              onMouseDown={(e) => e.stopPropagation()}
+              disabled={points.length === 0}
+              className="text-stone-400 hover:text-stone-800 p-1 disabled:opacity-30 disabled:cursor-not-allowed"
+              title={t("在新窗口中打开（可拖到其他显示器）", "Open in a new window (drag it to another monitor)")}
+            >
+              <ExternalLink size={14} />
+            </button>
+            <button onClick={onClose} onMouseDown={(e) => e.stopPropagation()} className="text-stone-400 hover:text-stone-800 p-1">
+              <X size={16} />
+            </button>
+          </div>
         </div>
 
-        <div className="px-5 py-3 border-b border-stone-100 flex items-center gap-3 flex-wrap shrink-0">
+        {popoutError && (
+          <div className="px-5 py-1.5 text-[11px] text-red-700 bg-red-50 border-b border-red-200 shrink-0">{popoutError}</div>
+        )}
+
+        <div className="px-5 py-3 border-b border-stone-100 flex items-center gap-3 flex-wrap shrink-0" onMouseDown={(e) => e.stopPropagation()}>
           <div className="flex items-center gap-1.5">
             <label className="text-[11px] text-stone-500 uppercase tracking-wider">{t("参数", "Parameter")}</label>
             <select
@@ -4082,9 +4712,14 @@ const FolderPlotDialog = ({ open, node, tree, docIndex, onClose, onOpenDoc, onOp
             {t("包含子文件夹", "Include subfolders")}
           </label>
           <span className="text-[11px] text-stone-400 ml-auto">{t(`共 ${scopeDocs.length} 个文档`, `${scopeDocs.length} document(s) in scope`)}</span>
+          {points.length > 0 && (
+            <div className="w-full">
+              <AxisRangeControls xAxis={xAxis} setXAxis={setXAxisSeeded} yAxis={yAxis} setYAxis={setYAxisSeeded} unit={unit} />
+            </div>
+          )}
         </div>
 
-        <div className="flex-1 overflow-auto p-5">
+        <div className="flex-1 min-h-0 overflow-auto p-5" onMouseDown={(e) => e.stopPropagation()}>
           {availableParams.length === 0 ? (
             <div className="text-center text-sm text-stone-500 py-10">
               {t("此文件夹（含子文件夹）中的文档没有任何数值型参数。请先在文档元数据或关键字提取中填写参数值。",
@@ -4097,7 +4732,13 @@ const FolderPlotDialog = ({ open, node, tree, docIndex, onClose, onOpenDoc, onOp
             </div>
           ) : (
             <>
-              <TimeSeriesChart points={points} paramName={param} unit={unit} onPointClick={openAndClose} />
+              <div ref={chartWrapRef} style={{ height: chartAreaHeight }} className="w-full">
+                <TimeSeriesChart
+                  points={points} paramName={param} unit={unit} onPointClick={openAndClose}
+                  width={chartSize.w} height={chartSize.h}
+                  timeRange={xRangeOverride} valueRange={yRangeOverride}
+                />
+              </div>
 
               {points.length > 1 && (
                 <div className="mt-3 border border-purple-200 bg-purple-50/60 rounded p-3">
@@ -4171,8 +4812,128 @@ const FolderPlotDialog = ({ open, node, tree, docIndex, onClose, onOpenDoc, onOp
             </details>
           )}
         </div>
+
+        {/* Resize handles */}
+        <div
+          onMouseDown={onResizeStart("x")}
+          className="absolute top-0 right-0 w-1.5 h-full cursor-ew-resize"
+          title={t("水平拖动可调整宽度", "Drag to resize width")}
+        />
+        <div
+          onMouseDown={onResizeStart("y")}
+          className="absolute bottom-0 left-0 w-full h-1.5 cursor-ns-resize"
+          title={t("垂直拖动可调整高度", "Drag to resize height")}
+        />
+        <div
+          onMouseDown={onResizeStart("xy")}
+          className="absolute bottom-0 right-0 w-4 h-4 cursor-nwse-resize"
+          style={{
+            background: "linear-gradient(135deg, transparent 0%, transparent 45%, #a8a29e 45%, #a8a29e 55%, transparent 55%, transparent 100%)",
+          }}
+          title={t("拖动可同时调整宽高", "Drag to resize both width and height")}
+        />
+        {interacting && (
+          <div className="fixed inset-0 z-[55]" style={{ cursor: interactCursor }} />
+        )}
       </div>
-    </div>
+    </>
+  );
+};
+
+/* =============================================================================
+ * PLOT POP-OUT WINDOW — the page rendered in the separate browser
+ * window/tab that FolderPlotDialog's "pop out" button opens (see popOut()
+ * there). It's a fresh top-level browser window, so it can be dragged to
+ * another monitor, maximized, etc. using the OS/browser's own chrome --
+ * nothing DMS draws itself needs to support that.
+ *
+ * Deliberately reads a one-time snapshot (points, param, unit, ...) out of
+ * localStorage rather than staying live-connected to the dialog that opened
+ * it: DMS otherwise has no cross-window channel, and a snapshot is enough
+ * for "look at this chart on my other monitor while I keep working in the
+ * main window". Pop out again after changing the parameter/scope to get an
+ * updated window.
+ * =============================================================================
+ */
+const PlotPopoutApp = ({ storageKey }) => {
+  const [data, setData] = useState(null);
+  const [missing, setMissing] = useState(false);
+  const containerRef = useRef(null);
+  const [chartSize, setChartSize] = useState({ w: 760, h: 420 });
+  const AXIS_DEFAULT = { mode: "auto", min: "", max: "" };
+  const [yAxis, setYAxis] = useState(AXIS_DEFAULT);
+  const [xAxis, setXAxis] = useState(AXIS_DEFAULT);
+
+  useEffect(() => {
+    try {
+      const raw = storageKey && localStorage.getItem(storageKey);
+      if (!raw) { setMissing(true); return; }
+      const parsed = JSON.parse(raw);
+      setData(parsed);
+      // One-time handoff -- clear it now so it doesn't linger in
+      // localStorage indefinitely once this window has read it.
+      localStorage.removeItem(storageKey);
+      document.title = `${parsed.paramName}${parsed.nodeName ? " · " + parsed.nodeName : ""} — DMS`;
+    } catch (e) {
+      setMissing(true);
+    }
+  }, [storageKey]);
+
+  useEffect(() => {
+    if (!data || !containerRef.current) return;
+    const el = containerRef.current;
+    const ro = new ResizeObserver((entries) => {
+      const cr = entries[0].contentRect;
+      if (cr.width > 40 && cr.height > 40) setChartSize({ w: Math.round(cr.width), h: Math.round(cr.height) });
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [data]);
+
+  const langCtxValue = useMemo(() => ({
+    lang: data?.lang || "zh",
+    t: (zh, en) => (data?.lang === "en" ? en : zh),
+    setLang: () => {},
+  }), [data]);
+
+  if (missing) {
+    return (
+      <div className="h-full flex items-center justify-center text-sm text-stone-500 p-6 text-center">
+        This chart window has expired — go back to DMS and use "Pop out" again to open a fresh one.
+      </div>
+    );
+  }
+  if (!data) return null;
+
+  const yRangeOverride = yAxis.mode === "custom" && yAxis.min !== "" && yAxis.max !== ""
+    ? { min: Number(yAxis.min), max: Number(yAxis.max) } : null;
+  const xRangeOverride = xAxis.mode === "custom" && xAxis.min && xAxis.max
+    ? { min: new Date(xAxis.min + "T00:00:00Z").getTime(), max: new Date(xAxis.max + "T23:59:59Z").getTime() } : null;
+  const setYAxisSeeded = makeAxisToggleSetter(setYAxis, () => autoValueBounds(data.points));
+  const setXAxisSeeded = makeAxisToggleSetter(setXAxis, () => autoTimeBounds(data.points));
+
+  return (
+    <LangContext.Provider value={langCtxValue}>
+      <div className="h-full flex flex-col bg-white">
+        <div className="px-4 py-2.5 border-b border-stone-200 shrink-0">
+          <div className="text-[10px] tracking-[0.2em] uppercase text-stone-500">{langCtxValue.t("图表", "Chart")}</div>
+          <h1 className="text-sm font-semibold text-stone-900">
+            {data.paramName}
+            {data.nodeName && <span className="text-stone-400 font-normal"> · {data.nodeName}</span>}
+          </h1>
+        </div>
+        <div className="px-4 py-2 border-b border-stone-100 shrink-0">
+          <AxisRangeControls xAxis={xAxis} setXAxis={setXAxisSeeded} yAxis={yAxis} setYAxis={setYAxisSeeded} unit={data.unit} />
+        </div>
+        <div ref={containerRef} className="flex-1 min-h-0 p-4">
+          <TimeSeriesChart
+            points={data.points} paramName={data.paramName} unit={data.unit}
+            width={chartSize.w} height={chartSize.h}
+            timeRange={xRangeOverride} valueRange={yRangeOverride}
+          />
+        </div>
+      </div>
+    </LangContext.Provider>
   );
 };
 
@@ -5334,7 +6095,7 @@ const FloatingDocPreview = ({ doc, onClose }) => {
   // full document page while the metadata/list stays visible alongside it
   // on the right, rather than the old small bottom-right thumbnail size.
   const [size, setSize] = useState(() => ({
-    w: typeof window !== "undefined" ? Math.round(window.innerWidth * 0.55) : 700,
+    w: typeof window !== "undefined" ? Math.round(window.innerWidth * 0.4) : 520,
     h: typeof window !== "undefined" ? Math.max(FLOATING_PREVIEW_MIN_H, window.innerHeight - 92) : 520,
   }));
   // True while a drag or resize is in progress — renders a transparent
@@ -5505,7 +6266,7 @@ const FloatingDocPreview = ({ doc, onClose }) => {
         className="flex items-center justify-between px-3 py-2 border-b border-stone-200 bg-stone-50 cursor-move shrink-0 select-none"
         onMouseDown={onDragStart}
       >
-        <div className="text-xs font-medium text-stone-700 truncate pr-2">{doc.name}</div>
+        <div className="text-sm font-bold text-stone-700 truncate pr-2">{doc.name}</div>
         <div className="flex items-center gap-1 shrink-0">
           <button
             onClick={() => {
@@ -5550,12 +6311,12 @@ const FloatingDocPreview = ({ doc, onClose }) => {
               onChange={(e) => setQuery(e.target.value)}
               onKeyDown={handleSearchKeyDown}
               placeholder={t("查找文字…（可与原文不完全一致）", "Find text… (doesn't need to match exactly)")}
-              className="flex-1 min-w-0 text-xs px-2 py-1 border border-stone-300 rounded focus:outline-none focus:border-amber-600"
+              className="flex-1 min-w-0 text-sm font-bold px-2 py-1 border border-stone-300 rounded focus:outline-none focus:border-amber-600"
             />
             <button
               onClick={runSearch}
               disabled={searching || !query.trim()}
-              className="text-[10px] px-2 py-1 border border-stone-300 rounded hover:bg-white disabled:opacity-40 shrink-0"
+              className="text-xs font-bold px-2 py-1 border border-stone-300 rounded hover:bg-white disabled:opacity-40 shrink-0"
               title={t("查找", "Find")}
             >
               {searching ? <Loader size={12} className="animate-spin" /> : t("查找", "Find")}
@@ -5579,7 +6340,7 @@ const FloatingDocPreview = ({ doc, onClose }) => {
           </div>
 
           {(matches.length > 0 || searchError) && (
-            <div className="px-2 pb-1.5 text-[11px]">
+            <div className="px-2 pb-1.5 text-sm font-bold">
               {matches.length > 0 ? (
                 <>
                   <div className="text-stone-500 mb-0.5">
@@ -5620,7 +6381,7 @@ const FloatingDocPreview = ({ doc, onClose }) => {
         ) : isImage ? (
           <img src={url} alt={doc.name} className="w-full h-full object-contain bg-white" />
         ) : (
-          <div className="w-full h-full flex flex-col items-center justify-center gap-2 text-xs text-stone-500 p-4 text-center">
+          <div className="w-full h-full flex flex-col items-center justify-center gap-2 text-sm font-bold text-stone-500 p-4 text-center">
             <div>{t("此文件类型无法直接预览。", "This file type can't be previewed inline.")}</div>
             <a href={url} target="_blank" rel="noopener noreferrer" className="text-amber-700 hover:text-amber-900 underline">
               {t("在新窗口打开", "Open in a new window")}
@@ -5670,9 +6431,17 @@ const DocumentCard = ({
   selectMode = false, selected = false, onToggleSelect,
   scheduleMode = false, urgency = null,
   onDragStart, onDragEnd, isDragging = false,
+  // "Working document" tracking — lifted up to the parent so the highlight
+  // survives after an inline editor closes (e.g. right after saving a due
+  // date) and only moves once a *different* document is worked on, instead
+  // of vanishing the moment this card's own local editing state resets.
+  isLastWorked = false, onMarkWorked,
 }) => {
   const { t, lang } = useLang();
-  const [showMeta, setShowMeta] = useState(() => Object.keys(doc.metadata || {}).length > 0);
+  // Always start collapsed — even documents that already have parameters
+  // filled in should render as a single line by default. The toggle button
+  // below still opens it on demand.
+  const [showMeta, setShowMeta] = useState(false);
   const [editingName, setEditingName] = useState(false);
   const [nameDraft, setNameDraft] = useState("");
   const [renamingBusy, setRenamingBusy] = useState(false);
@@ -5704,6 +6473,7 @@ const DocumentCard = ({
     setNameDraft(doc.name);
     setRenameError("");
     setEditingName(true);
+    onMarkWorked && onMarkWorked();
   };
   const commitName = async () => {
     const trimmed = nameDraft.trim();
@@ -5726,6 +6496,7 @@ const DocumentCard = ({
     setSnDraft(ownSn);
     setEditingSn(true);
     openDocForReference();
+    onMarkWorked && onMarkWorked();
   };
   const commitSn = () => {
     onUpdateSn(snDraft);
@@ -5738,6 +6509,7 @@ const DocumentCard = ({
     setDueDraft(doc.dueDate || "");
     setEditingDue(true);
     openDocForReference();
+    onMarkWorked && onMarkWorked();
   };
   const commitDue = () => {
     onUpdateDueDate(dueDraft);
@@ -5752,6 +6524,7 @@ const DocumentCard = ({
     setDocDateDraft(doc.docDate || "");
     setEditingDocDate(true);
     openDocForReference();
+    onMarkWorked && onMarkWorked();
   };
   const commitDocDate = () => {
     onUpdateDocDate(docDateDraft);
@@ -5763,6 +6536,16 @@ const DocumentCard = ({
   const showCheckbox = faceSelectMode || selectMode;
   const isChecked = faceSelectMode ? faceSelected : selected;
   const toggleChecked = faceSelectMode ? onToggleFaceSelect : onToggleSelect;
+
+  // "Working document" indicator — true whenever this card has an inline
+  // editor open (metadata, name, SN, due date, or doc date), OR it's the
+  // last document that was edited (isLastWorked, lifted to the parent) so
+  // the highlight survives after saving/closing the editor and only moves
+  // once a *different* document is worked on. Distinct from the amber
+  // checkbox-selected/urgency colors so a card actively (or recently) being
+  // edited stands out even among several similarly-named documents.
+  const isActivelyEditing = showMeta || editingName || editingSn || editingDue || editingDocDate;
+  const isEditing = isActivelyEditing || isLastWorked;
 
   return (
     <div
@@ -5782,10 +6565,16 @@ const DocumentCard = ({
       title={showCheckbox ? undefined : t("拖拽到左侧文件夹树可移动此文档", "Drag onto a folder in the tree to move this document there")}
       className={`border rounded bg-white transition-opacity ${
         isDragging ? "opacity-40" :
+        isEditing ? "border-indigo-400 bg-indigo-50/60 ring-1 ring-indigo-300" :
         showCheckbox && isChecked ? "border-amber-400 bg-amber-50" :
         cardUrgencyClass || "border-stone-200"
       }`}
     >
+      {isEditing && (
+        <div className="flex items-center gap-1 px-3 pt-2 text-[10px] font-medium text-indigo-700">
+          <Edit2 size={10} /> {isActivelyEditing ? t("正在编辑", "Editing") : t("最近编辑", "Recently edited")}
+        </div>
+      )}
       <div className="flex items-center gap-3 p-3">
         <div
           className={`w-10 h-10 rounded flex items-center justify-center shrink-0 relative ${showCheckbox ? "cursor-pointer" : "bg-stone-100 text-stone-600"}`}
@@ -5934,7 +6723,7 @@ const DocumentCard = ({
           onClick={() => {
             const opening = !showMeta;
             setShowMeta(opening);
-            if (opening) openDocForReference();
+            if (opening) { openDocForReference(); onMarkWorked && onMarkWorked(); }
           }}
           className={`text-xs px-2 py-1 border rounded flex items-center gap-1 ${
             showMeta ? "border-amber-400 bg-amber-50 text-amber-800" : "border-stone-300 text-stone-600 hover:bg-stone-100"
@@ -5983,7 +6772,7 @@ const DocumentCard = ({
 
       {/* Rename editor row */}
       {editingName && (
-        <div className="px-3 pb-3 border-t border-stone-100 bg-amber-50/40">
+        <div className="px-3 pb-3 border-t border-indigo-100 bg-indigo-50/60">
           <div className="flex items-center justify-between mb-1.5 mt-2">
             <div className="text-[10px] uppercase tracking-wider text-stone-500">
               {t("文件名", "File name")}
@@ -6028,7 +6817,7 @@ const DocumentCard = ({
 
       {/* SN editor row */}
       {editingSn && (
-        <div className="px-3 pb-3 border-t border-stone-100 bg-amber-50/40">
+        <div className="px-3 pb-3 border-t border-indigo-100 bg-indigo-50/60">
           <div className="flex items-center justify-between mb-1.5 mt-2">
             <div className="text-[10px] uppercase tracking-wider text-stone-500">
               {t("此文档的自定义序列号", "This document's custom serial number")}
@@ -6077,7 +6866,7 @@ const DocumentCard = ({
 
       {/* Due-date editor row */}
       {editingDue && (
-        <div className="px-3 pb-3 border-t border-stone-100 bg-amber-50/40">
+        <div className="px-3 pb-3 border-t border-indigo-100 bg-indigo-50/60">
           <div className="flex items-center justify-between mb-1.5 mt-2">
             <div className="text-[10px] uppercase tracking-wider text-stone-500">
               {t("此文档的到期日", "This document's due date")}
@@ -6123,7 +6912,7 @@ const DocumentCard = ({
 
       {/* Document-date editor row */}
       {editingDocDate && (
-        <div className="px-3 pb-3 border-t border-stone-100 bg-amber-50/40">
+        <div className="px-3 pb-3 border-t border-indigo-100 bg-indigo-50/60">
           <div className="flex items-center justify-between mb-1.5 mt-2">
             <div className="text-[10px] uppercase tracking-wider text-stone-500">
               {t("此文档的日期", "This document's date")}
@@ -6174,7 +6963,7 @@ const DocumentCard = ({
       )}
 
       {showMeta && (
-        <div className="px-3 pb-3 pt-1 border-t border-stone-100 bg-stone-50/50">
+        <div className="px-3 pb-3 pt-1 border-t border-indigo-100 bg-indigo-50/60">
           <div className="text-[10px] uppercase tracking-wider text-stone-500 mb-2 mt-2 flex items-center justify-between gap-2">
             <span className="flex items-center gap-2 shrink-0">
               {t("元数据", "Metadata")}
@@ -6186,9 +6975,18 @@ const DocumentCard = ({
                 <ExternalLink size={10} /> {t("查看文档", "View document")}
               </button>
             </span>
-            <span className="text-stone-400 normal-case tracking-normal text-right">{t("对所有引用此文档的位置均生效", "Applies everywhere this document is referenced")}</span>
+            <span className="text-stone-400 normal-case tracking-normal text-right">
+              {otherRefCount > 0
+                ? t("此文档还链接到其他文件夹：未改动的字段保持共享；在此改动的字段仅对本文件夹生效", "Also linked into other folders: unchanged fields stay shared; fields you edit here apply to this folder only")
+                : t("对所有引用此文档的位置均生效", "Applies everywhere this document is referenced")}
+            </span>
           </div>
-          <MetadataEditor metadata={doc.metadata || {}} keyParameters={keyParameters} onChange={onUpdateMeta} />
+          <MetadataEditor
+            metadata={doc.metadata || {}}
+            baseMetadata={otherRefCount > 0 ? (doc._baseMetadata || doc.metadata || {}) : null}
+            keyParameters={keyParameters}
+            onChange={onUpdateMeta}
+          />
         </div>
       )}
     </div>
@@ -7751,8 +8549,13 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
   const [error, setError] = useState(null);
   const [importDialog, setImportDialog] = useState(null); // { file, mode, target }
   const [newDialog, setNewDialog] = useState(null);       // { target }
-  const [pwDialog, setPwDialog] = useState(null);         // { current, next, confirm, hasExisting }
+  const [pwDialog, setPwDialog] = useState(null);         // { current, next, confirm, hasExisting } — APP login password
   const [authStatus, setAuthStatus] = useState(null);
+  // Project password (see "Per-project identity & password" in dms_server.py)
+  // — separate from the app login password above. { current, next, confirm,
+  // name, hasExisting }.
+  const [projectPwDialog, setProjectPwDialog] = useState(null);
+  const [projectAuthStatus, setProjectAuthStatus] = useState(null);
   const [exportSelDialog, setExportSelDialog] = useState(false);
   const [exportSelChecked, setExportSelChecked] = useState(new Set());
   const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform);
@@ -7767,13 +8570,17 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
       .then((r) => r.json())
       .then((s) => setAuthStatus(s))
       .catch(() => setAuthStatus(null));
+    fetch("/api/project-auth/status")
+      .then((r) => r.json())
+      .then((s) => setProjectAuthStatus(s))
+      .catch(() => setProjectAuthStatus(null));
   }, [open]);
 
   const doExport = async () => {
     setError(null);
     setBusy(true);
     try {
-      const res = await fetch("/api/project/export");
+      const res = await fetch("/api/project/export", { method: "POST" });
       if (!res.ok) {
         let msg = `HTTP ${res.status}`;
         try { msg = (await res.json()).error || msg; } catch {}
@@ -7824,7 +8631,7 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
     setError(null);
     setBusy(true);
     try {
-      const res = await fetch("/api/project/export-full");
+      const res = await fetch("/api/project/export-full", { method: "POST" });
       if (!res.ok) {
         let msg = `HTTP ${res.status}`;
         try { msg = (await res.json()).error || msg; } catch {}
@@ -7997,6 +8804,68 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
     }
   };
 
+  // Project password — see "Per-project identity & password" in
+  // dms_server.py. Independent of the app login password above: this one
+  // belongs to the active project itself (travels with its storage folder),
+  // gates opening that project directly, and is what its .dms exports get
+  // automatically encrypted with.
+  const openProjectPasswordDialog = () => {
+    setProjectPwDialog({
+      current: "",
+      next: "",
+      confirm: "",
+      name: projectAuthStatus?.name || "",
+      hasExisting: !!projectAuthStatus?.password_required,
+    });
+  };
+
+  const doSaveProjectPassword = async () => {
+    if (!projectPwDialog) return;
+    if (projectPwDialog.next !== projectPwDialog.confirm) {
+      setError(t("新密码与确认密码不一致。", "The new password and confirmation don't match."));
+      return;
+    }
+    setError(null);
+    setBusy(true);
+    try {
+      const res = await fetch("/api/project/set-password", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          current_password: projectPwDialog.current,
+          new_password: projectPwDialog.next,
+          name: projectPwDialog.name,
+        }),
+      });
+      if (!res.ok) {
+        let msg = `HTTP ${res.status}`;
+        try { msg = (await res.json()).error || msg; } catch {}
+        throw new Error(msg);
+      }
+      setProjectPwDialog(null);
+      onClose();
+      // Refresh status — but stay on the page since the cookie is renewed
+      window.location.reload();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const doProjectLogout = async () => {
+    setError(null);
+    setBusy(true);
+    try {
+      await fetch("/api/project-auth/logout", { method: "POST" });
+      window.location.reload();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   // Click-outside to close. Stash onClose in a ref so the effect doesn't
   // re-attach on every parent render — just attach once when `open` flips true.
   const onCloseRef = useRef(onClose);
@@ -8024,6 +8893,11 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
           <div className="px-3 pb-1 text-[10px] text-stone-400">
             {t("项目目录中最多保留 10 个 .dms 备份文件，更早的会自动移入\"Not Shown in The Tree\"文件夹", "The project folder keeps at most 10 .dms backup files; older ones are automatically moved into the \"Not Shown in The Tree\" folder")}
           </div>
+          {projectAuthStatus?.password_required && (
+            <div className="px-3 pb-1.5 text-[10px] text-amber-700 flex items-center gap-1">
+              <Lock size={10} /> {t("已用项目密码自动加密", "Automatically encrypted with the project password")}
+            </div>
+          )}
           <button
             onClick={doExport}
             disabled={busy}
@@ -8253,12 +9127,12 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
             <Hash size={14} className="text-stone-600 mt-0.5 shrink-0" />
             <div>
               <div className="text-stone-900">
-                {authStatus?.password_required ? t("修改或移除密码", "Change or remove password") : t("设置密码", "Set password")}
+                {authStatus?.password_required ? t("修改或移除应用登录密码", "Change or remove app login password") : t("设置应用登录密码", "Set app login password")}
               </div>
               <div className="text-[11px] text-stone-500 mt-0.5">
                 {authStatus?.password_required
                   ? t("当前已受密码保护 — 修改或清除密码", "Currently password-protected — change or clear the password")
-                  : t("可选：设置打开 DMS 所需的密码", "Optional: set a password required to open DMS")}
+                  : t("可选：设置打开 DMS（本机所有项目）所需的密码", "Optional: a password required to open DMS at all, on this machine — every project")}
               </div>
             </div>
           </button>
@@ -8273,6 +9147,38 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
                 <div className="text-stone-900">{t("退出登录", "Log out")}</div>
                 <div className="text-[11px] text-stone-500 mt-0.5">
                   {t("结束本次会话并要求重新输入密码", "Ends this session and requires the password to be re-entered")}
+                </div>
+              </div>
+            </button>
+          )}
+          <button
+            onClick={openProjectPasswordDialog}
+            disabled={busy}
+            className="w-full text-left px-3 py-2 hover:bg-amber-50 flex items-start gap-2 disabled:opacity-50"
+          >
+            <Lock size={14} className="text-stone-600 mt-0.5 shrink-0" />
+            <div>
+              <div className="text-stone-900">
+                {projectAuthStatus?.password_required ? t("修改或移除项目密码", "Change or remove project password") : t("设置项目密码", "Set project password")}
+              </div>
+              <div className="text-[11px] text-stone-500 mt-0.5">
+                {projectAuthStatus?.password_required
+                  ? t("当前项目已受密码保护 — 修改名称或密码", "This project is currently password-protected — change its name or password")
+                  : t("可选：为当前项目设置名称和密码，随文件夹本身生效（含直接打开与导入 .dms）", "Optional: name and password this project — enforced by the folder itself (opening it directly, or importing its .dms elsewhere)")}
+              </div>
+            </div>
+          </button>
+          {projectAuthStatus?.password_required && (
+            <button
+              onClick={doProjectLogout}
+              disabled={busy}
+              className="w-full text-left px-3 py-2 hover:bg-amber-50 flex items-start gap-2 disabled:opacity-50"
+            >
+              <X size={14} className="text-stone-600 mt-0.5 shrink-0" />
+              <div>
+                <div className="text-stone-900">{t("锁定当前项目", "Lock this project")}</div>
+                <div className="text-[11px] text-stone-500 mt-0.5">
+                  {t("重新要求输入项目密码（不影响应用登录状态）", "Requires the project password again (doesn't affect the app login)")}
                 </div>
               </div>
             </button>
@@ -8322,7 +9228,13 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
               <div className="flex-1 overflow-y-auto border border-stone-200 rounded p-2 mb-2" style={{ minHeight: 0 }}>
                 {tree ? renderNode(tree, 0) : <div className="text-xs text-stone-400 p-2">{t("无文件夹树", "No folder tree")}</div>}
               </div>
-              <div className="text-[11px] text-stone-400 mb-3">{t("已选", "Selected")} {exportSelChecked.size} {t("个节点", "node(s)")}</div>
+              <div className="text-[11px] text-stone-400 mb-1">{t("已选", "Selected")} {exportSelChecked.size} {t("个节点", "node(s)")}</div>
+              {projectAuthStatus?.password_required && (
+                <div className="text-[10px] text-amber-700 mb-3 flex items-center gap-1">
+                  <Lock size={10} /> {t("已用项目密码自动加密", "Automatically encrypted with the project password")}
+                </div>
+              )}
+
               {error && <div className="text-xs text-red-700 bg-red-50 border border-red-200 rounded p-2 mb-3">{error}</div>}
               <div className="flex gap-2 justify-end">
                 <button onClick={() => { setExportSelDialog(false); setError(null); }} disabled={busy} className="px-4 py-1.5 text-xs border border-stone-300 hover:bg-stone-100 rounded disabled:opacity-60">{t("取消", "Cancel")}</button>
@@ -8540,6 +9452,103 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
           </div>
         </div>
       )}
+
+      {/* Project password dialog — separate from the app login password
+          above; see "Per-project identity & password" in dms_server.py. */}
+      {projectPwDialog && (
+        <div
+          className="fixed inset-0 bg-stone-900/70 z-50 flex items-center justify-center p-4"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="bg-white w-full max-w-md rounded shadow-2xl p-5">
+            <div className="text-[10px] tracking-[0.2em] uppercase text-stone-500 mb-1">
+              {t("项目安全设置", "Project security settings")}
+            </div>
+            <h2 className="text-lg font-semibold text-stone-900 mb-3">
+              {projectPwDialog.hasExisting ? t("修改项目名称或密码", "Change project name or password") : t("设置项目密码", "Set project password")}
+            </h2>
+            <p className="text-xs text-stone-600 mb-4 leading-relaxed">
+              {projectPwDialog.hasExisting
+                ? t("要修改密码，请输入当前密码及新密码。若要移除保护，请将新密码留空。此密码存储在项目文件夹内，会随文件夹一起移动/同步。", "To change the password, enter the current password and a new one. To remove protection, leave the new password blank. This password is stored inside the project folder itself, and travels with it if copied or synced.")
+                : t("设置后，直接打开此项目文件夹，或导入其导出的 .dms 文件，都需要此密码。密码存储在项目文件夹内，会随文件夹一起移动/同步。", "Once set, this password is required both to open this project folder directly, and to import its exported .dms file elsewhere. It's stored inside the project folder itself, and travels with it if copied or synced.")}
+            </p>
+
+            <label className="block text-xs uppercase tracking-wider text-stone-600 mb-1.5">
+              {t("项目名称", "Project name")}
+            </label>
+            <input
+              type="text"
+              autoFocus
+              value={projectPwDialog.name}
+              onChange={(e) => setProjectPwDialog({ ...projectPwDialog, name: e.target.value })}
+              placeholder={t("例如：家庭文档", "e.g. Family Documents")}
+              className="w-full px-2 py-1.5 text-sm border border-stone-300 rounded mb-3"
+            />
+
+            {projectPwDialog.hasExisting && (
+              <>
+                <label className="block text-xs uppercase tracking-wider text-stone-600 mb-1.5">
+                  {t("当前密码", "Current password")}
+                </label>
+                <input
+                  type="password"
+                  value={projectPwDialog.current}
+                  onChange={(e) => setProjectPwDialog({ ...projectPwDialog, current: e.target.value })}
+                  className="w-full px-2 py-1.5 text-sm border border-stone-300 rounded mb-3"
+                />
+              </>
+            )}
+
+            <label className="block text-xs uppercase tracking-wider text-stone-600 mb-1.5">
+              {t("新密码", "New password")} {projectPwDialog.hasExisting && <span className="text-stone-400 normal-case tracking-normal">{t("（留空以移除密码）", "(leave blank to remove the password)")}</span>}
+            </label>
+            <input
+              type="password"
+              value={projectPwDialog.next}
+              onChange={(e) => setProjectPwDialog({ ...projectPwDialog, next: e.target.value })}
+              className="w-full px-2 py-1.5 text-sm border border-stone-300 rounded mb-3"
+            />
+
+            {projectPwDialog.next && (
+              <>
+                <label className="block text-xs uppercase tracking-wider text-stone-600 mb-1.5">
+                  {t("确认新密码", "Confirm new password")}
+                </label>
+                <input
+                  type="password"
+                  value={projectPwDialog.confirm}
+                  onChange={(e) => setProjectPwDialog({ ...projectPwDialog, confirm: e.target.value })}
+                  onKeyDown={(e) => { if (e.key === "Enter") doSaveProjectPassword(); }}
+                  className="w-full px-2 py-1.5 text-sm border border-stone-300 rounded mb-3"
+                />
+              </>
+            )}
+
+            {error && (
+              <div className="text-xs text-red-700 bg-red-50 border border-red-200 rounded p-2 mb-3 whitespace-pre-wrap">
+                {error}
+              </div>
+            )}
+
+            <div className="flex gap-2 justify-end">
+              <button
+                onClick={() => { setProjectPwDialog(null); setError(null); }}
+                disabled={busy}
+                className="px-4 py-1.5 text-xs border border-stone-300 hover:bg-stone-100 rounded disabled:opacity-60"
+              >
+                {t("取消", "Cancel")}
+              </button>
+              <button
+                onClick={doSaveProjectPassword}
+                disabled={busy || (projectPwDialog.hasExisting && !projectPwDialog.current) || (projectPwDialog.next && projectPwDialog.next !== projectPwDialog.confirm)}
+                className="px-4 py-1.5 text-xs bg-amber-600 hover:bg-amber-700 text-white rounded disabled:opacity-60"
+              >
+                {busy ? t("保存中…", "Saving…") : t("保存", "Save")}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 };
@@ -8579,9 +9588,13 @@ function Root() {
     })();
   }, []);
 
-  const handleSaved = (resolvedPath) => {
-    setStoragePath(resolvedPath);
-    setPhase("ready");
+  const handleSaved = () => {
+    // Full reload (rather than just flipping phase to "ready") so the
+    // server's auth gate gets a fresh chance to evaluate the newly-active
+    // project — if it has its own password (see "Per-project identity &
+    // password" in dms_server.py), this is what makes the lock screen show
+    // up instead of silently rendering the previous project's UI shell.
+    window.location.reload();
   };
 
   const handleChangeFolder = () => setPhase("change");
@@ -8907,43 +9920,77 @@ function DMS({ storagePath, onChangeFolder }) {
 
   const isMacDMS = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform);
 
+  // Active project's password/name status (see "Per-project identity &
+  // password" in dms_server.py) — used for the lock badge next to the
+  // storage-path button below. ProjectMenu fetches its own copy too (for
+  // its dialogs), independently of this one.
+  const [projectAuthStatus, setProjectAuthStatus] = useState(null);
+  useEffect(() => {
+    fetch("/api/project-auth/status")
+      .then((r) => r.json())
+      .then((s) => setProjectAuthStatus(s))
+      .catch(() => setProjectAuthStatus(null));
+  }, []);
+
   const [dmsImportDialog, setDmsImportDialog] = useState(null);
-  // { file, sourcePath, currentPath, chosenPathMode, customPath, mode }
+  // { file, sourcePath, currentPath, chosenPathMode, customPath, mode,
+  //   needsPassword, password }
   // chosenPathMode: "source" | "current" | "custom"
+  // needsPassword: true while the .dms file is password-protected (see
+  // ProjectMenu's export password dialog) and we haven't yet decrypted it
+  // to read its manifest — the dialog shows a password prompt instead of
+  // the path picker until inspect-dms succeeds with the right password.
   const [dmsImportBusy, setDmsImportBusy] = useState(false);
   const [dmsImportError, setDmsImportError] = useState(null);
 
-  const onImportFileChosen = async (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    e.target.value = "";
-
-    let sourcePath = "";
+  // Calls inspect-dms with the given password (may be ""); on success shows
+  // the normal path-selection dialog, on a wrong/missing password shows the
+  // password prompt (with an error once one has actually been tried).
+  const inspectDmsFile = async (file, password) => {
+    setDmsImportError(null);
+    let inspectData = null;
     try {
       const inspectForm = new FormData();
       inspectForm.append("file", file);
+      if (password) inspectForm.append("password", password);
       const inspectRes = await fetch("/api/project/inspect-dms", { method: "POST", body: inspectForm });
-      if (inspectRes.ok) {
-        const inspectData = await inspectRes.json();
-        sourcePath = inspectData.source_path || "";
-      }
+      inspectData = await inspectRes.json().catch(() => null);
     } catch {}
 
+    // Still locked: either no password was given yet (backend returns
+    // ok:true with no source_path), or the one just tried was wrong
+    // (backend returns an error) — both carry encrypted:true.
+    if (inspectData?.encrypted && !inspectData?.source_path) {
+      setDmsImportDialog({ file, needsPassword: true, password: "" });
+      if (password) setDmsImportError(inspectData.error || t("密码错误。", "Incorrect password."));
+      return;
+    }
+
+    const sourcePath = inspectData?.source_path || "";
     const currentPath = storagePath || "";
     const pathsDiffer = sourcePath && sourcePath !== currentPath;
-    setDmsImportError(null);
     setDmsImportDialog({
       file,
       sourcePath,
       currentPath,
       chosenPathMode: pathsDiffer ? "source" : "current",
       customPath: "",
+      needsPassword: false,
+      password,
+      projectName: inspectData?.project_name || "",
     });
+  };
+
+  const onImportFileChosen = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    e.target.value = "";
+    await inspectDmsFile(file, "");
   };
 
   const doImportFromDialog = async () => {
     if (!dmsImportDialog) return;
-    const { file, sourcePath, currentPath, chosenPathMode, customPath } = dmsImportDialog;
+    const { file, sourcePath, currentPath, chosenPathMode, customPath, password } = dmsImportDialog;
 
     let targetPath = "";
     if (chosenPathMode === "source") targetPath = sourcePath;
@@ -8961,6 +10008,7 @@ function DMS({ storagePath, onChangeFolder }) {
       const form = new FormData();
       form.append("file", file);
       form.append("target_path", targetPath.trim());
+      if (password) form.append("password", password);
       const res = await fetch("/api/project/import", { method: "POST", body: form });
       if (res.status === 413) { setDmsImportError(t("文件过大，服务器拒绝接收。请检查服务器配置。", "The file is too large and the server refused it. Please check the server configuration.")); return; }
       if (!res.ok && res.headers.get("content-type")?.includes("text/html")) { setDmsImportError(t(`服务器错误 (${res.status})，请检查终端日志。`, `Server error (${res.status}) — please check the terminal log.`)); return; }
@@ -9033,7 +10081,11 @@ function DMS({ storagePath, onChangeFolder }) {
   const [textTreeCopied, setTextTreeCopied] = useState(false);
   const [showPlotDialog, setShowPlotDialog] = useState(false); // parameter-vs-time chart
   const [verifyDatesQueue, setVerifyDatesQueue] = useState(null); // docs with an auto-detected date to confirm after upload
-  const [dupDialog, setDupDialog] = useState(null); // { duplicates, allFiles, targetNodeId }
+  // { duplicates, allFiles, targetNodeId, mirror? }. `mirror` is only set
+  // for the "upload as sources" flow — { tree, fileNodeId } — where each
+  // file's target folder is resolved per-file (mirroring the source's
+  // subfolder structure) rather than being the single flat targetNodeId.
+  const [dupDialog, setDupDialog] = useState(null);
   const [uploadStatus, setUploadStatus] = useState(null); // { done, total } or null
   // Face recognition state
   const [faceSelectMode, setFaceSelectMode] = useState(false);
@@ -9062,10 +10114,19 @@ function DMS({ storagePath, onChangeFolder }) {
   const [downloadSelectMode, setDownloadSelectMode] = useState(false);
   const [downloadSelectedIds, setDownloadSelectedIds] = useState(new Set());
   const [downloadDialog, setDownloadDialog] = useState(null); // { path, reveal, busy, error }
+  const [downloadFolderBrowserOpen, setDownloadFolderBrowserOpen] = useState(false);
   useEffect(() => {
     setDownloadSelectMode(false);
     setDownloadSelectedIds(new Set());
   }, [selectedId]);
+
+  // Which document card shows the "working document" highlight — set
+  // whenever an inline editor (rename/SN/due/doc-date/metadata) is opened
+  // on a card, and left in place after saving so the highlight survives
+  // until a *different* document is worked on. Lifted up here (rather than
+  // kept as each DocumentCard's own local state) precisely so it outlives
+  // any single card's local editing state resetting on save/cancel.
+  const [lastWorkedDocId, setLastWorkedDocId] = useState(null);
 
   const openDownloadDialog = async () => {
     let defaultPath = "";
@@ -9156,6 +10217,10 @@ function DMS({ storagePath, onChangeFolder }) {
   const ctxUploadTargetRef = useRef(null);
   const [folderPickerOpen, setFolderPickerOpen] = useState(false);
   const [pendingFolderFiles, setPendingFolderFiles] = useState([]); // [{folderName, files}]
+  // When checked in the "Upload folder" dialog: recreate each source
+  // folder's subfolders as real DMS folders (no date-based routing) instead
+  // of the default flat/year-month placement.
+  const [mirrorSubfolders, setMirrorSubfolders] = useState(false);
   const multiFolderInputRef = useRef(null);
   const [draggingId, setDraggingId] = useState(null);
   const [dropInfo, setDropInfo] = useState(null);
@@ -9658,7 +10723,15 @@ function DMS({ storagePath, onChangeFolder }) {
   const uploadFilesToNode = async (
     targetNodeId,
     files,
-    { skipDuplicates = false, routeMode = "year-month" } = {}
+    // baseTreeOverride: use this tree instead of the component's own `tree`
+    // state as the starting point. Needed by the subfolder-mirroring
+    // upload, which pre-creates a batch of folders and persists them
+    // *before* calling this function — without the override, this
+    // function's usual `tree` closure would still be the pre-render
+    // snapshot from before those folders existed, so its diff-and-merge
+    // step at the end would never find them and any doc references
+    // pointed at them would silently vanish instead of attaching.
+    { skipDuplicates = false, routeMode = "year-month", baseTreeOverride = null } = {}
   ) => {
     console.log(`[DMS] uploadFilesToNode called, target=${targetNodeId}, files=${files.length}, mode=${routeMode}`);
     if (!files.length) return;
@@ -9685,9 +10758,9 @@ function DMS({ storagePath, onChangeFolder }) {
 
     const filesToProcess = files;
     if (!filesToProcess.length) { setUploadStatus(null); return; }
-    const baseTree = tree; // snapshot at the start of this (possibly long) upload
-    let workingTree = tree;
-    let workingIndex = [...docIndex];
+    // snapshot at the start of this (possibly long) upload
+    const baseTree = baseTreeOverride || tree;
+    let workingTree = baseTreeOverride || tree;
     const newIndexEntries = [];
     // Docs whose date was auto-detected from their own text during this
     // upload -- surfaced in a single review dialog once the upload finishes
@@ -9792,7 +10865,6 @@ function DMS({ storagePath, onChangeFolder }) {
           docDateVerified: false,
         } : {}),
       };
-      workingIndex = [...workingIndex, newEntry];
       newIndexEntries.push(newEntry);
       if (uploadResult.detectedDate) {
         pendingDateVerification.push({
@@ -9810,18 +10882,47 @@ function DMS({ storagePath, onChangeFolder }) {
       // user creates a folder (or another action edits the index) while the
       // upload is still running, blindly persisting the stale snapshot would
       // silently overwrite (and delete) that concurrent change.
-      let finalTree = workingTree;
-      let finalIndex = workingIndex;
-      try {
-        const [freshTreeResp, freshIndex] = await Promise.all([
-          StorageAdapter.getTree(),
-          StorageAdapter.listDocumentIndex(),
-        ]);
-        if (freshTreeResp?.tree) finalTree = mergeTreeAdditions(baseTree, workingTree, freshTreeResp.tree);
-        if (freshIndex) finalIndex = [...freshIndex, ...newIndexEntries];
-      } catch (e) {
-        console.warn("[DMS] Could not re-fetch latest tree/index before final save; using local snapshot", e);
+      //
+      // This re-fetch is retried a few times before giving up — and if it
+      // never succeeds, this function now ABORTS the save entirely instead
+      // of falling back to `workingTree` (the local snapshot from the
+      // *start* of the upload, before this file existed). That fallback used
+      // to silently PUT the whole array over the server's copy; if the
+      // snapshot itself was incomplete (e.g. this upload started before the
+      // initial tree/index fetch on page load had finished), that overwrite
+      // could silently wipe out hundreds of unrelated documents' metadata —
+      // which is exactly what happened once. The uploaded files themselves
+      // are already safely saved to disk at this point either way (each file
+      // was persisted individually above, via saveDocument) — aborting here
+      // only means they aren't linked into the folder tree/index yet; nothing
+      // that already existed is ever at risk of being overwritten.
+      let freshTreeResp = null, freshIndex = null, fetchError = null;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          [freshTreeResp, freshIndex] = await Promise.all([
+            StorageAdapter.getTree(),
+            StorageAdapter.listDocumentIndex(),
+          ]);
+          fetchError = null;
+          break;
+        } catch (e) {
+          fetchError = e;
+          console.warn(`[DMS] Re-fetch before final save failed (attempt ${attempt}/3)`, e);
+          if (attempt < 3) await new Promise((r) => setTimeout(r, 1000 * attempt));
+        }
       }
+
+      if (fetchError || !freshTreeResp?.tree || !freshIndex) {
+        console.error("[DMS] ✗ Could not verify the latest tree/index after 3 attempts — aborting the save to avoid overwriting other data.", fetchError);
+        alert(t(
+          `${filesToProcess.length - failedFiles.length} 个文件已保存到磁盘，但因无法确认最新的索引状态，本次未能将它们关联到文件夹中（未覆盖任何现有数据）。请稍后重新上传这些文件以完成关联。`,
+          `${filesToProcess.length - failedFiles.length} file(s) were saved to disk, but couldn't be linked into the folder tree because the latest index state couldn't be verified (no existing data was overwritten). Please try uploading these files again shortly to finish linking them.`
+        ));
+        return;
+      }
+
+      const finalTree = mergeTreeAdditions(baseTree, workingTree, freshTreeResp.tree);
+      const finalIndex = [...freshIndex, ...newIndexEntries];
       await persistTree(finalTree);
       await persistIndex(finalIndex);
       console.log("[DMS] ✓ Upload complete");
@@ -9839,6 +10940,96 @@ function DMS({ storagePath, onChangeFolder }) {
     }
   };
 
+  // Given a batch of files picked via a `webkitdirectory` input (so each
+  // File carries a webkitRelativePath like "SourceFolder/sub1/sub2/x.pdf"),
+  // resolve — creating as needed — the DMS folder each file belongs in, so
+  // the source's subfolder structure is mirrored under baseNodeId exactly.
+  // The picked folder's own top-level name is never recreated as a folder:
+  // its direct contents merge straight into the already-selected node,
+  // only its *subfolders* become new DMS folders. No date-based routing is
+  // ever applied here (unlike the default "year-month" upload mode).
+  // Returns [updatedTree, Map<File, nodeId>].
+  const resolveMirroredTargets = (startTree, baseNodeId, files) => {
+    let workingTree = startTree;
+    const pathToNodeId = new Map([["", baseNodeId]]);
+    const fileNodeId = new Map();
+    for (const file of files) {
+      const parts = (file.webkitRelativePath || file.name).split("/");
+      const dirParts = parts.slice(1, -1); // drop the top-level source-folder name and the filename itself
+      const key = dirParts.join("/");
+      let nodeId = pathToNodeId.get(key);
+      if (nodeId === undefined) {
+        nodeId = baseNodeId;
+        let partial = "";
+        for (const part of dirParts) {
+          partial = partial ? `${partial}/${part}` : part;
+          let cached = pathToNodeId.get(partial);
+          if (cached === undefined) {
+            [workingTree, cached] = getOrCreateChild(workingTree, nodeId, part);
+            pathToNodeId.set(partial, cached);
+          }
+          nodeId = cached;
+        }
+      }
+      fileNodeId.set(file, nodeId);
+    }
+    return [workingTree, fileNodeId];
+  };
+
+  // Persists the (already-resolved) mirrored folder structure once, then
+  // uploads every file into its resolved folder — grouped by folder so
+  // uploadFilesToNode's own tree/index merge runs once per distinct
+  // folder rather than once per file.
+  const runMirroredUpload = async (mirroredTree, fileNodeId, files) => {
+    if (!files.length) return;
+    await persistTree(mirroredTree);
+    const groups = new Map(); // nodeId -> File[]
+    for (const file of files) {
+      const nodeId = fileNodeId.get(file);
+      if (!groups.has(nodeId)) groups.set(nodeId, []);
+      groups.get(nodeId).push(file);
+    }
+    for (const [nodeId, groupFiles] of groups) {
+      await uploadFilesToNode(nodeId, groupFiles, {
+        skipDuplicates: true, routeMode: "current-folder", baseTreeOverride: mirroredTree,
+      });
+    }
+  };
+
+  // "Upload files and subfolders as the sources" — the mirroring option in
+  // the "Upload folder" dialog. Duplicate detection runs once up front
+  // across the whole batch (uploadFilesToNode's own per-call check isn't
+  // used here, since this upload is split across several per-folder calls
+  // afterward and would otherwise show one dialog per folder instead of one
+  // for the whole operation).
+  const uploadFilesMirroringSubfolders = async (baseNodeId, files) => {
+    if (!files.length) return;
+    if (!baseNodeId) {
+      alert(t("请先在装配树中点击选择一个文件夹。", "Please click to select a folder in the assembly tree first."));
+      return;
+    }
+
+    const nameSizeSet = new Set(docIndex.map((e) => `${e.name}::${e.size}`));
+    const duplicates = [];
+    for (const file of files) {
+      if (nameSizeSet.has(`${file.name}::${file.size}`)) {
+        const existing = docIndex.find((e) => e.name === file.name && e.size === file.size);
+        duplicates.push({ file, existing });
+      }
+    }
+
+    const [mirroredTree, fileNodeId] = resolveMirroredTargets(tree, baseNodeId, files);
+
+    if (duplicates.length > 0) {
+      setDupDialog({ duplicates, allFiles: files, targetNodeId: baseNodeId, mirror: { tree: mirroredTree, fileNodeId } });
+      return;
+    }
+
+    await runMirroredUpload(mirroredTree, fileNodeId, files);
+  };
+
+  // "Upload file" — the OS file picker (no `accept` filter, so every
+  // visible file type can be selected, not just photos).
   const handleUpload = async (e) => {
     console.log("[DMS] handleUpload triggered, files=", e.target.files);
     const files = Array.from(e.target.files || []);
@@ -9861,30 +11052,18 @@ function DMS({ storagePath, onChangeFolder }) {
     e.target.value = "";
   };
 
-  const handleFolderUpload = async (e) => {
-    const photoExts = new Set(["jpg","jpeg","png","heic","heif","tif","tiff","webp","gif","bmp"]);
-    const videoExts = new Set(["avi","mp4","mov","mkv","wmv","m4v","mpg","mpeg","3gp","flv","webm"]);
-    const files = Array.from(e.target.files || []).filter((f) => {
-      const ext = f.name.split(".").pop().toLowerCase();
-      return f.type.startsWith("image/") || f.type.startsWith("video/") || photoExts.has(ext) || videoExts.has(ext);
-    });
-    if (!files.length) { e.target.value = ""; alert(t("所选文件夹中未找到照片或视频文件。", "No photo or video files were found in the selected folder.")); return; }
-    if (!selectedNode) { e.target.value = ""; alert(t("请先在装配树中点击选择一个文件夹。", "Please click to select a folder in the assembly tree first.")); return; }
-    try {
-      await uploadFilesToNode(selectedId, files);
-    } catch (err) {
-      console.error("[DMS] ✗ Folder upload error:", err);
-      alert(t("上传过程中发生意外错误：", "An unexpected error occurred during upload: ") + err.message);
-    }
-    e.target.value = "";
-  };
-
   const openMultiFolderDialog = () => {
     if (!selectedNode) { alert(t("请先在装配树中点击选择一个文件夹。", "Please click to select a folder in the assembly tree first.")); return; }
     setPendingFolderFiles([]);
+    setMirrorSubfolders(false);
     setFolderPickerOpen(true);
   };
 
+  // "Upload folder" — the picker input has `webkitdirectory`, so the browser
+  // itself walks every subfolder under the chosen folder and hands back
+  // every file in the whole tree (each File's webkitRelativePath reflects
+  // its nested path). The only filtering here is OS junk files — every real
+  // file type (not just photos) is kept.
   const junkFileNames = new Set([".ds_store", "thumbs.db", "desktop.ini"]);
   const handleMultiFolderPickerChange = (e) => {
     const allFiles = Array.from(e.target.files || []);
@@ -9904,16 +11083,24 @@ function DMS({ storagePath, onChangeFolder }) {
   const handleMultiFolderUpload = async () => {
     const allFiles = pendingFolderFiles.flatMap((f) => f.files);
     if (!allFiles.length) return;
+    const useMirror = mirrorSubfolders;
     setFolderPickerOpen(false);
     setPendingFolderFiles([]);
+    setMirrorSubfolders(false);
     try {
-      await uploadFilesToNode(selectedId, allFiles);
+      if (useMirror) {
+        await uploadFilesMirroringSubfolders(selectedId, allFiles);
+      } else {
+        await uploadFilesToNode(selectedId, allFiles);
+      }
     } catch (err) {
       console.error("[DMS] ✗ Multi-folder upload error:", err);
       alert(t("上传过程中发生意外错误：", "An unexpected error occurred during upload: ") + err.message);
     }
   };
 
+  // "Don't create year/month folders" — same file picker as handleUpload
+  // (all file types selectable), just skips photo date-based routing.
   const handleCurrentFolderUpload = async (e) => {
     const files = Array.from(e.target.files || []);
     if (!files.length) {
@@ -10139,7 +11326,17 @@ function DMS({ storagePath, onChangeFolder }) {
   const enrichDocsForNode = (node) => {
     if (!node) return [];
     return (node.documents || [])
-      .map((ref) => docIndex.find((e) => e.id === ref.id))
+      .map((ref) => {
+        const base = docIndex.find((e) => e.id === ref.id);
+        if (!base) return null;
+        const override = (base.metaOverrides || {})[node.id];
+        if (!override) return base;
+        // Merge this folder's overrides on top of the shared base for
+        // display/editing. Keep the raw base metadata too (as
+        // `_baseMetadata`) so the editor can show which fields are
+        // folder-specific vs shared.
+        return { ...base, metadata: effectiveMetadata(base.metadata, override), _baseMetadata: base.metadata || {} };
+      })
       .filter(Boolean);
   };
 
@@ -10218,6 +11415,64 @@ function DMS({ storagePath, onChangeFolder }) {
 
     await StorageAdapter.saveTree(workingTree);
     // Reload from server to ensure UI reflects the saved state.
+    const { tree: freshTree } = await StorageAdapter.getTree();
+    const freshIndex = await StorageAdapter.listDocumentIndex();
+    setTree(freshTree);
+    setDocIndex(freshIndex);
+  };
+
+  // Bulk "remove from folder" for the normal-folder multi-select toolbar.
+  // Mirrors unlinkDocFromNode's per-doc behavior (a doc with no other links
+  // moves to the recycle bin; a doc still linked elsewhere just loses this
+  // folder's link) but for the whole selection at once — one confirm and
+  // one tree/index save, instead of a dialog and a round trip per document.
+  const unlinkDocsFromNodeBulk = async (docIds, nodeId) => {
+    const ids = Array.from(new Set(docIds));
+    if (!ids.length) return;
+    const idSet = new Set(ids);
+
+    const lastRefIds = ids.filter((id) => (refMap.get(id) || []).filter((n) => n !== nodeId).length === 0);
+    const linkedElsewhereCount = ids.length - lastRefIds.length;
+
+    let confirmMsg;
+    if (linkedElsewhereCount === 0) {
+      confirmMsg = t(
+        `确定从此文件夹移除选中的 ${ids.length} 份文档？\n\n文档将被移至根目录下的"${NOT_SHOW_FOLDER}"文件夹，文件保留在磁盘上。`,
+        `Remove the selected ${ids.length} document(s) from this folder?\n\nThey'll be moved to the "${NOT_SHOW_FOLDER}" folder at the root; the files stay on disk.`
+      );
+    } else if (lastRefIds.length === 0) {
+      confirmMsg = t(
+        `确定移除选中的 ${ids.length} 份文档在此文件夹的链接？\n\n这些文档仍链接至其他文件夹，文件不会从磁盘删除。`,
+        `Remove the selected ${ids.length} document(s)' links from this folder?\n\nThey're still linked to other folders; the files won't be deleted from disk.`
+      );
+    } else {
+      confirmMsg = t(
+        `确定从此文件夹移除选中的 ${ids.length} 份文档？\n\n其中 ${lastRefIds.length} 份无其他链接，将移至"${NOT_SHOW_FOLDER}"文件夹；其余 ${linkedElsewhereCount} 份仍链接至其他文件夹，仅移除此处的链接。`,
+        `Remove the selected ${ids.length} document(s) from this folder?\n\n${lastRefIds.length} have no other links and will move to the "${NOT_SHOW_FOLDER}" folder; the remaining ${linkedElsewhereCount} are still linked elsewhere and will only lose this folder's link.`
+      );
+    }
+    if (!confirm(confirmMsg)) return;
+
+    let workingTree = updateNodeInTree(tree, nodeId, (n) => ({
+      ...n,
+      documents: (n.documents || []).filter((d) => !idSet.has(d.id)),
+    }));
+
+    let updatedIndex = docIndex;
+    if (lastRefIds.length > 0) {
+      const lastRefSet = new Set(lastRefIds);
+      let notShowId;
+      [workingTree, notShowId] = getOrCreateNotShowNode(workingTree);
+      workingTree = updateNodeInTree(workingTree, notShowId, (n) => ({
+        ...n,
+        documents: [...(n.documents || []), ...lastRefIds.map((id) => ({ id }))],
+      }));
+      updatedIndex = docIndex.map((e) => (lastRefSet.has(e.id) ? { ...e, originalNodeId: notShowId } : e));
+      // Save docIndex first so the server's file-sync reads the updated originalNodeId.
+      await StorageAdapter.saveDocumentIndex(updatedIndex);
+    }
+
+    await StorageAdapter.saveTree(workingTree);
     const { tree: freshTree } = await StorageAdapter.getTree();
     const freshIndex = await StorageAdapter.listDocumentIndex();
     setTree(freshTree);
@@ -10322,17 +11577,53 @@ function DMS({ storagePath, onChangeFolder }) {
     setSelectedId(toNodeId);
   };
 
-  // Update metadata GLOBALLY (the user's chosen behavior — one set per document).
+  // Update a document's metadata as seen from a specific folder (`nodeId`).
+  // A doc referenced by only one folder behaves exactly as before — one
+  // shared metadata set, written straight to docIndex. Once a doc is linked
+  // into 2+ folders, only the fields actually touched from THIS folder fork
+  // into a per-folder override (metaOverrides[nodeId]); every other field,
+  // and every other folder that hasn't touched that field, keeps reading
+  // the shared base value untouched (copy-on-write — see effectiveMetadata
+  // above).
   // Fires once per keystroke (via ImeInput's onCommit), so this must be fast
   // and must read the latest index — not a value snapshotted in a stale
   // closure — or rapid edits silently clobber each other.
-  const updateDocMetadata = async (docId, metadata) => {
+  const updateDocMetadata = async (docId, metadata, nodeId) => {
     // No tree change needed, and no file re-upload needed either — metadata
-    // lives only in docIndex. (The server's /api/docs upload endpoint never
-    // even reads a metadata field, so the old fetch-file+re-upload round trip
-    // here was pure overhead — and, being slow, was exactly what widened the
-    // race window that caused dropped characters while typing.)
-    const newIndex = docIndexRef.current.map((e) => (e.id === docId ? { ...e, metadata } : e));
+    // (base or per-folder override) lives only in docIndex. (The server's
+    // /api/docs upload endpoint never even reads a metadata field, so the
+    // old fetch-file+re-upload round trip here was pure overhead — and,
+    // being slow, was exactly what widened the race window that caused
+    // dropped characters while typing.)
+    const current = docIndexRef.current.find((e) => e.id === docId);
+    const totalRefs = (refMap.get(docId) || []).length;
+
+    if (!nodeId || totalRefs <= 1) {
+      // Not linked into multiple folders (or no folder context) — same
+      // behavior as always: one shared metadata set.
+      const newIndex = docIndexRef.current.map((e) => (e.id === docId ? { ...e, metadata } : e));
+      await persistIndex(newIndex);
+      return;
+    }
+
+    // Multi-linked: fork only the fields that actually changed from what
+    // this folder was showing (base + this folder's prior overrides, if
+    // any). Untouched fields, and every other folder's view, are unaffected.
+    const baseMetadata = current?.metadata || {};
+    const priorOverride = (current?.metaOverrides || {})[nodeId] || {};
+    const priorEffective = effectiveMetadata(baseMetadata, priorOverride);
+    const newMetadata = metadata || {};
+    const touchedKeys = [...new Set([...Object.keys(priorEffective), ...Object.keys(newMetadata)])]
+      .filter((k) => JSON.stringify(priorEffective[k]) !== JSON.stringify(newMetadata[k]));
+
+    const nextOverride = { ...priorOverride };
+    for (const k of touchedKeys) {
+      nextOverride[k] = newMetadata[k] === undefined ? { __deleted: true } : newMetadata[k];
+    }
+
+    const newIndex = docIndexRef.current.map((e) =>
+      e.id === docId ? { ...e, metaOverrides: { ...(e.metaOverrides || {}), [nodeId]: nextOverride } } : e
+    );
     await persistIndex(newIndex);
   };
 
@@ -10606,6 +11897,15 @@ function DMS({ storagePath, onChangeFolder }) {
             <HardDrive size={11} />
             <span className="font-mono truncate">{storagePath || "—"}</span>
           </button>
+          {projectAuthStatus?.password_required && (
+            <span
+              className="flex items-center gap-1 px-2 py-1 border border-amber-300 bg-amber-50 text-amber-800 rounded"
+              title={t(`此项目已受密码保护：${projectAuthStatus.name || ""}`, `This project is password-protected: ${projectAuthStatus.name || ""}`)}
+            >
+              <Lock size={11} />
+              {projectAuthStatus.name && <span className="truncate max-w-[140px]">{projectAuthStatus.name}</span>}
+            </span>
+          )}
           <span className="text-stone-300">|</span>
           <span className="tabular-nums">{t(`已索引 ${docIndex.length} 份文档`, `${docIndex.length} documents indexed`)}</span>
           <span className="text-stone-300">|</span>
@@ -11154,7 +12454,7 @@ function DMS({ storagePath, onChangeFolder }) {
                           onClick={() => { setDownloadSelectMode(true); setDownloadSelectedIds(new Set()); }}
                           className="text-xs px-3 py-1.5 border border-stone-300 hover:bg-amber-50 hover:border-amber-400 text-stone-700 rounded flex items-center gap-1.5"
                         >
-                          <CheckSquare size={12} /> {t("多选下载", "Select to download")}
+                          <CheckSquare size={12} /> {t("多选", "Select")}
                         </button>
                       ) : (
                         <>
@@ -11188,6 +12488,18 @@ function DMS({ storagePath, onChangeFolder }) {
                         >
                           <Download size={12} /> {t("下载", "Download")} ({downloadSelectedIds.size})
                         </button>
+                        <button
+                          onClick={async () => {
+                            await unlinkDocsFromNodeBulk(Array.from(downloadSelectedIds), selectedId);
+                            setDownloadSelectedIds(new Set());
+                            setDownloadSelectMode(false);
+                          }}
+                          disabled={downloadSelectedIds.size === 0}
+                          className="text-xs px-3 py-1.5 border border-red-400 bg-red-50 hover:bg-red-100 text-red-700 rounded flex items-center gap-1.5 disabled:opacity-40"
+                          title={t("从此文件夹移除选中的文档（无其他链接的会移至回收站，文件不会丢失）", "Remove the selected documents from this folder (any with no other links move to the recycle bin — files aren't lost)")}
+                        >
+                          <Trash2 size={12} /> {t("删除", "Delete")} ({downloadSelectedIds.size})
+                        </button>
                       </div>
                     )}
                   </div>
@@ -11212,7 +12524,7 @@ function DMS({ storagePath, onChangeFolder }) {
                         onOpen={() => openDoc(doc.id)}
                         onOpenNative={() => openDocNative(doc.id)}
                         onDelete={() => deleteDoc(doc.id)}
-                        onUpdateMeta={(m) => updateDocMetadata(doc.id, m)}
+                        onUpdateMeta={(m) => updateDocMetadata(doc.id, m, selectedId)}
                         onUpdateName={(newName) => renameDoc(doc.id, newName)}
                         onUpdateSn={(newSn) => updateDocSn(doc.id, newSn)}
                         onUpdateDueDate={(d) => updateDocDueDate(doc.id, d)}
@@ -11239,6 +12551,8 @@ function DMS({ storagePath, onChangeFolder }) {
                         isDragging={draggingDocId === doc.id}
                         onDragStart={() => handleDocDragStart(doc.id, selectedId)}
                         onDragEnd={handleDocDragEnd}
+                        isLastWorked={lastWorkedDocId === doc.id}
+                        onMarkWorked={() => setLastWorkedDocId(doc.id)}
                       />
                     );
                   })}
@@ -11474,7 +12788,7 @@ function DMS({ storagePath, onChangeFolder }) {
       />
 
       {folderPickerOpen && (
-        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center" onClick={(e) => { if (e.target === e.currentTarget) { setFolderPickerOpen(false); setPendingFolderFiles([]); } }}>
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center" onClick={(e) => { if (e.target === e.currentTarget) { setFolderPickerOpen(false); setPendingFolderFiles([]); setMirrorSubfolders(false); } }}>
           <div className="bg-white rounded-lg shadow-xl p-6 w-96 flex flex-col gap-4">
             <h3 className="font-semibold text-sm text-stone-800">{t("上传多个文件夹", "Upload multiple folders")}</h3>
             <div className="min-h-[80px] space-y-1.5">
@@ -11494,8 +12808,22 @@ function DMS({ storagePath, onChangeFolder }) {
               {t("+ 添加文件夹", "+ Add folder")}
               <input ref={multiFolderInputRef} type="file" webkitdirectory="" multiple onChange={handleMultiFolderPickerChange} className="hidden" />
             </label>
+            <label className="flex items-start gap-2 text-xs text-stone-600 border border-stone-200 rounded px-3 py-2 bg-stone-50 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={mirrorSubfolders}
+                onChange={(e) => setMirrorSubfolders(e.target.checked)}
+                className="accent-amber-600 mt-0.5"
+              />
+              <span>
+                {t("按来源文件夹结构上传", "Upload files and subfolders as the sources")}
+                <span className="block text-[10px] text-stone-400 mt-0.5">
+                  {t("每个文件夹中的子文件夹将在此处原样创建；不按日期生成年/月文件夹。", "Subfolders in each picked folder are recreated here exactly as they are; no year/month folders are created based on file dates.")}
+                </span>
+              </span>
+            </label>
             <div className="flex justify-end gap-2">
-              <button onClick={() => { setFolderPickerOpen(false); setPendingFolderFiles([]); }} className="text-xs px-3 py-1.5 rounded border border-stone-300 hover:bg-stone-50 text-stone-600">{t("取消", "Cancel")}</button>
+              <button onClick={() => { setFolderPickerOpen(false); setPendingFolderFiles([]); setMirrorSubfolders(false); }} className="text-xs px-3 py-1.5 rounded border border-stone-300 hover:bg-stone-50 text-stone-600">{t("取消", "Cancel")}</button>
               <button
                 onClick={handleMultiFolderUpload}
                 disabled={pendingFolderFiles.length === 0}
@@ -11516,13 +12844,22 @@ function DMS({ storagePath, onChangeFolder }) {
             </h3>
             <label className="text-xs text-stone-600">
               {t("保存至文件夹", "Save to folder")}
-              <input
-                type="text"
-                value={downloadDialog.path}
-                onChange={(e) => setDownloadDialog((d) => ({ ...d, path: e.target.value }))}
-                placeholder={t("例如：/Users/你/Downloads", "e.g. /Users/you/Downloads")}
-                className="mt-1 w-full text-xs px-2 py-1.5 border border-stone-300 rounded font-mono"
-              />
+              <div className="mt-1 flex gap-1.5">
+                <input
+                  type="text"
+                  value={downloadDialog.path}
+                  onChange={(e) => setDownloadDialog((d) => ({ ...d, path: e.target.value }))}
+                  placeholder={t("例如：/Users/你/Downloads", "e.g. /Users/you/Downloads")}
+                  className="flex-1 min-w-0 text-xs px-2 py-1.5 border border-stone-300 rounded font-mono"
+                />
+                <button
+                  type="button"
+                  onClick={() => setDownloadFolderBrowserOpen(true)}
+                  className="shrink-0 flex items-center gap-1 text-xs px-2.5 py-1.5 border border-stone-300 rounded hover:bg-stone-50 text-stone-600"
+                >
+                  <FolderOpen size={12} /> {t("浏览…", "Browse…")}
+                </button>
+              </div>
             </label>
             <button
               onClick={openDownloadDialog}
@@ -11560,6 +12897,17 @@ function DMS({ storagePath, onChangeFolder }) {
         </div>
       )}
 
+      {downloadFolderBrowserOpen && (
+        <FolderBrowserModal
+          startPath={downloadDialog?.path || ""}
+          onClose={() => setDownloadFolderBrowserOpen(false)}
+          onSelect={(path) => {
+            setDownloadDialog((d) => ({ ...d, path }));
+            setDownloadFolderBrowserOpen(false);
+          }}
+        />
+      )}
+
       {dupDialog && (
         <DuplicateDialog
           duplicates={dupDialog.duplicates}
@@ -11568,13 +12916,51 @@ function DMS({ storagePath, onChangeFolder }) {
           getPathFor={(id) => getNodePathFrom(tree, id)}
           onCancel={() => setDupDialog(null)}
           onUploadAll={() => {
-            const { allFiles, targetNodeId } = dupDialog;
+            const { allFiles, targetNodeId, mirror } = dupDialog;
             setDupDialog(null);
-            uploadFilesToNode(targetNodeId, allFiles, { skipDuplicates: true });
+            if (mirror) {
+              runMirroredUpload(mirror.tree, mirror.fileNodeId, allFiles);
+            } else {
+              uploadFilesToNode(targetNodeId, allFiles, { skipDuplicates: true });
+            }
           }}
           onLink={async () => {
-            const { duplicates, allFiles, targetNodeId } = dupDialog;
+            const { duplicates, allFiles, targetNodeId, mirror } = dupDialog;
             setDupDialog(null);
+
+            if (mirror) {
+              // Link each duplicate straight into the folder it would have
+              // uploaded to (its resolved mirrored subfolder) instead of
+              // storing a second copy of the file.
+              let newTree = mirror.tree;
+              for (const { file, existing } of duplicates) {
+                const linkNodeId = mirror.fileNodeId.get(file) || targetNodeId;
+                const target = findNode(newTree, linkNodeId);
+                if (!target) continue;
+                if ((target.documents || []).some((d) => d.id === existing.id)) continue;
+                newTree = updateNodeInTree(newTree, linkNodeId, (n) => ({
+                  ...n,
+                  documents: [...(n.documents || []), { id: existing.id }],
+                }));
+              }
+              await persistTree(newTree);
+              const nonDups = allFiles.filter((f) => !duplicates.some((d) => d.file === f));
+              if (nonDups.length) {
+                const groups = new Map();
+                for (const f of nonDups) {
+                  const nid = mirror.fileNodeId.get(f) || targetNodeId;
+                  if (!groups.has(nid)) groups.set(nid, []);
+                  groups.get(nid).push(f);
+                }
+                for (const [nid, groupFiles] of groups) {
+                  await uploadFilesToNode(nid, groupFiles, {
+                    skipDuplicates: true, routeMode: "current-folder", baseTreeOverride: newTree,
+                  });
+                }
+              }
+              return;
+            }
+
             // Build all links in one tree update so no call reads stale state.
             // Mirror the upload routing: if the original doc lived in a year/month
             // node, create the same year/month subfolder under the target and link there.
@@ -11612,10 +12998,14 @@ function DMS({ storagePath, onChangeFolder }) {
             }
           }}
           onSkip={() => {
-            const { duplicates, allFiles, targetNodeId } = dupDialog;
+            const { duplicates, allFiles, targetNodeId, mirror } = dupDialog;
             setDupDialog(null);
             const nonDups = allFiles.filter((f) => !duplicates.some((d) => d.file === f));
-            uploadFilesToNode(targetNodeId, nonDups, { skipDuplicates: true });
+            if (mirror) {
+              runMirroredUpload(mirror.tree, mirror.fileNodeId, nonDups);
+            } else {
+              uploadFilesToNode(targetNodeId, nonDups, { skipDuplicates: true });
+            }
           }}
         />
       )}
@@ -11636,7 +13026,61 @@ function DMS({ storagePath, onChangeFolder }) {
         />
       )}
 
-      {dmsImportDialog && (
+      {dmsImportDialog && dmsImportDialog.needsPassword && (
+        <div
+          className="fixed inset-0 bg-stone-900/70 z-50 flex items-center justify-center p-4"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="bg-white w-full max-w-md rounded shadow-2xl p-5">
+            <div className="text-[10px] tracking-[0.2em] uppercase text-stone-500 mb-1">
+              {t("导入项目", "Import project")}
+            </div>
+            <h2 className="text-lg font-semibold text-stone-900 mb-2">
+              {t("此文件受密码保护", "This file is password-protected")}
+            </h2>
+            <p className="text-xs text-stone-600 mb-4">
+              <strong className="font-mono">{dmsImportDialog.file.name}</strong>
+              {" "}{t("需要导出时设置的密码才能打开（与 DMS 应用登录密码无关）。", "needs the password it was exported with to open (unrelated to the DMS app's own login password).")}
+            </p>
+
+            <label className="block text-xs uppercase tracking-wider text-stone-600 mb-1.5">
+              {t("密码", "Password")}
+            </label>
+            <input
+              type="password"
+              autoFocus
+              value={dmsImportDialog.password}
+              onChange={(e) => setDmsImportDialog({ ...dmsImportDialog, password: e.target.value })}
+              onKeyDown={(e) => { if (e.key === "Enter") inspectDmsFile(dmsImportDialog.file, dmsImportDialog.password); }}
+              className="w-full px-2 py-1.5 text-sm border border-stone-300 rounded mb-3"
+            />
+
+            {dmsImportError && (
+              <div className="text-xs text-red-700 bg-red-50 border border-red-200 rounded p-2 mb-3 whitespace-pre-wrap">
+                {dmsImportError}
+              </div>
+            )}
+
+            <div className="flex gap-2 justify-end">
+              <button
+                onClick={() => { setDmsImportDialog(null); setDmsImportError(null); }}
+                className="px-4 py-1.5 text-xs border border-stone-300 hover:bg-stone-100 rounded disabled:opacity-60"
+              >
+                {t("取消", "Cancel")}
+              </button>
+              <button
+                onClick={() => inspectDmsFile(dmsImportDialog.file, dmsImportDialog.password)}
+                disabled={!dmsImportDialog.password}
+                className="px-4 py-1.5 text-xs bg-amber-600 hover:bg-amber-700 text-white rounded disabled:opacity-60"
+              >
+                {t("继续", "Continue")}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {dmsImportDialog && !dmsImportDialog.needsPassword && (
         <div
           className="fixed inset-0 bg-stone-900/70 z-50 flex items-center justify-center p-4"
           onClick={(e) => e.stopPropagation()}
@@ -11651,6 +13095,9 @@ function DMS({ storagePath, onChangeFolder }) {
             <p className="text-xs text-stone-600 mb-4">
               {t("正在导入", "Importing")} <strong className="font-mono">{dmsImportDialog.file.name}</strong>
               （{Math.round(dmsImportDialog.file.size / 1024)} KB）
+              {dmsImportDialog.projectName && (
+                <> — {t("项目", "project")} <strong>{dmsImportDialog.projectName}</strong></>
+              )}
             </p>
 
             <div className="space-y-3 mb-4">
@@ -11750,8 +13197,17 @@ function DMS({ storagePath, onChangeFolder }) {
   );
 }
 
+// A `?popout=plot&key=...` URL (opened by FolderPlotDialog's "pop out"
+// button, see popOut() there) renders just the standalone chart window
+// instead of the full app -- this is a separate top-level browser window,
+// not part of the main app's UI tree.
+const _popoutParams = new URLSearchParams(location.search);
 const root = ReactDOM.createRoot(document.getElementById("root"));
-root.render(<Root />);
+if (_popoutParams.get("popout") === "plot") {
+  root.render(<PlotPopoutApp storageKey={_popoutParams.get("key") || ""} />);
+} else {
+  root.render(<Root />);
+}
 
 // Startup banner
 console.log("%c[DMS] Document Management System loaded — build 2026-06-02-text-tree","color:#b45309;font-weight:bold;font-size:14px");

@@ -168,6 +168,39 @@ def _doc_path(docs_dir: Path, doc_id: str) -> Path | None:
 # ---------------------------------------------------------------------------
 # Image → single-PDF-page conversion (Pillow)
 # ---------------------------------------------------------------------------
+# Photos are only ever displayed shrunk to fit a letter-size page (see below),
+# but reportlab's drawImage embeds whatever pixel data it's handed — passing
+# it the original file directly (as this used to) bakes the FULL original
+# resolution into the PDF, deflate-compressed as a near-raw pixel array
+# rather than JPEG. For a modern phone photo (e.g. 3024x4032) that's ~14 MB
+# per image once embedded, even though HEIC/JPEG source files are ~1 MB —
+# merging 100+ photos this way produced a multi-gigabyte PDF. Downscaling to
+# a box no bigger than any page can actually show, and re-encoding as JPEG
+# before handing it to reportlab, cuts that by two-plus orders of magnitude
+# with no visible loss on the page.
+_MAX_EMBED_DIM = 900   # px, longest edge fit within this box (~165x smaller than embedding full-res)
+_EMBED_JPEG_QUALITY = 85
+
+
+def _downscaled_jpeg_reader(img_path: Path) -> "ImageReader":
+    """Open an image, downscale it to fit within _MAX_EMBED_DIM x _MAX_EMBED_DIM
+    (no upscaling — small images pass through unchanged), and return an
+    ImageReader wrapping a re-encoded JPEG. reportlab embeds an already-JPEG
+    source as-is (no further re-compression), so this is what actually keeps
+    the output PDF small — resizing alone wouldn't help if reportlab still
+    stored the result as a raw/deflate pixel array."""
+    with Image.open(img_path) as im:
+        im = im.convert("RGB")
+        iw, ih = im.size
+        scale = min(1.0, _MAX_EMBED_DIM / max(iw, ih))
+        if scale < 1.0:
+            im = im.resize((max(1, round(iw * scale)), max(1, round(ih * scale))), Image.LANCZOS)
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=_EMBED_JPEG_QUALITY, optimize=True)
+        buf.seek(0)
+        return ImageReader(buf)
+
+
 def _image_to_pdf_bytes(img_path: Path, caption: str) -> bytes:
     """Convert an image into a single-page PDF using reportlab, preserving aspect."""
     buf = io.BytesIO()
@@ -184,17 +217,17 @@ def _image_to_pdf_bytes(img_path: Path, caption: str) -> bytes:
     avail_h = top_y - MARGIN
 
     try:
-        with Image.open(img_path) as im:
-            iw, ih = im.size
-            scale = min(avail_w / iw, avail_h / ih)
-            draw_w = iw * scale
-            draw_h = ih * scale
-            x = (PAGE_W - draw_w) / 2
-            y = MARGIN + (avail_h - draw_h) / 2
-            c.drawImage(
-                str(img_path), x, y, width=draw_w, height=draw_h,
-                preserveAspectRatio=True, anchor="c",
-            )
+        reader = _downscaled_jpeg_reader(img_path)
+        iw, ih = reader.getSize()
+        scale = min(avail_w / iw, avail_h / ih)
+        draw_w = iw * scale
+        draw_h = ih * scale
+        x = (PAGE_W - draw_w) / 2
+        y = MARGIN + (avail_h - draw_h) / 2
+        c.drawImage(
+            reader, x, y, width=draw_w, height=draw_h,
+            preserveAspectRatio=True, anchor="c",
+        )
     except Exception as e:
         c.setFont(_FONT, 10)
         c.setFillColor(SUBTLE)

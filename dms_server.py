@@ -1043,6 +1043,146 @@ def decrypt_secret(token: str) -> str:
     return f.decrypt(token.encode("ascii")).decode("utf-8")
 
 
+# ---------------------------------------------------------------------------
+# .dms file encryption primitives
+#
+# Used to encrypt an exported .dms file's bytes with the *project* password
+# (see "Per-project identity & password" below) so the file can't be
+# opened/imported without it, even by someone with no access to this server
+# at all (a different machine, a shared drive, an email attachment). The key
+# is derived fresh from the password + a random per-file salt (stored in the
+# file's own header) via PBKDF2-HMAC-SHA256, then used as a Fernet key to
+# encrypt the whole zip's bytes as one blob.
+# ---------------------------------------------------------------------------
+_DMS_ENC_MAGIC = b"DMSENC1\0"  # 8 bytes, identifies an encrypted .dms file
+_DMS_ENC_SALT_LEN = 16
+
+
+def _derive_fernet_key(password: str, salt: bytes) -> bytes:
+    raw = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000, dklen=32)
+    return base64.urlsafe_b64encode(raw)
+
+
+def _encrypt_project_bytes(data: bytes, password: str) -> bytes:
+    from cryptography.fernet import Fernet
+    salt = secrets.token_bytes(_DMS_ENC_SALT_LEN)
+    key = _derive_fernet_key(password, salt)
+    token = Fernet(key).encrypt(data)
+    return _DMS_ENC_MAGIC + salt + token
+
+
+def _is_encrypted_project_blob(data: bytes) -> bool:
+    return data[: len(_DMS_ENC_MAGIC)] == _DMS_ENC_MAGIC
+
+
+def _decrypt_project_bytes(blob: bytes, password: str) -> bytes:
+    """Raises cryptography.fernet.InvalidToken on a wrong password."""
+    from cryptography.fernet import Fernet
+    salt = blob[len(_DMS_ENC_MAGIC):len(_DMS_ENC_MAGIC) + _DMS_ENC_SALT_LEN]
+    token = blob[len(_DMS_ENC_MAGIC) + _DMS_ENC_SALT_LEN:]
+    key = _derive_fernet_key(password, salt)
+    return Fernet(key).decrypt(token)
+
+
+# ---------------------------------------------------------------------------
+# Per-project identity & password
+#
+# Unlike the app-login password above (global, lives in ~/.pms_dms_config.json,
+# gates the whole server regardless of which project folder is open), this
+# password belongs to one specific *project*: it's stored as a small file
+# INSIDE that project's own storage folder, so it travels with the folder —
+# copy/move/sync it (e.g. via OneDrive) to another machine and that machine
+# enforces the same password. One project password serves two purposes:
+#   1. Gates direct access whenever DMS.app has this folder open as the
+#      active project — even with no app-login password set at all.
+#   2. Is used to automatically encrypt every .dms export of this project
+#      (see _write_dms_zip / _maybe_encrypt_dms_file_in_place) — no separate
+#      per-export password prompt.
+# Only the password's hash is ever written to disk (see hash_password);
+# the plaintext is cached in memory ONLY, for the life of an unlocked
+# session, so exports made during that session can reuse it without asking
+# again. Restarting the server (or switching to a different project) drops
+# that cache — the project password must be re-entered to unlock again.
+# ---------------------------------------------------------------------------
+PROJECT_META_FILENAME = ".dms_project.json"
+
+
+def _project_meta_path(root: Path) -> Path:
+    return root / PROJECT_META_FILENAME
+
+
+def load_project_meta(root: Path) -> dict:
+    p = _project_meta_path(root)
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def save_project_meta(root: Path, meta: dict) -> None:
+    _project_meta_path(root).write_text(json.dumps(meta, indent=2))
+
+
+def get_project_name(root: Path) -> str:
+    name = (load_project_meta(root).get("name") or "").strip()
+    return name or root.name
+
+
+def project_password_required(root: "Path | None" = None) -> bool:
+    root = root if root is not None else get_storage_root()
+    if not root or not root.exists():
+        return False
+    return bool(load_project_meta(root).get("password_hash"))
+
+
+def verify_project_password(root: Path, password: str) -> bool:
+    meta = load_project_meta(root)
+    if not meta.get("password_hash"):
+        return True  # no password set
+    return hash_password(password, meta.get("password_salt", "")) == meta.get("password_hash", "")
+
+
+# In-memory only — cleared on server restart, project switch, logout, or a
+# password change. `_project_session_root` records which storage root the
+# tokens/cache below currently apply to; see _sync_project_session_scope.
+_PROJECT_SESSION_TOKENS: set[str] = set()
+_project_session_root: str = ""
+_project_password_cache: str = ""
+
+
+def _sync_project_session_scope() -> None:
+    """Whenever the active project (storage root) changes, drop any
+    session/cache left over from the previous one — a stale cookie from
+    project A must never unlock project B, and B's exports must never be
+    silently encrypted with A's cached password."""
+    global _project_session_root, _project_password_cache
+    root = get_storage_root()
+    cur = str(root) if root else ""
+    if cur != _project_session_root:
+        _PROJECT_SESSION_TOKENS.clear()
+        _project_password_cache = ""
+        _project_session_root = cur
+
+
+def is_project_authenticated() -> bool:
+    _sync_project_session_scope()
+    if not project_password_required():
+        return True
+    token = request.cookies.get("dms_project_session", "")
+    return token in _PROJECT_SESSION_TOKENS
+
+
+def issue_project_session_token() -> str:
+    _sync_project_session_scope()
+    token = secrets.token_urlsafe(32)
+    if len(_PROJECT_SESSION_TOKENS) > 10_000:
+        _PROJECT_SESSION_TOKENS.clear()
+    _PROJECT_SESSION_TOKENS.add(token)
+    return token
+
+
 # Active session tokens (in-memory only — restarting the server logs everyone out)
 _SESSION_TOKENS: set[str] = set()
 
@@ -1312,12 +1452,29 @@ _PUBLIC_ENDPOINTS = {
     "auth_status",
     "auth_login",
     "auth_logout",
+    "project_auth_status",  # lets the locked screen show the project's name + check state
+    "project_auth_login",
+    "project_auth_logout",
     "mobile_upload_page",   # mobile page handles its own auth in JS
     "mobile_upload",        # allow upload without session on local network
     "remote_mobile_page",   # token-gated remote upload page — token is the auth
     "download_token",       # one-time download links sent to phone
     "mobile_browse_page",         # browse page handles its own auth in JS
     "remote_mobile_browse_page",  # token-gated remote browse page
+}
+
+# Endpoints that switch (or just inspect) which project is active. These must
+# stay reachable even while the CURRENTLY active project is locked — without
+# this, a forgotten project password would permanently strand the user with
+# no way to start a new project or import a different one instead. They're
+# still gated by the app-login password above, unlike _PUBLIC_ENDPOINTS.
+_PROJECT_GATE_EXEMPT_ENDPOINTS = {
+    "get_settings",
+    "set_settings",
+    "check_storage_path",
+    "import_project",
+    "inspect_dms",
+    "new_project",
 }
 
 
@@ -1336,8 +1493,14 @@ def add_ngrok_header(response):
 
 @app.before_request
 def enforce_auth():
-    """Require a valid session cookie when password is enabled.
-
+    """Require a valid session cookie when a password is enabled — checked in
+    two independent, stackable stages:
+      1. The app-login password (global, gates the whole server regardless
+         of which project is open).
+      2. The active project's own password, if it has one (see "Per-project
+         identity & password" above) — this is what makes opening DMS.app
+         pointed straight at a protected project folder ask for a password
+         too, not just importing its exported .dms file.
     Public endpoints (login, etc.) are always accessible. Static files (the
     main page) get a friendly login HTML; API endpoints get JSON 401.
     """
@@ -1345,19 +1508,23 @@ def enforce_auth():
     if request.endpoint in _PUBLIC_ENDPOINTS:
         return None
 
-    if not password_required():
+    if password_required() and not is_authenticated():
+        path = request.path
+        if path.startswith("/api/"):
+            return jsonify({"error": "Authentication required", "code": "auth_required"}), 401
+        return Response(_LOGIN_PAGE_HTML, mimetype="text/html"), 401
+
+    if request.endpoint in _PROJECT_GATE_EXEMPT_ENDPOINTS:
         return None
 
-    if is_authenticated():
-        return None
+    if project_password_required() and not is_project_authenticated():
+        path = request.path
+        if path.startswith("/api/"):
+            return jsonify({"error": "This project is password-protected", "code": "project_auth_required"}), 401
+        root = get_storage_root()
+        return Response(_project_login_page_html(get_project_name(root) if root else ""), mimetype="text/html"), 401
 
-    # Not authenticated. Decide what to send back.
-    path = request.path
-    if path.startswith("/api/"):
-        return jsonify({"error": "Authentication required", "code": "auth_required"}), 401
-
-    # For the main page, serve the login screen
-    return Response(_LOGIN_PAGE_HTML, mimetype="text/html"), 401
+    return None
 
 
 _LOGIN_PAGE_HTML = """<!DOCTYPE html>
@@ -1416,6 +1583,123 @@ async function doLogin(e) {
     err.textContent = msg;
     err.style.display = 'block';
     document.getElementById('pw').select();
+  }
+  return false;
+}
+</script>
+</body>
+</html>
+"""
+
+
+def _project_login_page_html(project_name: str) -> str:
+    """Like _LOGIN_PAGE_HTML, but for unlocking one specific project (see
+    "Per-project identity & password" above) rather than the whole app."""
+    import html as _html
+    safe_name = _html.escape(project_name or "this project")
+    return """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DMS — Project locked</title>
+<style>
+  body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+         background: #fafaf9; margin: 0; height: 100vh;
+         display: flex; align-items: center; justify-content: center; }
+  .card { background: white; border: 1px solid #d6d3d1; border-radius: 6px;
+          padding: 28px; width: 360px; box-shadow: 0 2px 4px rgba(0,0,0,.04); }
+  .kicker { font-size: 10px; letter-spacing: .2em; text-transform: uppercase;
+            color: #78716c; margin-bottom: 4px; }
+  h1 { font-size: 20px; margin: 0 0 4px; color: #1c1917; font-weight: 600; }
+  .sub { font-size: 12px; color: #78716c; margin: 0 0 16px; word-break: break-word; }
+  label { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: .1em;
+          color: #57534e; margin-bottom: 6px; }
+  input[type=password] { width: 100%; padding: 8px 10px; font-size: 14px;
+          border: 1px solid #d6d3d1; border-radius: 4px; box-sizing: border-box; }
+  input[type=password]:focus { outline: none; border-color: #b45309; }
+  button { width: 100%; margin-top: 12px; padding: 9px;
+           background: #b45309; color: white; border: 0; border-radius: 4px;
+           font-size: 14px; font-weight: 500; cursor: pointer; }
+  button:hover { background: #92400e; }
+  .error { color: #b91c1c; background: #fef2f2; border: 1px solid #fecaca;
+           padding: 8px; border-radius: 4px; font-size: 12px; margin-top: 10px; display: none; }
+  .switch-link { display: block; text-align: center; margin-top: 16px;
+           font-size: 12px; color: #78716c; cursor: pointer; text-decoration: underline; }
+  .switch-box { display: none; margin-top: 14px; padding-top: 14px; border-top: 1px solid #e7e5e4; }
+  .switch-box input[type=text] { width: 100%; padding: 7px 9px; font-size: 13px;
+           border: 1px solid #d6d3d1; border-radius: 4px; box-sizing: border-box; font-family: ui-monospace, monospace; }
+  .switch-box input[type=text]:focus { outline: none; border-color: #b45309; }
+  .switch-box button { background: #57534e; }
+  .switch-box button:hover { background: #44403c; }
+</style>
+</head>
+<body>
+<div class="card">
+  <form onsubmit="return doLogin(event)">
+    <div class="kicker">Password-protected project</div>
+    <h1>Unlock project</h1>
+    <p class="sub">""" + safe_name + """</p>
+    <label for="pw">Password</label>
+    <input id="pw" type="password" autofocus>
+    <button type="submit">Unlock</button>
+    <div id="err" class="error"></div>
+  </form>
+  <div class="switch-link" onclick="toggleSwitch()">Open a different project folder instead</div>
+  <div class="switch-box" id="switchBox">
+    <form onsubmit="return doSwitch(event)">
+      <label for="path">Project folder path</label>
+      <input id="path" type="text" placeholder="/path/to/other/project">
+      <button type="submit">Open this folder</button>
+      <div id="switchErr" class="error"></div>
+    </form>
+  </div>
+</div>
+<script>
+async function doLogin(e) {
+  e.preventDefault();
+  const pw = document.getElementById('pw').value;
+  const err = document.getElementById('err');
+  err.style.display = 'none';
+  const r = await fetch('/api/project-auth/login', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({password: pw})
+  });
+  if (r.ok) {
+    window.location.href = '/';
+  } else {
+    let msg = 'Incorrect password.';
+    try { msg = (await r.json()).error || msg; } catch {}
+    err.textContent = msg;
+    err.style.display = 'block';
+    document.getElementById('pw').select();
+  }
+  return false;
+}
+function toggleSwitch() {
+  const box = document.getElementById('switchBox');
+  box.style.display = box.style.display === 'block' ? 'none' : 'block';
+  if (box.style.display === 'block') document.getElementById('path').focus();
+}
+async function doSwitch(e) {
+  e.preventDefault();
+  const path = document.getElementById('path').value.trim();
+  const err = document.getElementById('switchErr');
+  err.style.display = 'none';
+  if (!path) return false;
+  const r = await fetch('/api/settings', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({storage_path: path})
+  });
+  if (r.ok) {
+    window.location.href = '/';
+  } else {
+    let msg = 'Could not open that folder.';
+    try { msg = (await r.json()).error || msg; } catch {}
+    err.textContent = msg;
+    err.style.display = 'block';
   }
   return false;
 }
@@ -2227,6 +2511,126 @@ def auth_set_password():
     return resp
 
 
+# ---- Per-project password (see "Per-project identity & password" above) ---
+@app.route("/api/project-auth/status", methods=["GET"])
+def project_auth_status():
+    """Tell the client whether the ACTIVE project needs its own password,
+    whether they're already unlocked for it, and its friendly name."""
+    root = get_storage_root()
+    return jsonify({
+        "password_required": project_password_required(root),
+        "authenticated": is_project_authenticated(),
+        "name": get_project_name(root) if root else "",
+    })
+
+
+@app.route("/api/project-auth/login", methods=["POST"])
+def project_auth_login():
+    root = get_storage_root()
+    if not root or not root.exists():
+        return jsonify({"error": "No active project"}), 400
+
+    data = request.get_json(force=True) or {}
+    pw = data.get("password", "")
+
+    global _project_password_cache
+    if not project_password_required(root):
+        token = issue_project_session_token()
+        resp = jsonify({"ok": True, "no_password": True})
+        resp.set_cookie("dms_project_session", token, httponly=True, samesite="Strict")
+        return resp
+    if not pw or not verify_project_password(root, pw):
+        return jsonify({"error": "Incorrect password"}), 401
+
+    # Issue the token FIRST — it syncs _project_session_root to the current
+    # root (clearing any stale cache left from a previous root), so setting
+    # the cache after it is what actually survives.
+    token = issue_project_session_token()
+    _project_password_cache = pw  # memory-only — see module docstring above
+    resp = jsonify({"ok": True, "name": get_project_name(root)})
+    resp.set_cookie("dms_project_session", token, httponly=True, samesite="Strict")
+    return resp
+
+
+@app.route("/api/project-auth/logout", methods=["POST"])
+def project_auth_logout():
+    """Locks the currently active project again (without affecting the app
+    login or any other project)."""
+    global _project_password_cache
+    token = request.cookies.get("dms_project_session", "")
+    _PROJECT_SESSION_TOKENS.discard(token)
+    _project_password_cache = ""
+    resp = jsonify({"ok": True})
+    resp.delete_cookie("dms_project_session")
+    return resp
+
+
+@app.route("/api/project/set-password", methods=["POST"])
+def project_set_password():
+    """Set, change, remove the active project's password, and/or rename it.
+
+    Body JSON: { "current_password": "...", "new_password": "...", "name": "..." }
+    `new_password` and `name` are each optional/independent — omit a field
+    (rather than sending "") to leave it untouched. `new_password: ""` clears
+    the project's password (still requires current_password if one exists).
+    """
+    root = get_storage_root()
+    if not root or not root.exists():
+        return jsonify({"error": "Storage path not configured"}), 503
+    # If already protected, require the project to be unlocked to change it
+    # (defense in depth — mirrors auth_set_password for the app password).
+    if project_password_required(root) and not is_project_authenticated():
+        return jsonify({"error": "Authentication required"}), 401
+
+    data = request.get_json(force=True) or {}
+    current = data.get("current_password", "")
+
+    meta = load_project_meta(root)
+    has_existing = bool(meta.get("password_hash"))
+
+    global _project_password_cache
+    new_cache_value = None  # deferred — see below
+    if "new_password" in data:
+        new = data.get("new_password", "")
+        if has_existing and not verify_project_password(root, current):
+            return jsonify({"error": "Current password is incorrect"}), 401
+        if new:
+            if len(new) < 4:
+                return jsonify({"error": "Password must be at least 4 characters"}), 400
+            salt = secrets.token_hex(16)
+            meta["password_salt"] = salt
+            meta["password_hash"] = hash_password(new, salt)
+            new_cache_value = new
+        else:
+            # Clearing the password
+            meta.pop("password_salt", None)
+            meta.pop("password_hash", None)
+            _PROJECT_SESSION_TOKENS.clear()
+            new_cache_value = ""
+
+    if "name" in data:
+        meta["name"] = (data.get("name") or "").strip()
+
+    save_project_meta(root, meta)
+
+    resp = jsonify({
+        "ok": True,
+        "password_now_set": bool(meta.get("password_hash")),
+        "name": get_project_name(root),
+    })
+    if meta.get("password_hash"):
+        # Re-issue a session for the requester so they're not locked out
+        # (covers both "just set for the first time" and "just changed it").
+        # Issued BEFORE the cache assignment below: issuing syncs
+        # _project_session_root to the current root, which would otherwise
+        # wipe a cache value set beforehand (see _sync_project_session_scope).
+        token = issue_project_session_token()
+        resp.set_cookie("dms_project_session", token, httponly=True, samesite="Strict")
+    if new_cache_value is not None:
+        _project_password_cache = new_cache_value
+    return resp
+
+
 # ---- Settings (storage path) ----------------------------------------------
 @app.route("/api/settings", methods=["GET"])
 def get_settings():
@@ -2545,6 +2949,104 @@ def _unique_dest_path(dest: Path) -> Path:
 def default_download_folder():
     """Return the OS default Downloads folder, used to prefill the download dialog."""
     return jsonify({"path": str(_default_downloads_dir())})
+
+
+def _browse_roots() -> list:
+    """Shortcut locations (home, common subfolders, drives/volumes) shown in the
+    sidebar of the folder-browser dialog, so users can jump around without typing."""
+    roots = []
+    home = Path.home()
+
+    def add(name, p: Path):
+        try:
+            if p.is_dir():
+                roots.append({"name": name, "path": str(p.resolve())})
+        except OSError:
+            pass
+
+    add("Home", home)
+    add("Desktop", home / "Desktop")
+    add("Documents", home / "Documents")
+    add("Downloads", home / "Downloads")
+
+    if sys.platform == "win32":
+        import string
+        for letter in string.ascii_uppercase:
+            drive = Path(f"{letter}:\\")
+            if drive.exists():
+                add(f"{letter}:", drive)
+    elif sys.platform == "darwin":
+        add("Macintosh HD", Path("/"))
+        volumes = Path("/Volumes")
+        if volumes.is_dir():
+            try:
+                for entry in sorted(volumes.iterdir(), key=lambda p: p.name.lower()):
+                    if entry.name != "Macintosh HD":
+                        add(entry.name, entry)
+            except OSError:
+                pass
+    else:
+        add("Root (/)", Path("/"))
+        for base in (Path("/media"), Path("/mnt")):
+            if base.is_dir():
+                try:
+                    for entry in sorted(base.iterdir(), key=lambda p: p.name.lower()):
+                        add(entry.name, entry)
+                except OSError:
+                    pass
+
+    return roots
+
+
+@app.route("/api/browse-folder", methods=["GET"])
+def browse_folder():
+    """List subfolders of a path (or the root shortcuts when no path is given),
+    for the "Browse…" folder picker in the download dialog. Folders only —
+    files are never listed since this endpoint exists purely for navigation.
+
+    Query params: path (optional, absolute or ~-relative)
+    Response: { ok, path, parent, entries: [{name, path}], roots: [{name, path}] }
+    """
+    raw = (request.args.get("path") or "").strip()
+    roots = _browse_roots()
+
+    if not raw:
+        return jsonify({"ok": True, "path": None, "parent": None, "entries": roots, "roots": roots})
+
+    target = Path(raw).expanduser()
+    try:
+        target = target.resolve()
+    except OSError:
+        return jsonify({"error": f"Cannot resolve path: {raw}"}), 400
+
+    if not target.exists():
+        return jsonify({"error": f"Folder does not exist: {target}"}), 404
+    if not target.is_dir():
+        target = target.parent
+
+    entries = []
+    try:
+        for entry in target.iterdir():
+            if entry.name.startswith("."):
+                continue
+            try:
+                if entry.is_dir():
+                    entries.append({"name": entry.name, "path": str(entry)})
+            except OSError:
+                continue
+    except PermissionError:
+        return jsonify({"error": f"Permission denied: {target}"}), 403
+    entries.sort(key=lambda e: e["name"].lower())
+
+    parent = target.parent
+    has_parent = parent != target
+    return jsonify({
+        "ok": True,
+        "path": str(target),
+        "parent": str(parent) if has_parent else None,
+        "entries": entries,
+        "roots": roots,
+    })
 
 
 @app.route("/api/docs/download-to-folder", methods=["POST"])
@@ -5007,36 +5509,88 @@ def _build_node_lookup(tree) -> dict:
     return lookup
 
 
+def _effective_metadata(base: dict | None, override: dict | None) -> dict:
+    """Merge a per-folder metadata override on top of a document's shared
+    base metadata. Python mirror of the frontend's effectiveMetadata() —
+    see dms.html. A document linked into only one folder has no override,
+    so this just returns its (unchanged) base metadata."""
+    if not override:
+        return dict(base or {})
+    merged = dict(base or {})
+    for k, v in override.items():
+        if isinstance(v, dict) and v.get("__deleted"):
+            merged.pop(k, None)
+        else:
+            merged[k] = v
+    return merged
+
+
+def _walk_doc_node_refs(node, path=""):
+    """Yield (doc_id, node_id, folder_path) for every document reference in
+    the tree, in tree order. A document linked into multiple folders yields
+    once per folder, so callers can show each link's own effective
+    (override-applied) metadata separately."""
+    if not node:
+        return
+    here = f"{path}/{node.get('name', '')}" if path else (node.get("name") or "")
+    for ref in (node.get("documents") or []):
+        doc_id = ref.get("id")
+        if doc_id:
+            yield doc_id, node.get("id"), here
+    for child in (node.get("children") or []):
+        yield from _walk_doc_node_refs(child, here)
+
+
 @app.route("/api/export-csv", methods=["GET"])
 def export_metadata_csv():
-    """Download a CSV file with one row per document and metadata as columns."""
+    """Download a CSV file with one row per document *placement* — a document
+    linked into several folders (e.g. one summary report linked under
+    several accounts) gets one row per folder, each with that folder's own
+    effective metadata (its per-folder overrides merged on top of the
+    document's shared base metadata)."""
     import io as _io
     import csv as _csv
 
     idx = read_index()
     docs = idx.get("docIndex", [])
-    node_lookup = _build_node_lookup(idx.get("tree"))
+    docs_by_id = {d.get("id"): d for d in docs if d.get("id")}
+    tree = idx.get("tree")
+    node_lookup = _build_node_lookup(tree)
 
-    # Collect unique metadata keys in order of first appearance
+    refs = list(_walk_doc_node_refs(tree)) if tree else []
+    # Any document with no live tree reference (legacy/orphaned data) still
+    # gets a row, via its last-known folder, so nothing silently drops out.
+    referenced_ids = {doc_id for doc_id, _, _ in refs}
+    for doc in docs:
+        doc_id = doc.get("id")
+        if doc_id and doc_id not in referenced_ids:
+            refs.append((doc_id, doc.get("originalNodeId", ""), ""))
+
+    # Collect unique metadata keys in order of first appearance, and each
+    # placement's effective metadata, in one pass.
     seen_keys: set[str] = set()
     meta_keys: list[str] = []
-    for doc in docs:
-        for k in doc.get("metadata", {}).keys():
+    rows = []
+    for doc_id, node_id, folder_path in refs:
+        doc = docs_by_id.get(doc_id)
+        if not doc:
+            continue
+        override = (doc.get("metaOverrides") or {}).get(node_id)
+        meta = _effective_metadata(doc.get("metadata"), override)
+        for k in meta.keys():
             if k not in seen_keys:
                 seen_keys.add(k)
                 meta_keys.append(k)
+        sn = node_lookup.get(node_id, {}).get("sn", "")
+        uploaded = (doc.get("uploadedAt") or "")[:10]  # YYYY-MM-DD only
+        rows.append((doc.get("name", ""), folder_path, uploaded, sn, meta))
 
     buf = _io.StringIO()
     writer = _csv.writer(buf)
-    writer.writerow(["Document Name", "Upload Date", "Serial Number"] + meta_keys)
+    writer.writerow(["Document Name", "Folder", "Upload Date", "Serial Number"] + meta_keys)
 
-    for doc in docs:
-        node_id = doc.get("originalNodeId", "")
-        sn = node_lookup.get(node_id, {}).get("sn", "")
-        uploaded = (doc.get("uploadedAt") or "")[:10]  # YYYY-MM-DD only
-        meta = doc.get("metadata", {})
-        row = [doc.get("name", ""), uploaded, sn] + [meta.get(k, "") for k in meta_keys]
-        writer.writerow(row)
+    for name, folder_path, uploaded, sn, meta in rows:
+        writer.writerow([name, folder_path, uploaded, sn] + [meta.get(k, "") for k in meta_keys])
 
     csv_bytes = buf.getvalue().encode("utf-8-sig")  # BOM lets Excel open UTF-8 correctly
 
@@ -5105,19 +5659,37 @@ def _enforce_dms_backup_retention(root: Path, keep: int = DMS_BACKUP_KEEP) -> No
             pass
 
 
+def _active_export_password(root: Path) -> str:
+    """The password (if any) that must be used to encrypt an export of
+    `root`: the project's own password, from the in-memory cache populated
+    when this session unlocked it (see _sync_project_session_scope). Empty
+    if the project has no password — exports then go out unencrypted, same
+    as before this feature existed."""
+    _sync_project_session_scope()
+    if not project_password_required(root):
+        return ""
+    return _project_password_cache
+
+
 def _write_dms_zip(root: Path, prefix: str = "METADATA") -> Path:
-    """Save index.json into a .dms file directly in the project folder.
+    """Save index.json (+ the project's name/password identity, if any) into
+    a .dms file directly in the project folder.
 
     The actual photo/document files stay on disk where they are — only the
     index (folder tree + document list) is exported.  This keeps the .dms
     file small and fast to create regardless of how many files are stored.
+
+    If the project has its own password set (see "Per-project identity &
+    password" above), the whole zip is encrypted with it, so the file can't
+    be opened/imported anywhere without that same password.
 
     Returns the path of the written file.
     """
     filename = _dms_backup_filename(root, prefix)
     out_path = root / filename
 
-    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         manifest = {
             "format": "dms-project",
             "version": 1,
@@ -5129,6 +5701,16 @@ def _write_dms_zip(root: Path, prefix: str = "METADATA") -> Path:
         index_path = root / "index.json"
         if index_path.exists():
             zf.write(index_path, arcname="index.json")
+
+        proj_meta_path = _project_meta_path(root)
+        if proj_meta_path.exists():
+            zf.write(proj_meta_path, arcname=PROJECT_META_FILENAME)
+
+    data = buf.getvalue()
+    password = _active_export_password(root)
+    if password:
+        data = _encrypt_project_bytes(data, password)
+    out_path.write_bytes(data)
 
     _enforce_dms_backup_retention(root)
     return out_path
@@ -5145,9 +5727,13 @@ def _auto_backup():
         print(f"[DMS] Auto-backup failed: {exc}")
 
 
-@app.route("/api/project/export", methods=["GET"])
+@app.route("/api/project/export", methods=["POST"])
 def export_project():
-    """Save a METADATA- .dms backup (index.json only, no document files) into the project folder."""
+    """Save a METADATA- .dms backup (index.json only, no document files) into the project folder.
+
+    Automatically encrypted with the active project's own password, if it
+    has one — see _write_dms_zip.
+    """
     root = get_storage_root()
     if not root or not root.exists():
         return jsonify({"error": "Storage path not configured"}), 503
@@ -5156,9 +5742,28 @@ def export_project():
     return jsonify({"ok": True, "path": str(out_path), "filename": out_path.name})
 
 
-@app.route("/api/project/export-full", methods=["GET"])
+def _maybe_encrypt_dms_file_in_place(out_path: Path, root: Path) -> None:
+    """If the active project has its own password, read back the
+    just-written .dms file, encrypt its bytes with it (see
+    _encrypt_project_bytes / _active_export_password), and overwrite it in
+    place. Writing the plain zip straight to disk first (rather than
+    building it in memory) keeps large "with files" exports streaming
+    instead of loading every document into RAM up front; only the opt-in
+    encryption step reads the whole file back, once."""
+    password = _active_export_password(root)
+    if not password:
+        return
+    data = out_path.read_bytes()
+    out_path.write_bytes(_encrypt_project_bytes(data, password))
+
+
+@app.route("/api/project/export-full", methods=["POST"])
 def export_project_full():
-    """Save (and download) a complete COMP- backup that includes all document files."""
+    """Save (and download) a complete COMP- backup that includes all document files.
+
+    Automatically encrypted with the active project's own password, if it
+    has one — see _maybe_encrypt_dms_file_in_place.
+    """
     root = get_storage_root()
     if not root or not root.exists():
         return jsonify({"error": "Storage path not configured"}), 503
@@ -5176,11 +5781,15 @@ def export_project_full():
         index_path = root / "index.json"
         if index_path.exists():
             zf.write(index_path, arcname="index.json")
+        proj_meta_path = _project_meta_path(root)
+        if proj_meta_path.exists():
+            zf.write(proj_meta_path, arcname=PROJECT_META_FILENAME)
         docs_dir = root / "docs"
         if docs_dir.exists():
             for fpath in sorted(docs_dir.rglob("*")):
                 if fpath.is_file():
                     zf.write(fpath, arcname=str(fpath.relative_to(root)))
+    _maybe_encrypt_dms_file_in_place(out_path, root)
     _enforce_dms_backup_retention(root)
     return send_file(out_path, as_attachment=True, download_name=filename,
                      mimetype="application/octet-stream")
@@ -5191,7 +5800,9 @@ def export_project_selected():
     """Download a .dms backup containing only the selected nodes and their documents.
 
     Body JSON: { "node_ids": ["NODE-xxx", ...] }
-    Selected nodes AND all their descendants are included.
+    Selected nodes AND all their descendants are included. Automatically
+    encrypted with the active project's own password, if it has one — see
+    _maybe_encrypt_dms_file_in_place.
     """
     root = get_storage_root()
     if not root or not root.exists():
@@ -5247,11 +5858,33 @@ def export_project_selected():
             "doc_count": len(included_docs),
         }, indent=2))
         zf.writestr("index.json", json.dumps(filtered_idx, indent=2, ensure_ascii=False))
+        proj_meta_path = _project_meta_path(root)
+        if proj_meta_path.exists():
+            zf.write(proj_meta_path, arcname=PROJECT_META_FILENAME)
         for doc_id, fpath in doc_file_map.items():
             zf.write(fpath, arcname=str(fpath.relative_to(root)))
+    _maybe_encrypt_dms_file_in_place(out_path, root)
     _enforce_dms_backup_retention(root)
     return send_file(out_path, as_attachment=True, download_name=filename,
                      mimetype="application/octet-stream")
+
+
+def _decrypt_uploaded_dms(raw: bytes, password: str):
+    """Given the raw bytes of an uploaded .dms file, resolve it to plain zip
+    bytes, decrypting first if it's password-protected (see
+    _encrypt_project_bytes). Returns (zip_bytes, encrypted, error_response);
+    error_response is a (jsonify(...), status) tuple to return as-is, or
+    None on success."""
+    if not _is_encrypted_project_blob(raw):
+        return raw, False, None
+    if not password:
+        return None, True, (jsonify({"error": "This file is password-protected.", "encrypted": True}), 401)
+    try:
+        return _decrypt_project_bytes(raw, password), True, None
+    except Exception:
+        # Wrong password (InvalidToken) or a malformed/corrupt encrypted blob
+        # — either way, from the user's perspective this reads as "wrong password".
+        return None, True, (jsonify({"error": "Incorrect password", "encrypted": True}), 401)
 
 
 @app.route("/api/project/import", methods=["POST"])
@@ -5262,6 +5895,7 @@ def import_project():
       file: the .dms file
       target_path: where to extract it (will be created)
       mode: 'new' (target must be empty) | 'overwrite' (delete existing contents first)
+      password: required if the file was exported with a password
     """
     if "file" not in request.files:
         return jsonify({"error": "Missing 'file' part"}), 400
@@ -5269,6 +5903,7 @@ def import_project():
     f = request.files["file"]
     target_path = (request.form.get("target_path") or "").strip()
     mode = (request.form.get("mode") or "overwrite").strip()
+    password = request.form.get("password", "")
 
     if not target_path:
         current = get_storage_root()
@@ -5278,11 +5913,15 @@ def import_project():
 
     target = Path(target_path).expanduser().resolve()
 
-    # Read uploaded file into a temp file for zipfile to read
+    zip_bytes, _encrypted, err = _decrypt_uploaded_dms(f.read(), password)
+    if err:
+        return err
+
+    # Write the (now-plain) zip bytes to a temp file for zipfile to read
     tmp_zip = tempfile.NamedTemporaryFile(suffix=".dms", delete=False)
-    tmp_zip.close()  # Must close before f.save() on Windows (file locking)
+    tmp_zip.close()  # Must close before writing on Windows (file locking)
     try:
-        f.save(tmp_zip.name)
+        Path(tmp_zip.name).write_bytes(zip_bytes)
 
         # Validate it's a real .dms zip with a manifest
         try:
@@ -5322,6 +5961,19 @@ def import_project():
         cfg["storage_path"] = str(target)
         save_config(cfg)
 
+        # If the password just used to decrypt this file also unlocks the
+        # newly-imported project (same password — see _write_dms_zip), unlock
+        # it now automatically, rather than immediately bouncing the user
+        # into a second password prompt for the project they just proved
+        # they know the password to.
+        auto_unlock_cookie = None
+        if password:
+            global _project_password_cache
+            _sync_project_session_scope()
+            if verify_project_password(target, password):
+                _project_password_cache = password
+                auto_unlock_cookie = issue_project_session_token()
+
         # Inventory what landed
         inventory = {
             "imported_to": str(target),
@@ -5332,7 +5984,10 @@ def import_project():
         if docs_dir.exists():
             inventory["doc_count"] = sum(1 for _ in docs_dir.iterdir() if _.is_file())
 
-        return jsonify({"ok": True, **inventory})
+        resp = jsonify({"ok": True, **inventory})
+        if auto_unlock_cookie:
+            resp.set_cookie("dms_project_session", auto_unlock_cookie, httponly=True, samesite="Strict")
+        return resp
     finally:
         try:
             os.unlink(tmp_zip.name)
@@ -5346,28 +6001,55 @@ def inspect_dms():
 
     Returns the source_path and export date from the embedded manifest.json
     so the UI can offer the user a path-selection dialog before importing.
+
+    Multipart form fields: file, password (optional). If the file is
+    password-protected and no (or the wrong) password is given, the manifest
+    can't be read yet — the response just flags `encrypted: true` so the UI
+    can prompt for a password and call this again before importing.
     """
     if "file" not in request.files:
         return jsonify({"error": "Missing 'file'"}), 400
 
     f = request.files["file"]
+    password = request.form.get("password", "")
+    raw = f.read()
+
+    if _is_encrypted_project_blob(raw):
+        if not password:
+            return jsonify({"ok": True, "encrypted": True})
+        try:
+            zip_bytes = _decrypt_project_bytes(raw, password)
+        except Exception:
+            return jsonify({"error": "Incorrect password", "encrypted": True}), 401
+    else:
+        zip_bytes = raw
+
     tmp_zip = tempfile.NamedTemporaryFile(suffix=".dms", delete=False)
-    tmp_zip.close()  # Must close before f.save() on Windows (file locking)
+    tmp_zip.close()  # Must close before writing on Windows (file locking)
     try:
-        f.save(tmp_zip.name)
+        Path(tmp_zip.name).write_bytes(zip_bytes)
         try:
             with zipfile.ZipFile(tmp_zip.name, "r") as zf:
-                if "manifest.json" not in zf.namelist():
+                names = zf.namelist()
+                if "manifest.json" not in names:
                     return jsonify({"error": "Not a valid .dms file (missing manifest.json)"}), 400
                 manifest = json.loads(zf.read("manifest.json"))
                 if manifest.get("format") != "dms-project":
                     return jsonify({"error": "Not a DMS project file"}), 400
+                project_name = ""
+                if PROJECT_META_FILENAME in names:
+                    try:
+                        project_name = (json.loads(zf.read(PROJECT_META_FILENAME)).get("name") or "").strip()
+                    except (json.JSONDecodeError, KeyError):
+                        pass
         except zipfile.BadZipFile:
             return jsonify({"error": "Not a valid .dms (zip) file"}), 400
         return jsonify({
             "ok": True,
+            "encrypted": _is_encrypted_project_blob(raw),
             "source_path": manifest.get("source_path", ""),
             "exported_at": manifest.get("exported_at", ""),
+            "project_name": project_name,
         })
     finally:
         try:
