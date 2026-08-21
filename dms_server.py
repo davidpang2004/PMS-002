@@ -205,11 +205,32 @@ def _reserve_doc_slots(idx: dict, count: int = 1) -> bool:
 
 
 def write_index(idx: dict) -> None:
+    """Write index.json atomically.
+
+    Every keystroke on an editable field (node name, description, a login's
+    website/username/password, ...) triggers its own PUT /api/tree, so a
+    burst of edits can produce several overlapping writes in flight. A
+    plain path.write_text() truncates-then-writes in place; two overlapping
+    writers with separate file handles to the same path can interleave
+    (write_text isn't a single atomic syscall), corrupting the file with a
+    torn mix of both writes -- observed directly during testing: a shorter
+    write finished first, then a still-in-flight longer write's tail landed
+    on top, leaving a stray trailing brace and unparseable JSON. Writing to
+    a temp file in the same directory and os.replace()-ing it into place
+    instead makes every write atomic at the filesystem level: whichever
+    write's rename lands last simply wins outright, in full, with no
+    torn/interleaved state ever visible on disk.
+    """
     p = get_index_path()
     if not p:
         raise RuntimeError("Storage path is not configured")
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(idx, indent=2))
+    tmp = p.with_suffix(f".json.tmp-{secrets.token_hex(4)}")
+    try:
+        tmp.write_text(json.dumps(idx, indent=2))
+        os.replace(tmp, p)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _get_lan_ip() -> str:
@@ -2751,22 +2772,80 @@ def get_tree():
     return jsonify({"tree": idx.get("tree"), "photoRootNodeId": idx.get("photoRootNodeId", "")})
 
 
+def _encrypt_one_password(container: dict) -> None:
+    """If `container` (a node, or one entry in node["logins"]) carries a
+    plaintext `password` key, replace it with an encrypted `passwordEnc`.
+    `password: ""` (explicit clear) removes `passwordEnc`; `password`
+    absent leaves any existing `passwordEnc` untouched."""
+    if "password" not in container:
+        return
+    plaintext = container.pop("password") or ""
+    if plaintext:
+        container["passwordEnc"] = encrypt_secret(plaintext)
+    else:
+        container.pop("passwordEnc", None)
+
+
+# What the client shows/sends in `passwordEnc` once a password has been
+# saved without ever holding the real ciphertext again: dms.html's
+# saveNodePassword/saveNodeLoginPassword deliberately scrub the real value
+# from client state right after saving it ("only a presence marker is kept
+# locally... never the value"), replacing it with this single bullet
+# character. PUT /api/tree replaces the whole stored tree with whatever the
+# client sends (see put_tree below), so if this marker were ever written
+# to disk as if it were the real passwordEnc, it would permanently destroy
+# the saved password the next time *anything else* on that node/login gets
+# edited and autosaved in the same session -- see _resolve_password_markers.
+SAVED_PASSWORD_MARKER = "•"
+
+
+def _collect_password_ciphertexts(node: dict, out: dict) -> None:
+    """Walk a tree, recording {id: passwordEnc} for every node and login
+    entry that currently has a real encrypted password. Used right before
+    a tree overwrite to resolve SAVED_PASSWORD_MARKER back to the actual
+    ciphertext already on disk (see _resolve_password_markers)."""
+    if not node:
+        return
+    if node.get("id") and node.get("passwordEnc"):
+        out[node["id"]] = node["passwordEnc"]
+    for login in (node.get("logins") or []):
+        if login.get("id") and login.get("passwordEnc"):
+            out[login["id"]] = login["passwordEnc"]
+    for child in (node.get("children") or []):
+        _collect_password_ciphertexts(child, out)
+
+
+def _resolve_password_markers(node: dict, old_ciphertexts: dict) -> None:
+    """Walk a tree in-place, replacing SAVED_PASSWORD_MARKER wherever it
+    appears in `passwordEnc` with the real ciphertext looked up (by node or
+    login id) in `old_ciphertexts` -- must run before _encrypt_tree_passwords
+    on every PUT /api/tree, or a client autosaving some unrelated edit right
+    after setting a password would overwrite that password with the literal
+    marker string instead of leaving it alone."""
+    if not node:
+        return
+    if node.get("passwordEnc") == SAVED_PASSWORD_MARKER:
+        node["passwordEnc"] = old_ciphertexts.get(node.get("id"), "")
+    for login in (node.get("logins") or []):
+        if login.get("passwordEnc") == SAVED_PASSWORD_MARKER:
+            login["passwordEnc"] = old_ciphertexts.get(login.get("id"), "")
+    for child in (node.get("children") or []):
+        _resolve_password_markers(child, old_ciphertexts)
+
+
 def _encrypt_tree_passwords(node: dict) -> None:
     """Walk a tree in-place, turning any plaintext `password` field the
     frontend sent into an encrypted `passwordEnc`, so a plaintext website
-    password never touches disk.
-
-    `password: ""` (explicit clear) removes `passwordEnc`. `password`
-    absent leaves any existing `passwordEnc` untouched.
+    password never touches disk. Applies both to a node's own (legacy,
+    single-login) fields and to each entry of its `logins` array — a folder
+    can carry any number of website/username/password sets (see
+    getNodeLogins in dms.html).
     """
     if not node:
         return
-    if "password" in node:
-        plaintext = node.pop("password") or ""
-        if plaintext:
-            node["passwordEnc"] = encrypt_secret(plaintext)
-        else:
-            node.pop("passwordEnc", None)
+    _encrypt_one_password(node)
+    for login in (node.get("logins") or []):
+        _encrypt_one_password(login)
     for child in (node.get("children") or []):
         _encrypt_tree_passwords(child)
 
@@ -2779,6 +2858,9 @@ def put_tree():
     idx = read_index()
     old_tree = idx.get("tree")   # snapshot before overwrite
     new_tree = data.get("tree")
+    old_ciphertexts = {}
+    _collect_password_ciphertexts(old_tree, old_ciphertexts)
+    _resolve_password_markers(new_tree, old_ciphertexts)
     _encrypt_tree_passwords(new_tree)
     idx["tree"] = new_tree
     write_index(idx)
@@ -2795,11 +2877,17 @@ def put_tree():
 
 @app.route("/api/nodes/<node_id>/reveal-credential", methods=["POST"])
 def reveal_credential(node_id):
-    """Decrypt and return a folder's saved login info, on demand only.
+    """Decrypt and return one of a folder's saved logins, on demand only.
 
     Kept out of the bulk GET /api/tree response so the real password never
     rides along with routine tree loads — only fetched when the user
     actually clicks "Open"/"Copy password".
+
+    Body: { "login_id": "..." } selects which entry in node["logins"] to
+    reveal (see getNodeLogins in dms.html). An empty/missing login_id, or
+    one that doesn't match any entry, falls back to the node's own legacy
+    top-level websiteUrl/accountName/passwordEnc fields — the shape every
+    folder used before a folder could carry more than one login.
     """
     if not get_storage_root():
         return jsonify({"error": "Storage path not configured"}), 503
@@ -2807,16 +2895,22 @@ def reveal_credential(node_id):
     node = _find_node_by_id(idx.get("tree"), node_id)
     if not node:
         return jsonify({"error": "Node not found"}), 404
+    data = request.get_json(silent=True) or {}
+    login_id = (data.get("login_id") or "").strip()
+    entry = None
+    if login_id:
+        entry = next((l for l in (node.get("logins") or []) if l.get("id") == login_id), None)
+    source = entry if entry is not None else node
     password = ""
-    enc = node.get("passwordEnc")
+    enc = source.get("passwordEnc")
     if enc:
         try:
             password = decrypt_secret(enc)
         except Exception:
             return jsonify({"error": "Could not decrypt stored password"}), 500
     return jsonify({
-        "websiteUrl": node.get("websiteUrl", ""),
-        "accountName": node.get("accountName", ""),
+        "websiteUrl": source.get("websiteUrl", ""),
+        "accountName": source.get("accountName", ""),
         "password": password,
     })
 
