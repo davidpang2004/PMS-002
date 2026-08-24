@@ -5587,6 +5587,157 @@ def combine_to_folder():
     })
 
 
+# ---- Plot snapshot Excel export --------------------------------------------
+
+def _read_xlsx_rows(path: "Path | None") -> list:
+    """Return [{"date": "...", "total": float, "unit": "..."}] from a plot
+    snapshot workbook, skipping the header row. Missing/unreadable file just
+    means no history yet -- an empty list, not an error."""
+    if not path or not path.exists():
+        return []
+    from openpyxl import load_workbook
+    rows = []
+    wb = load_workbook(path, data_only=True)
+    ws = wb.active
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if not row or row[0] is None or row[1] is None:
+            continue
+        rows.append({
+            "date": str(row[0])[:10],
+            "total": float(row[1]),
+            "unit": str(row[2]) if len(row) > 2 and row[2] is not None else "",
+        })
+    return rows
+
+
+def _write_xlsx_rows(path: Path, rows: list) -> None:
+    """(Re)write a plot snapshot workbook from scratch: header row + one row
+    per entry. Rewriting the whole file (rather than opening+appending) keeps
+    this simple and self-correcting -- the row list already came from
+    _read_xlsx_rows plus the new entry, so there's nothing to preserve that
+    isn't already in `rows`."""
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "History"
+    ws.append(["Date", "Total", "Unit"])
+    for r in rows:
+        ws.append([r["date"], r["total"], r.get("unit", "")])
+    ws.column_dimensions["A"].width = 14
+    ws.column_dimensions["B"].width = 18
+    ws.column_dimensions["C"].width = 10
+    wb.save(path)
+
+
+@app.route("/api/docs/plot-snapshot", methods=["GET", "POST"])
+def plot_snapshot():
+    """
+    Read or append to a per-folder, per-parameter Excel history file used by
+    FolderPlotDialog's "Save snapshot" / "View history" buttons (dms.html).
+
+    The file is a real document living directly inside the target folder
+    node, named "<param> history.xlsx" -- one file per parameter, so
+    switching Group-by/Field/X-axis in the dialog still appends to the same
+    file (only the parameter name selects which file). Re-saving a parameter
+    that already has a file appends a new row to that same document instead
+    of creating a duplicate, and the returned doc_id is stable across calls.
+
+    GET  ?node_id=...&param=...                 -> read-only, no write
+    POST { node_id, param, total, unit, date? }  -> append one row (date
+                                                     defaults to today)
+
+    Response: { "ok": true, "doc_id": "..."|null, "name": "..."|null,
+                "rows": [{"date","total","unit"}, ...] }  (rows always
+    reflect what's on disk after this call, in file order)
+    """
+    if not get_storage_root():
+        return jsonify({"error": "Storage path not configured"}), 503
+    try:
+        from openpyxl import load_workbook  # noqa: F401 -- import-checks availability
+    except ImportError as e:
+        return jsonify({
+            "error": (
+                "Excel support not installed. Run:\n"
+                "    pip3 install openpyxl\n"
+                "Then restart the server.\n\nDetail: " + str(e)
+            )
+        }), 500
+
+    is_post = request.method == "POST"
+    if is_post:
+        payload = request.get_json(force=True) or {}
+        node_id = (payload.get("node_id") or "").strip()
+        param = (payload.get("param") or "").strip()
+    else:
+        payload = {}
+        node_id = (request.args.get("node_id") or "").strip()
+        param = (request.args.get("param") or "").strip()
+    if not node_id or not param:
+        return jsonify({"error": "node_id and param are required"}), 400
+
+    idx = read_index()
+    tree = idx.get("tree")
+    node = _find_node_by_id(tree, node_id) if tree else None
+    if not node:
+        return jsonify({"error": "Folder not found"}), 404
+
+    display_name = f"{param} history.xlsx"
+    docs_dir = get_docs_dir()
+    by_id = {d["id"]: d for d in idx.get("docIndex", [])}
+
+    # An existing snapshot for this parameter must be linked *directly* in
+    # this folder (not a descendant's) -- each folder tracks its own totals.
+    existing_doc_id, existing_path = None, None
+    for ref in (node.get("documents") or []):
+        d = by_id.get(ref.get("id"))
+        if d and (d.get("name") or "").lower() == display_name.lower():
+            existing_doc_id = d["id"]
+            matches = list(docs_dir.rglob(f"{existing_doc_id}__*")) or list(docs_dir.rglob(f"{existing_doc_id}*"))
+            existing_path = matches[0] if matches else None
+            break
+
+    rows = _read_xlsx_rows(existing_path)
+
+    if not is_post:
+        return jsonify({"ok": True, "doc_id": existing_doc_id, "name": display_name if existing_doc_id else None, "rows": rows})
+
+    total = payload.get("total")
+    if total is None:
+        return jsonify({"error": "total is required"}), 400
+    unit = (payload.get("unit") or "").strip()
+    date_str = (payload.get("date") or "").strip() or datetime.now().strftime("%Y-%m-%d")
+    rows.append({"date": date_str, "total": float(total), "unit": unit})
+
+    out_dir = _get_node_docs_dir(node_id, tree) or docs_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if existing_doc_id and existing_path:
+        doc_id, out_path = existing_doc_id, existing_path
+    else:
+        doc_id = "DOC-" + datetime.now().strftime("%Y%m%d") + "-" + secrets.token_hex(4).upper()
+        out_path = out_dir / f"{doc_id}__{_safe_filename_part(display_name)}"
+
+    _write_xlsx_rows(out_path, rows)
+    size = out_path.stat().st_size
+
+    if existing_doc_id:
+        for d in idx.get("docIndex", []):
+            if d["id"] == existing_doc_id:
+                d["size"] = size
+                d["uploadedAt"] = datetime.utcnow().isoformat() + "Z"
+                break
+    else:
+        idx.setdefault("docIndex", []).append({
+            "id": doc_id, "name": display_name,
+            "mime": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "size": size, "uploadedAt": datetime.utcnow().isoformat() + "Z",
+            "originalNodeId": node_id, "metadata": {},
+        })
+        node.setdefault("documents", []).append({"id": doc_id})
+
+    write_index(idx)
+    return jsonify({"ok": True, "doc_id": doc_id, "name": display_name, "rows": rows})
+
+
 # ---- Metadata CSV export ---------------------------------------------------
 
 def _build_node_lookup(tree) -> dict:
@@ -6240,7 +6391,15 @@ def hierarchy_create():
     in the DMS index.json.  Each node in the hierarchy becomes a DMS tree node.
     Existing nodes whose names match are left untouched (idempotent).
 
-    Request JSON:  { "text": "<file contents>", "dedupe_names": false }
+    Request JSON:  { "text": "<file contents>", "dedupe_names": false,
+                      "target_node_id": "NODE-XXXXXX" }
+
+    target_node_id is optional. When given, the hierarchy's root row is
+    attached as a *child* of that existing node (matched/reused by name
+    just like any other row) instead of being merged against the whole
+    project tree's root — so importing under an existing folder can't
+    demote the rest of the tree under a brand-new root. Omit it to keep
+    the original whole-tree-root behavior.
 
     Response (success):
       { "ok": true, "root": "BOP001", "created": [...], "skipped": [...] }
@@ -6254,6 +6413,7 @@ def hierarchy_create():
     data = request.get_json(force=True, silent=True) or {}
     text = data.get("text", "")
     dedupe_names = bool(data.get("dedupe_names"))
+    target_node_id = (data.get("target_node_id") or "").strip() or None
 
     details_nodes, errors, root = parse_hierarchy_file_with_details(text, dedupe_names=dedupe_names)
     if errors:
@@ -6280,13 +6440,38 @@ def hierarchy_create():
 
     existing_tree = idx.get("tree")
 
+    attach_target = None
+    if target_node_id:
+        attach_target = _find_node_by_id(existing_tree, target_node_id) if existing_tree else None
+        if attach_target is None:
+            return jsonify({"ok": False, "errors": [f"Target folder '{target_node_id}' not found."]})
+
     for hier_id, parent_hier_id in order:
         # Display name is the last path component so "A/B/C" shows as "C".
         # Bare names like "BOP001" are unchanged (backward compatible).
         display_name = hier_id.rsplit("/", 1)[-1]
 
-        if parent_hier_id is None:
-            # Root node
+        if parent_hier_id is None and attach_target is not None:
+            # Caller picked an existing folder to import into: attach the
+            # hierarchy's root row as a child of it, same as any other row,
+            # instead of comparing it against the whole project tree's root.
+            existing_child = _find_child_by_name(attach_target, display_name)
+            if existing_child:
+                node_id_map[hier_id] = existing_child
+                skipped.append(hier_id)
+            else:
+                new_node = {
+                    "id": "NODE-" + secrets.token_hex(3).upper(),
+                    "name": display_name,
+                    "description": "",
+                    "children": [],
+                    "documents": [],
+                }
+                attach_target.setdefault("children", []).append(new_node)
+                node_id_map[hier_id] = new_node
+                created.append(hier_id)
+        elif parent_hier_id is None:
+            # No target folder given — original whole-tree-root behavior.
             if existing_tree and existing_tree.get("name") == display_name:
                 # Root already exists with this name — reuse it
                 node_id_map[hier_id] = existing_tree
