@@ -21,7 +21,7 @@ elif command -v python3 >/dev/null 2>&1; then
     echo "Python found: $($PYTHON --version)"
 
     # Check required Python packages and install if missing
-    NEEDED_PACKAGES="flask pypdf reportlab Pillow pillow-heif"
+    NEEDED_PACKAGES="flask pypdf reportlab Pillow pillow-heif openpyxl"
     MISSING=""
     for pkg in $NEEDED_PACKAGES; do
         case "$pkg" in

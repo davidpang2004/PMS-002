@@ -228,6 +228,20 @@ const TrendingUp = (p) => (
     <polyline points="17 6 23 6 23 12" />
   </I>
 );
+const LineChartIcon = (p) => (
+  <I {...p}>
+    <path d="M3 3v18h18" />
+    <path d="m19 9-5 5-4-4-3 3" />
+  </I>
+);
+const BarChartIcon = (p) => (
+  <I {...p}>
+    <path d="M3 3v18h18" />
+    <path d="M18 17V9" />
+    <path d="M13 17V5" />
+    <path d="M8 17v-3" />
+  </I>
+);
 const AlertTriangle = (p) => (
   <I {...p}>
     <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
@@ -810,6 +824,20 @@ const StorageAdapter = {
     return res.json();   // { ok, comment }
   },
 
+  // Read (GET) or append-and-read (POST) the per-folder, per-parameter Excel
+  // snapshot history used by FolderPlotDialog's "Save snapshot" / "View
+  // history" buttons -- see /api/docs/plot-snapshot in dms_server.py.
+  async getPlotHistory(nodeId, param) {
+    return this._json(`/api/docs/plot-snapshot?node_id=${encodeURIComponent(nodeId)}&param=${encodeURIComponent(param)}`);
+  },
+  async savePlotSnapshot(nodeId, param, total, unit, date) {
+    return this._json("/api/docs/plot-snapshot", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ node_id: nodeId, param, total, unit, date }),
+    });
+  },
+
   async hierarchyPreview(text, dedupeNames = false) {
     return this._json("/api/hierarchy/preview", {
       method: "POST",
@@ -818,11 +846,11 @@ const StorageAdapter = {
     });
   },
 
-  async hierarchyCreate(text, dedupeNames = false) {
+  async hierarchyCreate(text, dedupeNames = false, targetNodeId = null) {
     return this._json("/api/hierarchy/create", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text, dedupe_names: dedupeNames }),
+      body: JSON.stringify({ text, dedupe_names: dedupeNames, target_node_id: targetNodeId }),
     });
   },
 };
@@ -1024,6 +1052,21 @@ const resolveDocTime = (doc, tree) => {
   const folderId = doc.originalNodeId || doc.nodeId;
   const ym = folderId ? nearestYearMonthName(tree, folderId) : null;
   return ym ? `${ym}-01` : null;
+};
+
+// Generalizes resolveDocTime for FolderPlotDialog's X-axis field picker:
+// "docdate" keeps the original doc-date-or-YYYY-MM-folder behavior above;
+// "duedate" reads doc.dueDate directly (no folder fallback -- a due date is
+// either set or it isn't); anything else names a metadata key and only
+// counts if that field's value is itself a plain "YYYY-MM-DD" date (see
+// dateLikeParams in FolderPlotDialog). Returns "YYYY-MM-DD" or null.
+const resolveXFieldValue = (doc, tree, xField) => {
+  if (xField === "docdate") return resolveDocTime(doc, tree);
+  if (xField === "duedate") return doc.dueDate || null;
+  const mv = (doc.metadata || {})[xField];
+  const raw = mv == null ? "" : typeof mv === "string" ? mv : (mv.value ?? mv.actual ?? "");
+  const s = String(raw).trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null;
 };
 
 // Pull a plottable number out of one metadata field's value. Metadata values
@@ -3880,13 +3923,32 @@ const _niceNum = (range, round) => {
 };
 
 const niceTicks = (min, max, tickCount = 5) => {
-  if (min === max) { min -= 1; max += 1; }
+  // Treat a range that's negligible relative to min/max's own magnitude the
+  // same as an exact tie (the existing min===max padding below), not just a
+  // literal min===max. Two values meant to be "the same" can differ by a
+  // tiny floating-point rounding artifact instead of being bit-identical --
+  // e.g. 12345.67 + 98765.43 === 111111.09999999999, not 111111.1 -- which
+  // without this check left `range` many orders of magnitude smaller than
+  // min/max. _niceNum then starves the step size down until niceMin/niceMax
+  // exceed float64's ~15-17 significant digits of precision, and the tick
+  // loop below -- stepping from niceMin to niceMax by that near-zero step --
+  // effectively never terminates (observed directly: it threw "RangeError:
+  // Invalid array length" from ticks.push() after growing past 2^32 entries).
+  const magnitude = Math.max(Math.abs(min), Math.abs(max), 1);
+  // Pad relative to the value's own size, not a flat ±1 -- a flat pad leaves
+  // a single large point (e.g. a $5M balance) with a ~$2-wide axis range,
+  // which reads as an empty flat line even though the point is technically
+  // there. 5% of magnitude on each side gives real headroom at any scale.
+  if (Math.abs(max - min) <= magnitude * 1e-9) { const pad = magnitude * 0.05; min -= pad; max += pad; }
   const range = _niceNum(max - min, false);
   const step = _niceNum(range / (tickCount - 1), true);
   const niceMin = Math.floor(min / step) * step;
   const niceMax = Math.ceil(max / step) * step;
   const ticks = [];
-  for (let v = niceMin; v <= niceMax + step * 0.5; v += step) {
+  // Belt-and-suspenders against any other path to a runaway loop here: 5
+  // ticks is the norm and even a wide custom axis range tops out at a
+  // handful more, so 1000 is already far past anything legitimate.
+  for (let v = niceMin; v <= niceMax + step * 0.5 && ticks.length < 1000; v += step) {
     ticks.push(Math.round(v / step) * step);
   }
   return { min: niceMin, max: niceMax, ticks };
@@ -4181,6 +4243,168 @@ const TimeSeriesChart = ({ points, paramName, unit, onPointClick, width = 680, h
   );
 };
 
+// Groups `points` by X position (date string, or the categorical `x` label)
+// and draws one bar per document side-by-side within each group -- e.g. five
+// accounts' Balance all dated the same day become five bars in one group
+// instead of five overlapping dots on a line. Group order follows the order
+// `points` already arrives in (chronological for date-based X fields, or
+// alphabetical for the categorical "document name" axis -- see
+// FolderPlotDialog), not a second sort here.
+const GroupedBarChart = ({ points, isCategorical, paramName, unit, onPointClick, width = 680, height = 300, valueRange = null }) => {
+  const { t } = useLang();
+  const [hover, setHover] = useState(null); // { gi, ii } of the hovered bar, or null
+
+  // Extra top margin (vs. the line chart's 18px) leaves room for the
+  // per-bar value labels, plus the group subtotal stacked above those.
+  const margin = { top: 48, right: 24, bottom: 38, left: 68 };
+  const innerW = width - margin.left - margin.right;
+  const innerH = height - margin.top - margin.bottom;
+
+  if (!points || points.length === 0) return null;
+
+  // Preserve first-occurrence order of each group key (caller's sort order),
+  // rather than re-sorting here -- see comment above.
+  const groups = [];
+  const groupByKey = new Map();
+  for (const p of points) {
+    const key = isCategorical ? p.x : p.date;
+    let g = groupByKey.get(key);
+    if (!g) { g = { key, items: [] }; groupByKey.set(key, g); groups.push(g); }
+    g.items.push(p);
+  }
+  const maxPerGroup = Math.max(1, ...groups.map((g) => g.items.length));
+
+  const hasValueRange = valueRange && Number.isFinite(valueRange.min) && Number.isFinite(valueRange.max) && valueRange.max > valueRange.min;
+  let yMin, yMax, yTicks;
+  if (hasValueRange) {
+    yMin = valueRange.min; yMax = valueRange.max;
+    yTicks = Array.from({ length: 5 }, (_, i) => yMin + (i / 4) * (yMax - yMin));
+  } else {
+    let vMin = Infinity, vMax = -Infinity;
+    for (const p of points) { if (p.value < vMin) vMin = p.value; if (p.value > vMax) vMax = p.value; }
+    // Bars read from a zero baseline, so the domain always includes 0 --
+    // unlike the line chart, which auto-fits tightly around the data.
+    ({ min: yMin, max: yMax, ticks: yTicks } = niceTicks(Math.min(0, vMin), Math.max(0, vMax), 5));
+  }
+  const yRange = (yMax - yMin) || 1;
+  const yScale = (v) => margin.top + innerH - ((v - yMin) / yRange) * innerH;
+  const yZero = Math.min(Math.max(yScale(0), margin.top), margin.top + innerH);
+
+  const bandW = innerW / groups.length;
+  const groupPad = Math.min(bandW * 0.15, 10);
+  const slotW = (bandW - groupPad * 2) / maxPerGroup;
+  const barW = Math.max(2, Math.min(slotW * 0.78, 46));
+
+  const palette = ["#d97706", "#0891b2", "#7c3aed", "#059669", "#dc2626", "#4f46e5", "#be185d", "#65a30d"];
+
+  const fmtVal = (v) => unit ? `${v.toLocaleString()} ${unit}` : v.toLocaleString();
+  // Categorical (document-name) labels can be arbitrarily long; date labels
+  // are always "YYYY-MM-DD" -- shorten those to "MM-DD" since the year
+  // rarely varies within one chart and full dates crowd narrow bands.
+  const fmtLabel = (key) => isCategorical
+    ? (key.length > 14 ? key.slice(0, 13) + "…" : key)
+    : key.slice(5);
+
+  return (
+    <div className="relative w-full h-full">
+      <svg
+        viewBox={`0 0 ${width} ${height}`}
+        className="w-full h-full touch-none"
+        role="img"
+        aria-label={`${paramName}${unit ? ` (${unit})` : ""} by ${isCategorical ? "document" : "date"}, ${groups.length} group(s)`}
+      >
+        {/* Gridlines + y-axis labels */}
+        {yTicks.map((tv) => (
+          <g key={`y-${tv}`}>
+            <line x1={margin.left} x2={width - margin.right} y1={yScale(tv)} y2={yScale(tv)} stroke="#e7e5e4" strokeWidth="1" />
+            <text x={margin.left - 8} y={yScale(tv)} textAnchor="end" dominantBaseline="middle"
+              className="fill-stone-500" fontSize="12" fontFamily="ui-monospace, monospace">
+              {tv.toLocaleString()}
+            </text>
+          </g>
+        ))}
+        {/* Zero baseline, slightly darker than the gridlines */}
+        <line x1={margin.left} x2={width - margin.right} y1={yZero} y2={yZero} stroke="#a8a29e" strokeWidth="1" />
+
+        {groups.map((g, gi) => {
+          const gx = margin.left + gi * bandW;
+          const subtotal = g.items.reduce((s, p) => s + p.value, 0);
+          return (
+            <g key={g.key}>
+              {g.items.map((p, ii) => {
+                const bx = gx + groupPad + ii * slotW + (slotW - barW) / 2;
+                const by = Math.min(yScale(p.value), yZero);
+                const bh = Math.max(1, Math.abs(yScale(p.value) - yZero));
+                const isHover = hover && hover.gi === gi && hover.ii === ii;
+                return (
+                  <g key={p.docId + ii}>
+                    <rect
+                      x={bx} y={by} width={barW} height={bh}
+                      fill={palette[ii % palette.length]}
+                      opacity={isHover ? 1 : 0.88}
+                      stroke={isHover ? "#292524" : "none"} strokeWidth={isHover ? 1.5 : 0}
+                      className="cursor-pointer"
+                      onMouseEnter={() => setHover({ gi, ii })}
+                      onMouseLeave={() => setHover((cur) => (cur && cur.gi === gi && cur.ii === ii ? null : cur))}
+                      onClick={() => onPointClick && onPointClick(p.docId)}
+                    />
+                    {/* Bar's own value, right above (or, for a negative bar,
+                        below) its own top edge -- unitless and smaller than
+                        the group subtotal so several bars in one group don't
+                        crowd into each other. */}
+                    <text
+                      x={bx + barW / 2} y={p.value < 0 ? by + bh + 15 : by - 6}
+                      textAnchor="middle" className="fill-stone-700 font-medium pointer-events-none" fontSize="12" fontFamily="ui-monospace, monospace"
+                    >
+                      {p.value.toLocaleString()}
+                    </text>
+                  </g>
+                );
+              })}
+              {/* Group subtotal, shown only when more than one bar shares this
+                  X position -- a single-bar group's "subtotal" would just
+                  repeat that one bar's value. Sits further out than the
+                  per-bar value labels above so the two don't collide. */}
+              {g.items.length > 1 && (
+                <text x={gx + bandW / 2} y={Math.min(yZero, ...g.items.map((p) => yScale(p.value))) - 24}
+                  textAnchor="middle" className="fill-stone-700 font-semibold" fontSize="13" fontFamily="ui-monospace, monospace">
+                  {`Σ ${fmtVal(subtotal)}`}
+                </text>
+              )}
+              <text x={gx + bandW / 2} y={height - margin.bottom + 18} textAnchor="middle"
+                className="fill-stone-500" fontSize="12" fontFamily="ui-monospace, monospace">
+                <title>{g.key}</title>
+                {fmtLabel(g.key)}
+              </text>
+            </g>
+          );
+        })}
+      </svg>
+
+      {hover && (
+        <div
+          className="absolute z-10 pointer-events-none bg-stone-900 text-white text-sm rounded px-2.5 py-2 shadow-lg"
+          style={{
+            left: `${((margin.left + hover.gi * bandW + groupPad + hover.ii * slotW + slotW / 2) / width) * 100}%`,
+            top: `${(Math.min(yScale(groups[hover.gi].items[hover.ii].value), yZero) / height) * 100}%`,
+            transform: "translate(-50%, -130%)",
+            maxWidth: "220px",
+          }}
+        >
+          <div className="font-semibold text-base">{fmtVal(groups[hover.gi].items[hover.ii].value)}</div>
+          <div className="text-stone-300 font-mono">{groups[hover.gi].key}</div>
+          <div className="text-stone-300 truncate">{groups[hover.gi].items[hover.ii].docName}</div>
+        </div>
+      )}
+
+      <div className="mt-1.5 text-sm text-stone-600">
+        {t("点击柱形可打开对应文档。Σ 为同一分组内各柱之和。",
+           "Click a bar to open its document. Σ marks the sum of bars sharing that group.")}
+      </div>
+    </div>
+  );
+};
+
 // Plain (not "nice"-rounded) min/max of a series -- used only to seed the
 // custom-range inputs with real numbers the moment "Auto" is unchecked, so
 // there's something to edit immediately instead of two empty boxes (see
@@ -4219,7 +4443,7 @@ const makeAxisToggleSetter = (setAxis, bounds) => (updater) => {
  * { mode: "auto" | "custom", min, max } state objects owned by the caller.
  * =============================================================================
  */
-const AxisRangeControls = ({ xAxis, setXAxis, yAxis, setYAxis, unit }) => {
+const AxisRangeControls = ({ xAxis, setXAxis, yAxis, setYAxis, unit, showX = true }) => {
   const { t } = useLang();
   const numInput = "w-20 text-sm border border-stone-300 rounded px-1.5 py-0.5 focus:outline-none focus:border-amber-600";
   return (
@@ -4251,33 +4475,35 @@ const AxisRangeControls = ({ xAxis, setXAxis, yAxis, setYAxis, unit }) => {
           </>
         )}
       </div>
-      <div className="flex items-center gap-1.5">
-        <span className="text-stone-700 uppercase tracking-wider">{t("横轴（时间）", "X axis (time)")}</span>
-        <label className="flex items-center gap-1 cursor-pointer text-stone-700">
-          <input
-            type="checkbox"
-            className="accent-amber-600"
-            checked={xAxis.mode === "auto"}
-            onChange={(e) => setXAxis((a) => ({ ...a, mode: e.target.checked ? "auto" : "custom" }))}
-          />
-          {t("自动", "Auto")}
-        </label>
-        {xAxis.mode === "custom" && (
-          <>
+      {showX && (
+        <div className="flex items-center gap-1.5">
+          <span className="text-stone-700 uppercase tracking-wider">{t("横轴（时间）", "X axis (time)")}</span>
+          <label className="flex items-center gap-1 cursor-pointer text-stone-700">
             <input
-              type="date" value={xAxis.min}
-              onChange={(e) => setXAxis((a) => ({ ...a, min: e.target.value }))}
-              className="text-sm border border-stone-300 rounded px-1.5 py-0.5 focus:outline-none focus:border-amber-600"
+              type="checkbox"
+              className="accent-amber-600"
+              checked={xAxis.mode === "auto"}
+              onChange={(e) => setXAxis((a) => ({ ...a, mode: e.target.checked ? "auto" : "custom" }))}
             />
-            <span className="text-stone-600">–</span>
-            <input
-              type="date" value={xAxis.max}
-              onChange={(e) => setXAxis((a) => ({ ...a, max: e.target.value }))}
-              className="text-sm border border-stone-300 rounded px-1.5 py-0.5 focus:outline-none focus:border-amber-600"
-            />
-          </>
-        )}
-      </div>
+            {t("自动", "Auto")}
+          </label>
+          {xAxis.mode === "custom" && (
+            <>
+              <input
+                type="date" value={xAxis.min}
+                onChange={(e) => setXAxis((a) => ({ ...a, min: e.target.value }))}
+                className="text-sm border border-stone-300 rounded px-1.5 py-0.5 focus:outline-none focus:border-amber-600"
+              />
+              <span className="text-stone-600">–</span>
+              <input
+                type="date" value={xAxis.max}
+                onChange={(e) => setXAxis((a) => ({ ...a, max: e.target.value }))}
+                className="text-sm border border-stone-300 rounded px-1.5 py-0.5 focus:outline-none focus:border-amber-600"
+              />
+            </>
+          )}
+        </div>
+      )}
     </div>
   );
 };
@@ -4396,17 +4622,129 @@ const FolderBrowserModal = ({ startPath, onSelect, onClose }) => {
  */
 const PLOT_DIALOG_MIN_W = 480;
 const PLOT_DIALOG_MIN_H = 380;
-const FolderPlotDialog = ({ open, node, tree, docIndex, onClose, onOpenDoc, onOpenAISettings }) => {
+const FolderPlotDialog = ({ open, node, tree, docIndex, onClose, onOpenDoc, onOpenAISettings, onDocsChanged }) => {
   const { t, lang } = useLang();
   const [includeSub, setIncludeSub] = useState(true);
   const [field, setField] = useState("actual"); // "actual" | "design"
   const [param, setParam] = useState("");
+
+  // --- X axis field + chart type -----------------------------------------
+  // xField: "docdate" (each document's own date, the historical default) |
+  // "duedate" (doc.dueDate) | "docname" (categorical -- one slot per
+  // document, no time axis at all) | any other string names a metadata key
+  // whose values look like dates (see dateLikeParams below).
+  // chartType: "line" (TimeSeriesChart -- only meaningful with a real time
+  // axis) | "bar" (GroupedBarChart -- works for both time and categorical X,
+  // and is the only option that shows several same-X values as separate,
+  // comparable bars instead of stacked dots).
+  const [xField, setXField] = useState("docdate");
+  const [chartType, setChartType] = useState("line");
+
+  // --- Group by: "document" (the historical default -- one point per
+  // document in scope) | "folder" (one bar per *immediate child* of the
+  // selected folder, each showing that child's own most-recent value --
+  // recursing into whatever subfolders it has -- rather than every
+  // document). Built for "one bar per account, plus the total across
+  // accounts" (e.g. several Fidelity account folders' latest Balance and
+  // their combined sum), which per-document mode can't express: it has no
+  // notion of "collapse each subfolder down to its single latest reading."
+  const [groupMode, setGroupMode] = useState("document");
+  // Folder mode only makes sense as bars keyed by folder name -- there's no
+  // time axis to draw a line against once every subfolder collapses to one
+  // point each. Same reasoning as the isCategorical->bar effect below.
+  useEffect(() => {
+    if (groupMode === "folder") setChartType("bar");
+  }, [groupMode]);
+  // "docname" (per-document categorical axis) has no meaning as the
+  // "which document is latest" field folder mode needs -- fall back rather
+  // than silently finding no dates and plotting nothing.
+  useEffect(() => {
+    if (groupMode === "folder" && xField === "docname") setXField("docdate");
+  }, [groupMode, xField]);
 
   // --- Gemini trend fit/comment (opt-in) --------------------------------
   const [aiSettings, setAiSettings] = useState({ configured: false, library_installed: true });
   const [aiLoading, setAiLoading] = useState(false);
   const [aiComment, setAiComment] = useState("");
   const [aiError, setAiError] = useState("");
+
+  // --- Excel snapshot history (opt-in) -----------------------------------
+  // "Save snapshot" appends {date: today, total: totals.grand} to a per-
+  // folder, per-parameter Excel file ("<param> history.xlsx") that lives as
+  // a real document directly inside the current folder -- see
+  // StorageAdapter.savePlotSnapshot / /api/docs/plot-snapshot in
+  // dms_server.py. "Total vs. time" reads that same file back and plots it,
+  // so the more snapshots get saved over time, the more points that chart
+  // has. Only shown where the Total panel itself is shown (bar-chart-like
+  // views), since a snapshot of a "latest value" line chart wouldn't mean
+  // the same thing.
+  const [savingSnapshot, setSavingSnapshot] = useState(false);
+  const [snapshotMsg, setSnapshotMsg] = useState(""); // status/error after Save
+  const [historyDocId, setHistoryDocId] = useState(null);
+  const [historyRows, setHistoryRows] = useState([]); // [{date, total, unit}]
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState("");
+  const [showHistoryChart, setShowHistoryChart] = useState(false);
+
+  // The history file is keyed by folder + parameter -- once either changes,
+  // whatever's currently shown/loaded is about a different file, so drop it
+  // rather than plotting/saving into the wrong one. Keyed off node?.id, not
+  // `node` itself: saveSnapshot's own onDocsChanged() refresh hands this
+  // component a brand-new `node` object (same folder, new reference, from
+  // the app re-deriving selectedNode off the refreshed tree) -- depending on
+  // the object would immediately wipe the just-set success message.
+  useEffect(() => {
+    setSnapshotMsg(""); setHistoryRows([]); setHistoryDocId(null); setShowHistoryChart(false); setHistoryError("");
+  }, [node?.id, param]);
+
+  const saveSnapshot = async () => {
+    if (!node || !param || savingSnapshot) return;
+    setSavingSnapshot(true); setSnapshotMsg("");
+    try {
+      const data = await StorageAdapter.savePlotSnapshot(node.id, param, totals.grand, unit);
+      setHistoryRows(data.rows || []);
+      setHistoryDocId(data.doc_id || null);
+      setSnapshotMsg(t(`已保存快照（“${data.name}”，共 ${data.rows.length} 条记录）`, `Snapshot saved to "${data.name}" (${data.rows.length} recorded so far)`));
+      // The Excel file now exists (or has a new row) as a real document in
+      // this folder -- refresh the app's tree/docIndex so it shows up in the
+      // folder's file list right away instead of only after the next reload.
+      if (onDocsChanged) await onDocsChanged();
+    } catch (e) {
+      setSnapshotMsg(e.message || String(e));
+    } finally {
+      setSavingSnapshot(false);
+    }
+  };
+
+  const toggleHistoryChart = async () => {
+    if (showHistoryChart) { setShowHistoryChart(false); return; }
+    if (!node || !param) return;
+    setHistoryLoading(true); setHistoryError("");
+    try {
+      const data = await StorageAdapter.getPlotHistory(node.id, param);
+      setHistoryRows(data.rows || []);
+      setHistoryDocId(data.doc_id || null);
+      setShowHistoryChart(true);
+    } catch (e) {
+      setHistoryError(e.message || String(e));
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
+  // historyRows -> chart points, same shape TimeSeriesChart expects
+  // elsewhere in this component (see docPoints above). Every point shares
+  // historyDocId as its docId so clicking any of them opens the underlying
+  // Excel file -- there's no per-point source document, just log entries.
+  const historyPoints = useMemo(() => {
+    return historyRows
+      .map((r) => ({
+        t: new Date(r.date + "T00:00:00Z").getTime(),
+        date: r.date, xLabel: r.date, value: r.total,
+        docId: historyDocId, docName: t("总计快照", "Total snapshot"),
+      }))
+      .sort((a, b) => a.t - b.t);
+  }, [historyRows, historyDocId]);
 
   // --- Custom axis ranges (see AxisRangeControls) ------------------------
   const AXIS_DEFAULT = { mode: "auto", min: "", max: "" };
@@ -4506,13 +4844,13 @@ const FolderPlotDialog = ({ open, node, tree, docIndex, onClose, onOpenDoc, onOp
   }, [open]);
 
   // The previous analysis (and any custom axis range) is about a different
-  // series once the parameter, field, or scope changes -- drop it rather
-  // than leaving a stale comment/range sitting under a chart it no longer
-  // describes.
+  // series once the parameter, field, scope, or X axis changes -- drop it
+  // rather than leaving a stale comment/range sitting under a chart it no
+  // longer describes.
   useEffect(() => {
     setAiComment(""); setAiError("");
     setYAxis(AXIS_DEFAULT); setXAxis(AXIS_DEFAULT);
-  }, [param, field, includeSub, node]);
+  }, [param, field, includeSub, node, xField, groupMode]);
 
   // Skip the (potentially large) scope/point computation entirely while the
   // dialog is closed -- it's mounted the whole time the app runs, and this
@@ -4559,6 +4897,60 @@ const FolderPlotDialog = ({ open, node, tree, docIndex, onClose, onOpenDoc, onOp
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, availableParams.join("|")]);
 
+  // Metadata keys (other than the plotted parameter itself) whose values
+  // look like a plain "YYYY-MM-DD" date for at least one doc in scope --
+  // offered in the X axis dropdown alongside the two built-in date fields
+  // (document date, due date). Heuristic, not a real per-field type system
+  // (this app doesn't have one -- see getNumericParamValue) -- matches the
+  // same "YYYY-MM-DD" shape docDate/dueDate are already stored in.
+  const dateLikeParams = useMemo(() => {
+    const set = new Set();
+    for (const d of scopeDocs) {
+      for (const [k, v] of Object.entries(d.metadata || {})) {
+        if (k === param) continue;
+        const raw = v == null ? "" : typeof v === "string" ? v : (v.value ?? v.actual ?? "");
+        if (/^\d{4}-\d{2}-\d{2}$/.test(String(raw).trim())) set.add(k);
+      }
+    }
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [scopeDocs, param]);
+
+  const xFieldOptions = useMemo(
+    () => ["docdate", "duedate", ...dateLikeParams, "docname"],
+    [dateLikeParams]
+  );
+  // A metadata-param X field can stop existing (folder/scope changed) --
+  // fall back to the default rather than silently plotting nothing.
+  useEffect(() => {
+    if (!open) return;
+    if (!xFieldOptions.includes(xField)) setXField("docdate");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, xFieldOptions.join("|")]);
+
+  const isCategorical = xField === "docname";
+  // Line charts assume a real time axis (position, CAGR labels, ...) --
+  // switching to the categorical document axis only makes sense as bars, so
+  // force that the moment X becomes categorical rather than showing a
+  // meaningless line option.
+  useEffect(() => {
+    if (isCategorical) setChartType("bar");
+  }, [isCategorical]);
+  // What actually gets rendered, as opposed to the raw `chartType` state:
+  // isCategorical/groupMode flipping to something line-incompatible and
+  // `points` recomputing to match both happen synchronously within the same
+  // render (points' useMemo depends on isCategorical/groupMode directly),
+  // but the effects above that correct `chartType` back to "bar" don't run
+  // until *after* that render commits. Rendering off raw `chartType` in that
+  // gap would hand TimeSeriesChart categorical/folder points with no
+  // date/`t` field, which crashes on `new Date(...).toISOString()`. Every
+  // render site below uses this instead so there's no such gap.
+  const effectiveChartType = (isCategorical || groupMode === "folder") ? "bar" : chartType;
+
+  const xFieldLabel = xField === "docdate" ? t("文档日期", "document date")
+    : xField === "duedate" ? t("到期日", "due date")
+    : xField === "docname" ? t("文档", "document")
+    : xField;
+
   const unit = useMemo(() => {
     if (!param) return "";
     for (const d of scopeDocs) {
@@ -4571,7 +4963,7 @@ const FolderPlotDialog = ({ open, node, tree, docIndex, onClose, onOpenDoc, onOp
     return "";
   }, [scopeDocs, param, field]);
 
-  const { points, undated } = useMemo(() => {
+  const { points: docPoints, undated: docUndated } = useMemo(() => {
     if (!param) return { points: [], undated: [] };
     const pts = [];
     const undatedDocs = [];
@@ -4588,20 +4980,144 @@ const FolderPlotDialog = ({ open, node, tree, docIndex, onClose, onOpenDoc, onOp
       if (seenValues.has(v)) continue;
       seenValues.add(v);
       seenPerDoc.set(d.id, seenValues);
-      const date = resolveDocTime(d, tree);
+      if (isCategorical) {
+        pts.push({ x: d.name, xLabel: d.name, value: v, docId: d.id, docName: d.name });
+        continue;
+      }
+      const date = resolveXFieldValue(d, tree, xField);
       if (!date) { undatedDocs.push(d); continue; }
       // Parse as UTC (explicit "Z") so the point's position on the time axis
       // and formatAxisDate's toISOString() round-trip agree regardless of
       // the viewer's own timezone -- a local-time parse here would shift
       // dates by a day for anyone east/west of UTC.
-      pts.push({ t: new Date(date + "T00:00:00Z").getTime(), date, value: v, docId: d.id, docName: d.name });
+      pts.push({ t: new Date(date + "T00:00:00Z").getTime(), date, xLabel: date, value: v, docId: d.id, docName: d.name });
     }
-    pts.sort((a, b) => a.t - b.t);
+    pts.sort(isCategorical ? (a, b) => a.x.localeCompare(b.x) : (a, b) => a.t - b.t);
     return { points: pts, undated: undatedDocs };
-  }, [scopeDocs, param, field, tree]);
+  }, [scopeDocs, param, field, tree, xField, isCategorical]);
+
+  // Recursively resolve one folder's contribution to "Subfolder latest
+  // value" mode:
+  //  - Its own directly-attached documents (not the ones inside any child
+  //    -- those are handled by the recursive calls below) collapse to a
+  //    single "own latest" reading, same as a plain account folder always
+  //    has: whichever one of them has the most recent usable date.
+  //  - Each child folder is resolved the same way, recursively -- so a
+  //    child with children of its own keeps collapsing all the way down.
+  //  - The folder's total is the SUM of its own latest reading (if any)
+  //    plus every child's own total. A multi-account institution folder
+  //    (e.g. "Fidelity" holding 4 separate account subfolders) therefore
+  //    rolls up to the combined latest balance across every account under
+  //    it, not just whichever single statement happens to be dated latest
+  //    -- that was the old (wrong) behavior this replaces. This is fully
+  //    recursive, not hardcoded to 2 levels: a 3rd-layer folder sums into
+  //    its 2nd-layer parent the same way the 2nd layer sums into the 1st.
+  // Returns { sum, leafCount, anchor, sawParam }: `leafCount` is how many
+  // "own latest" readings (at any depth) fed the sum -- 0 means nothing
+  // plottable anywhere in this subtree, so the caller should skip this
+  // folder entirely rather than plot a 0 (a missing balance isn't a zero
+  // balance). `anchor` is *a* representative contributing document (the
+  // one with the latest date among all of them) used only so a bar/table
+  // row for a summed (multi-account) folder still has something to open on
+  // click -- it does not mean the sum came from that one document alone.
+  // `sawParam` records whether `param` was found on any document here at
+  // all, even one with no usable date -- purely diagnostic, so a skipped
+  // folder's explanation can distinguish "never had this parameter" from
+  // "had it, but no document could be dated" (see the excluded-folders
+  // list in the JSX below).
+  const resolveFolderContribution = (folderNode, byId) => {
+    let anchor = null; // { date, value, doc } for this folder's OWN best reading
+    let sawParam = false;
+    for (const d of folderNode.documents || []) {
+      const base = byId.get(d.id);
+      if (!base) continue;
+      const override = (base.metaOverrides || {})[folderNode.id];
+      const doc = override ? { ...base, metadata: effectiveMetadata(base.metadata, override) } : base;
+      const v = getNumericParamValue((doc.metadata || {})[param], { field });
+      if (v == null) continue;
+      sawParam = true;
+      const date = resolveXFieldValue(doc, tree, xField);
+      if (!date) continue;
+      if (!anchor || date > anchor.date) anchor = { date, value: v, doc };
+    }
+    let sum = anchor ? anchor.value : 0;
+    let leafCount = anchor ? 1 : 0;
+    for (const child of folderNode.children || []) {
+      const r = resolveFolderContribution(child, byId);
+      if (r.sawParam) sawParam = true;
+      if (r.leafCount === 0) continue;
+      sum += r.sum;
+      leafCount += r.leafCount;
+      if (!anchor || (r.anchor && r.anchor.date > anchor.date)) anchor = r.anchor;
+    }
+    return { sum, leafCount, anchor, sawParam };
+  };
+
+  // One point per *immediate child* of the selected folder, each resolved
+  // via resolveFolderContribution above. Independent of scopeDocs/
+  // includeSub -- every child is always walked in full, since "collapse
+  // this subfolder (and everything under it) down to one number" is the
+  // whole point of this mode.
+  const { points: folderPoints, undated: folderUndated } = useMemo(() => {
+    if (groupMode !== "folder" || !open || !node || !param) return { points: [], undated: [] };
+    const byId = new Map(docIndex.map((d) => [d.id, d]));
+    const pts = [];
+    const skipped = []; // { child, reason: "no-param" | "no-date" }, for the "excluded" disclosure
+    for (const child of node.children || []) {
+      const r = resolveFolderContribution(child, byId);
+      if (r.leafCount === 0) {
+        skipped.push({ child, reason: r.sawParam ? "no-date" : "no-param" });
+        continue;
+      }
+      pts.push({
+        x: child.name, xLabel: child.name, value: r.sum,
+        docId: r.anchor.doc.id,
+        docName: r.leafCount > 1
+          ? t(`${r.leafCount} 项之和，最新 ${r.anchor.date}`, `sum of ${r.leafCount} item(s), latest ${r.anchor.date}`)
+          : `${r.anchor.doc.name} (${r.anchor.date})`,
+      });
+    }
+    pts.sort((a, b) => a.x.localeCompare(b.x));
+    return { points: pts, undated: skipped };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [groupMode, open, node, param, field, xField, docIndex, tree]);
+
+  const points = groupMode === "folder" ? folderPoints : docPoints;
+  const undated = groupMode === "folder" ? folderUndated : docUndated;
+
+  // Per-X-value subtotal (several documents can share the same date, e.g.
+  // five accounts' Balance all dated the same day) plus a grand total across
+  // every currently plotted point. Summing only means something when a
+  // point represents an amount that's meant to be added up (an expense, a
+  // per-account balance combined with others on the same date, etc). For
+  // the far more common case -- a single point-in-time quantity like one
+  // account's Balance tracked across dates -- adding up 18 snapshots of the
+  // same account produces a number with no real-world meaning, so that case
+  // (a line chart where no X position has more than one contributing
+  // document) instead reports the latest point's value. See hasMultiPerX
+  // below and its use in the render.
+  const totals = useMemo(() => {
+    const byX = new Map(); // xLabel -> { sum, count }
+    let grand = 0;
+    for (const p of points) {
+      const cur = byX.get(p.xLabel) || { sum: 0, count: 0 };
+      cur.sum += p.value; cur.count += 1;
+      byX.set(p.xLabel, cur);
+      grand += p.value;
+    }
+    const hasMultiPerX = Array.from(byX.values()).some((g) => g.count > 1);
+    const latest = points.length ? points[points.length - 1] : null; // points is sorted ascending
+    return { byX, grand, hasMultiPerX, latest };
+  }, [points]);
 
   const fitWithGemini = async () => {
-    if (aiLoading || points.length < 2) return;
+    // A trend fit needs real dates -- meaningless against the categorical
+    // "document" axis, and folder mode's points have no `date`/`t` at all
+    // (each bar is one subfolder's latest reading, not a moment in time --
+    // see folderPoints above). Unreachable in either case: the panel that
+    // renders this button is hidden whenever isCategorical or groupMode is
+    // "folder", see the JSX below.
+    if (aiLoading || points.length < 2 || isCategorical || groupMode === "folder") return;
     setAiLoading(true); setAiError(""); setAiComment("");
     try {
       const data = await StorageAdapter.aiFitTrend(
@@ -4649,10 +5165,13 @@ const FolderPlotDialog = ({ open, node, tree, docIndex, onClose, onOpenDoc, onOp
     if (points.length === 0) return;
     const key = `dms_plot_popout_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const payload = {
-      points: points.map((p) => ({ t: p.t, date: p.date, value: p.value, docName: p.docName })),
+      points: points.map((p) => ({ t: p.t, date: p.date, x: p.x, xLabel: p.xLabel, value: p.value, docName: p.docName })),
       paramName: param,
       unit,
       nodeName: node ? node.name : "",
+      isCategorical,
+      chartType,
+      xFieldLabel,
       lang,
     };
     try {
@@ -4745,14 +5264,75 @@ const FolderPlotDialog = ({ open, node, tree, docIndex, onClose, onOpenDoc, onOp
               <option value="design">{t("设计值", "Design")}</option>
             </select>
           </div>
-          <label className="flex items-center gap-1.5 text-[13px] text-stone-700 cursor-pointer">
-            <input type="checkbox" checked={includeSub} onChange={(e) => setIncludeSub(e.target.checked)} className="accent-amber-600" />
-            {t("包含子文件夹", "Include subfolders")}
-          </label>
-          <span className="text-[13px] text-stone-600 ml-auto">{t(`共 ${scopeDocs.length} 个文档`, `${scopeDocs.length} document(s) in scope`)}</span>
+          <div className="flex items-center gap-1.5">
+            <label className="text-[13px] text-stone-700 uppercase tracking-wider">{t("分组", "Group by")}</label>
+            <div className="flex items-center gap-0.5 border border-stone-300 rounded overflow-hidden">
+              <button
+                onClick={() => setGroupMode("document")}
+                title={t("每份文档一个数据点（原有方式）", "One point per document (the original behavior)")}
+                className={`px-2 py-1 text-[13px] ${groupMode === "document" ? "bg-amber-600 text-white" : "text-stone-700 hover:bg-stone-50"}`}
+              >
+                {t("文档", "Document")}
+              </button>
+              <button
+                onClick={() => setGroupMode("folder")}
+                title={t("每个子文件夹一根柱子，取该子文件夹（含其自身子文件夹）中最新一份文档的数值，并给出各子文件夹最新值之和", "One bar per subfolder, using the most recent value found anywhere in that subfolder (including its own subfolders), plus the total across subfolders")}
+                className={`px-2 py-1 text-[13px] border-l border-stone-300 ${groupMode === "folder" ? "bg-amber-600 text-white" : "text-stone-700 hover:bg-stone-50"}`}
+              >
+                {t("子文件夹最新值", "Subfolder latest value")}
+              </button>
+            </div>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <label className="text-[13px] text-stone-700 uppercase tracking-wider">
+              {groupMode === "folder" ? t("“最新”依据", "\"Latest\" by") : t("横轴", "X axis")}
+            </label>
+            <select
+              value={xField}
+              onChange={(e) => setXField(e.target.value)}
+              className="text-sm border border-stone-300 rounded px-2 py-1 focus:outline-none focus:border-amber-600"
+            >
+              <option value="docdate">{t("文档日期", "Document date")}</option>
+              <option value="duedate">{t("到期日", "Due date")}</option>
+              {dateLikeParams.map((p) => <option key={p} value={p}>{p}</option>)}
+              {groupMode !== "folder" && <option value="docname">{t("文档（分类）", "Document (categorical)")}</option>}
+            </select>
+          </div>
+          <div className="flex items-center gap-0.5 border border-stone-300 rounded overflow-hidden">
+            <button
+              onClick={() => setChartType("line")}
+              disabled={isCategorical || groupMode === "folder"}
+              title={
+                groupMode === "folder" ? t("子文件夹最新值模式没有时间轴，只能用柱状图", "Subfolder latest value has no time axis -- bars only")
+                : isCategorical ? t("分类横轴无法使用折线图", "Line charts need a real time axis")
+                : t("折线图", "Line chart")
+              }
+              className={`px-2 py-1 flex items-center gap-1 text-[13px] disabled:opacity-30 disabled:cursor-not-allowed ${chartType === "line" ? "bg-amber-600 text-white" : "text-stone-700 hover:bg-stone-50"}`}
+            >
+              <LineChartIcon size={13} /> {t("折线", "Line")}
+            </button>
+            <button
+              onClick={() => setChartType("bar")}
+              title={t("柱状图（同一横轴位置的多个值并排显示，并给出小计）", "Bar chart (several values at the same X position shown side by side, with a subtotal)")}
+              className={`px-2 py-1 flex items-center gap-1 text-[13px] border-l border-stone-300 ${chartType === "bar" ? "bg-amber-600 text-white" : "text-stone-700 hover:bg-stone-50"}`}
+            >
+              <BarChartIcon size={13} /> {t("柱状", "Bar")}
+            </button>
+          </div>
+          {groupMode !== "folder" && (
+            <label className="flex items-center gap-1.5 text-[13px] text-stone-700 cursor-pointer">
+              <input type="checkbox" checked={includeSub} onChange={(e) => setIncludeSub(e.target.checked)} className="accent-amber-600" />
+              {t("包含子文件夹", "Include subfolders")}
+            </label>
+          )}
+          <span className="text-[13px] text-stone-600 ml-auto">
+            {groupMode === "folder"
+              ? t(`共 ${(node?.children || []).length} 个子文件夹，${points.length} 个有数值`, `${(node?.children || []).length} subfolder(s), ${points.length} with a value`)
+              : t(`共 ${scopeDocs.length} 个文档`, `${scopeDocs.length} document(s) in scope`)}
+          </span>
           {points.length > 0 && (
             <div className="w-full">
-              <AxisRangeControls xAxis={xAxis} setXAxis={setXAxisSeeded} yAxis={yAxis} setYAxis={setYAxisSeeded} unit={unit} />
+              <AxisRangeControls xAxis={xAxis} setXAxis={setXAxisSeeded} yAxis={yAxis} setYAxis={setYAxisSeeded} unit={unit} showX={effectiveChartType === "line"} />
             </div>
           )}
         </div>
@@ -4765,20 +5345,129 @@ const FolderPlotDialog = ({ open, node, tree, docIndex, onClose, onOpenDoc, onOp
             </div>
           ) : points.length === 0 ? (
             <div className="text-center text-base text-stone-700 py-10">
-              {t(`没有文档同时具有 "${param}" 的数值和可用日期（文档日期或 "YYYY-MM" 文件夹名）。`,
-                 `No document has both a numeric value for "${param}" and a usable date (document date, or a "YYYY-MM" folder name).`)}
+              {groupMode === "folder"
+                ? ((node?.children || []).length === 0
+                    ? t("此文件夹没有子文件夹。切换回“文档”分组以绘制其自身文档。", "This folder has no subfolders. Switch back to \"Document\" grouping to plot its own documents.")
+                    : t(`没有任何子文件夹的文档同时具有 "${param}" 的数值和可用的${xFieldLabel}。`, `No subfolder has a document with both a "${param}" value and a usable ${xFieldLabel}.`))
+                : isCategorical
+                ? t(`没有文档具有 "${param}" 的数值。`, `No document has a numeric value for "${param}".`)
+                : t(`没有文档同时具有 "${param}" 的数值和可用的${xFieldLabel}${xField === "docdate" ? "（文档日期或 \"YYYY-MM\" 文件夹名）" : ""}。`,
+                    `No document has both a numeric value for "${param}" and a usable ${xFieldLabel}${xField === "docdate" ? " (document date, or a \"YYYY-MM\" folder name)" : ""}.`)}
             </div>
           ) : (
             <>
               <div ref={chartWrapRef} style={{ height: chartAreaHeight }} className="w-full">
-                <TimeSeriesChart
-                  points={points} paramName={param} unit={unit} onPointClick={openAndClose}
-                  width={chartSize.w} height={chartSize.h}
-                  timeRange={xRangeOverride} valueRange={yRangeOverride}
-                />
+                {effectiveChartType === "bar" ? (
+                  <GroupedBarChart
+                    points={points} isCategorical={isCategorical || groupMode === "folder"} paramName={param} unit={unit} onPointClick={openAndClose}
+                    width={chartSize.w} height={chartSize.h}
+                    valueRange={yRangeOverride}
+                  />
+                ) : (
+                  <TimeSeriesChart
+                    points={points} paramName={param} unit={unit} onPointClick={openAndClose}
+                    width={chartSize.w} height={chartSize.h}
+                    timeRange={xRangeOverride} valueRange={yRangeOverride}
+                  />
+                )}
               </div>
 
-              {points.length > 1 && (
+              {effectiveChartType === "line" && !totals.hasMultiPerX ? (
+                /* Plain time series -- one point per date, e.g. a single
+                   account's Balance over the years (the common case). Adding
+                   up 18 snapshots of the same point-in-time quantity has no
+                   real-world meaning, so show the most recent value instead
+                   of a sum -- see the totals memo above. */
+                <div className="mt-3 border border-stone-200 bg-stone-50 rounded p-3 text-[13px]">
+                  <div className="flex items-center justify-between gap-2 flex-wrap">
+                    <span className="text-stone-700 uppercase tracking-wider">
+                      {t("最新值", "Latest value")}
+                      {totals.latest && <span className="normal-case text-stone-600"> ({totals.latest.xLabel})</span>}
+                    </span>
+                    <span className="font-mono font-semibold text-stone-800 text-lg">
+                      {totals.latest ? totals.latest.value.toLocaleString() : "—"}{unit ? ` ${unit}` : ""}
+                    </span>
+                  </div>
+                </div>
+              ) : (
+                /* Grand total across every plotted point, plus a per-X
+                   subtotal breakdown whenever at least one X position (e.g.
+                   one date) has more than one document contributing to it --
+                   otherwise every subtotal would just repeat the single point
+                   it contains. Summing is meaningful here: a bar chart
+                   compares distinct documents/categories side by side, and a
+                   line chart only lands in this branch when at least one X
+                   position genuinely combines several documents (e.g.
+                   several accounts' Balance dated the same day), where the
+                   sum is a real combined total. */
+                <div className="mt-3 border border-stone-200 bg-stone-50 rounded p-3 text-[13px]">
+                  <div className="flex items-center justify-between gap-2 flex-wrap">
+                    <span className="text-stone-700 uppercase tracking-wider">{t("总计", "Total")}</span>
+                    <span className="font-mono font-semibold text-stone-800 text-lg">
+                      {totals.grand.toLocaleString()}{unit ? ` ${unit}` : ""}
+                    </span>
+                  </div>
+                  {totals.hasMultiPerX && (
+                    <div className="mt-2 pt-2 border-t border-stone-200 space-y-1">
+                      {Array.from(totals.byX.entries()).map(([x, g]) => (
+                        <div key={x} className="flex items-center justify-between gap-2 text-stone-700">
+                          <span className="font-mono">{x}{g.count > 1 ? ` (${g.count})` : ""}</span>
+                          <span className="font-mono">{g.sum.toLocaleString()}{unit ? ` ${unit}` : ""}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Excel snapshot history -- "Save snapshot" records
+                      today's total into "<param> history.xlsx" inside this
+                      folder; "Total vs. time" plots whatever's been recorded
+                      there so far, so it grows a new point each time you
+                      save one. See the state/handlers above. */}
+                  <div className="mt-2 pt-2 border-t border-stone-200 flex items-center gap-2 flex-wrap">
+                    <button
+                      onClick={saveSnapshot}
+                      disabled={savingSnapshot || !param}
+                      className="text-[13px] px-2.5 py-1 rounded flex items-center gap-1.5 border border-stone-300 text-stone-700 bg-white hover:bg-stone-100 disabled:opacity-40"
+                      title={t("将今天的日期和总计追加保存到本文件夹内的 Excel 文件中", "Append today's date and this total to an Excel file saved in this folder")}
+                    >
+                      {savingSnapshot
+                        ? (<><Loader size={11} className="animate-spin" /> {t("保存中…", "Saving…")}</>)
+                        : (<><Save size={11} /> {t("保存快照", "Save snapshot")}</>)}
+                    </button>
+                    <button
+                      onClick={toggleHistoryChart}
+                      disabled={historyLoading || !param}
+                      className={`text-[13px] px-2.5 py-1 rounded flex items-center gap-1.5 border disabled:opacity-40 ${showHistoryChart ? "border-amber-600 bg-amber-600 text-white" : "border-stone-300 text-stone-700 bg-white hover:bg-stone-100"}`}
+                      title={t("绘制该 Excel 文件中已保存的总计随时间变化的曲线", "Plot the totals saved in that Excel file over time")}
+                    >
+                      {historyLoading
+                        ? (<><Loader size={11} className="animate-spin" /> {t("加载中…", "Loading…")}</>)
+                        : (<><TrendingUp size={11} /> {showHistoryChart ? t("收起总计走势", "Hide total vs. time") : t("总计走势图", "Total vs. time")}</>)}
+                    </button>
+                    {snapshotMsg && <span className="text-stone-600">{snapshotMsg}</span>}
+                    {historyError && <span className="text-red-700">{historyError}</span>}
+                  </div>
+
+                  {showHistoryChart && (
+                    historyPoints.length === 0 ? (
+                      <div className="mt-2 pt-2 border-t border-stone-200 text-center text-stone-600 py-6">
+                        {t("此参数还没有已保存的快照。点击“保存快照”记录第一条。", "No snapshots saved for this parameter yet. Click \"Save snapshot\" to record the first one.")}
+                      </div>
+                    ) : (
+                      <div className="mt-2 pt-2 border-t border-stone-200">
+                        <div style={{ height: 220 }} className="w-full">
+                          <TimeSeriesChart
+                            points={historyPoints} paramName={t(`${param}（总计）`, `${param} (total)`)} unit={unit} onPointClick={openAndClose}
+                            width={Math.max(300, size.w - 64)} height={220}
+                          />
+                        </div>
+                      </div>
+                    )
+                  )}
+                </div>
+              )}
+
+              {points.length > 1 && !isCategorical && groupMode !== "folder" && (
                 <div className="mt-3 border border-purple-200 bg-purple-50/60 rounded p-3">
                   <div className="flex items-center justify-between gap-2 flex-wrap">
                     <div className="flex items-center gap-1.5 text-[13px] text-purple-800 font-medium">
@@ -4817,17 +5506,22 @@ const FolderPlotDialog = ({ open, node, tree, docIndex, onClose, onOpenDoc, onOp
               <table className="w-full text-sm mt-4">
                 <thead className="text-stone-700 text-left border-b border-stone-200">
                   <tr>
-                    <th className="py-1 pr-2 font-medium w-28">{t("日期", "Date")}</th>
+                    <th className="py-1 pr-2 font-medium w-28 capitalize">{groupMode === "folder" ? t("子文件夹", "Subfolder") : xFieldLabel}</th>
                     <th className="py-1 pr-2 font-medium w-24">{t("数值", "Value")}</th>
-                    <th className="py-1 font-medium">{t("文档", "Document")}</th>
+                    {!isCategorical && <th className="py-1 font-medium">{t("文档", "Document")}</th>}
                   </tr>
                 </thead>
                 <tbody>
                   {points.map((p) => (
-                    <tr key={p.docId} onClick={() => openAndClose(p.docId)} className="border-b border-stone-100 hover:bg-amber-50 cursor-pointer">
-                      <td className="py-1 pr-2 font-mono">{p.date}</td>
+                    // Keyed by xLabel+docId, not docId alone -- in folder mode
+                    // two different subfolders could both resolve to the same
+                    // underlying document as their "latest" (e.g. it's linked
+                    // into both), which would otherwise collide on a bare
+                    // docId key.
+                    <tr key={`${p.xLabel}|${p.docId}`} onClick={() => openAndClose(p.docId)} className="border-b border-stone-100 hover:bg-amber-50 cursor-pointer">
+                      <td className="py-1 pr-2 font-mono">{p.xLabel}</td>
                       <td className="py-1 pr-2 font-mono">{p.value}{unit ? ` ${unit}` : ""}</td>
-                      <td className="py-1 truncate max-w-0" title={p.docName}>{p.docName}</td>
+                      {!isCategorical && <td className="py-1 truncate max-w-0" title={p.docName}>{p.docName}</td>}
                     </tr>
                   ))}
                 </tbody>
@@ -4838,14 +5532,40 @@ const FolderPlotDialog = ({ open, node, tree, docIndex, onClose, onOpenDoc, onOp
           {undated.length > 0 && (
             <details className="mt-4 text-[13px] text-stone-700">
               <summary className="cursor-pointer hover:text-stone-700">
-                {t(`${undated.length} 个文档已排除（无可用日期）`, `${undated.length} document(s) excluded (no usable date)`)}
+                {groupMode === "folder"
+                  ? t(`${undated.length} 个子文件夹已排除（点击展开查看每个的具体原因）`, `${undated.length} subfolder(s) excluded (expand for each one's specific reason)`)
+                  : t(`${undated.length} 个文档已排除（没有可用的${xFieldLabel}）`, `${undated.length} document(s) excluded (no usable ${xFieldLabel})`)}
               </summary>
               <ul className="mt-1.5 ml-4 list-disc space-y-0.5">
-                {undated.map((d) => (
-                  <li key={d.id}>
-                    <button onClick={() => openAndClose(d.id)} className="hover:underline hover:text-amber-700 text-left">{d.name}</button>
-                  </li>
-                ))}
+                {/* Folder mode lists the skipped *child folder nodes* themselves
+                    (not documents) -- there's no single document to open for
+                    "this subfolder had nothing plottable", so these are plain
+                    text rather than openAndClose buttons. Each one also says
+                    *why*: "no-param" means no document anywhere in that
+                    subfolder ever carried this exact parameter name at all
+                    (the most common real cause -- e.g. one institution's
+                    documents use "Balance" while another's use "Balance ($)"
+                    as the metadata key, so selecting one leaves the other's
+                    folders looking empty even though they have balances);
+                    "no-date" means the parameter was found but no document
+                    carrying it could be dated. */}
+                {groupMode === "folder"
+                  ? undated.map(({ child, reason }) => (
+                      <li key={child.id}>
+                        {child.name}
+                        <span className="text-stone-600">
+                          {" — "}
+                          {reason === "no-param"
+                            ? t(`此子文件夹（含其子文件夹）中没有任何文档带有 "${param}" 这个参数`, `no document in this subfolder (or its subfolders) has a "${param}" value at all`)
+                            : t(`有 "${param}" 的数值，但没有可用的${xFieldLabel}`, `has a "${param}" value, but no usable ${xFieldLabel}`)}
+                        </span>
+                      </li>
+                    ))
+                  : undated.map((d) => (
+                      <li key={d.id}>
+                        <button onClick={() => openAndClose(d.id)} className="hover:underline hover:text-amber-700 text-left">{d.name}</button>
+                      </li>
+                    ))}
               </ul>
             </details>
           )}
@@ -4943,6 +5663,7 @@ const PlotPopoutApp = ({ storageKey }) => {
   }
   if (!data) return null;
 
+  const isBar = data.chartType === "bar";
   const yRangeOverride = yAxis.mode === "custom" && yAxis.min !== "" && yAxis.max !== ""
     ? { min: Number(yAxis.min), max: Number(yAxis.max) } : null;
   const xRangeOverride = xAxis.mode === "custom" && xAxis.min && xAxis.max
@@ -4961,14 +5682,22 @@ const PlotPopoutApp = ({ storageKey }) => {
           </h1>
         </div>
         <div className="px-4 py-2 border-b border-stone-100 shrink-0">
-          <AxisRangeControls xAxis={xAxis} setXAxis={setXAxisSeeded} yAxis={yAxis} setYAxis={setYAxisSeeded} unit={data.unit} />
+          <AxisRangeControls xAxis={xAxis} setXAxis={setXAxisSeeded} yAxis={yAxis} setYAxis={setYAxisSeeded} unit={data.unit} showX={!isBar} />
         </div>
         <div ref={containerRef} className="flex-1 min-h-0 p-4">
-          <TimeSeriesChart
-            points={data.points} paramName={data.paramName} unit={data.unit}
-            width={chartSize.w} height={chartSize.h}
-            timeRange={xRangeOverride} valueRange={yRangeOverride}
-          />
+          {isBar ? (
+            <GroupedBarChart
+              points={data.points} isCategorical={!!data.isCategorical} paramName={data.paramName} unit={data.unit}
+              width={chartSize.w} height={chartSize.h}
+              valueRange={yRangeOverride}
+            />
+          ) : (
+            <TimeSeriesChart
+              points={data.points} paramName={data.paramName} unit={data.unit}
+              width={chartSize.w} height={chartSize.h}
+              timeRange={xRangeOverride} valueRange={yRangeOverride}
+            />
+          )}
         </div>
       </div>
     </LangContext.Provider>
@@ -6128,13 +6857,16 @@ const PdfViewerPanel = ({ url, jumpToPage, highlightText, jumpNonce }) => {
 
 const FloatingDocPreview = ({ doc, onClose }) => {
   const { t } = useLang();
-  const [pos, setPos] = useState({ x: null, y: null }); // null = default position (left edge)
-  // Default to a large panel on the left -- big enough to actually read a
-  // full document page while the metadata/list stays visible alongside it
-  // on the right, rather than the old small bottom-right thumbnail size.
+  const [pos, setPos] = useState({ x: null, y: null }); // null = default position (top edge)
+  // Default to a wide panel docked to the top -- nearly the full window
+  // width so PDF.js's "page-width" fit (see PdfViewerPanel) renders the
+  // page large and legible, with just enough height to read comfortably
+  // while the tree/metadata panel underneath stays visible for reference.
+  // Replaces the older tall-and-narrow left-pinned default, which fit less
+  // text per line and hid whatever was below it.
   const [size, setSize] = useState(() => ({
-    w: typeof window !== "undefined" ? Math.round(window.innerWidth * 0.4) : 520,
-    h: typeof window !== "undefined" ? Math.max(FLOATING_PREVIEW_MIN_H, window.innerHeight - 92) : 520,
+    w: typeof window !== "undefined" ? window.innerWidth - 32 : 900,
+    h: typeof window !== "undefined" ? Math.max(FLOATING_PREVIEW_MIN_H, Math.round(window.innerHeight * 0.45)) : 420,
   }));
   // True while a drag or resize is in progress — renders a transparent
   // overlay above the iframe so its own event handling can't swallow
@@ -6239,11 +6971,22 @@ const FloatingDocPreview = ({ doc, onClose }) => {
   // the exact matched text (for its bonus in-page highlight) get used.
   const currentMatchPage = currentMatch ? pageForOffset(pageRanges, currentMatch.start) : null;
 
-  const defaultLeft = 16; // pinned to the left edge by default, per user preference
+  const defaultLeft = 16; // small margin either side -- size.w already spans (window width - 32)
   const curLeft = pos.x != null ? pos.x : defaultLeft;
-  const curTop = pos.y != null ? pos.y : 72;
+  const curTop = pos.y != null ? pos.y : 72; // docked near the top, above the tree/metadata panel
 
+  // Mousedown handler for the *whole* window, not just the header -- lets
+  // the user grab anywhere (the gray gutter around a PDF page, the blank
+  // chrome around a letterboxed image, even the page canvas itself) to move
+  // the window, instead of only the thin header bar. Bails out first if the
+  // mousedown landed on something meant for normal interaction: a
+  // button/link/input (page-nav, zoom, search box, the header's own icon
+  // buttons), pdf.js's own text layer (".textLayer" -- selecting text is
+  // more useful there than dragging), or an iframe/img (which have their
+  // own native drag/selection behavior) -- so dragging never steals a click
+  // or a text selection from the content itself.
   const onDragStart = (e) => {
+    if (e.target.closest("button, a, input, .textLayer, iframe, img")) return;
     e.preventDefault();
     dragRef.current = { startX: e.clientX, startY: e.clientY, origX: curLeft, origY: curTop };
     setInteracting("move");
@@ -6297,12 +7040,12 @@ const FloatingDocPreview = ({ doc, onClose }) => {
 
   return (
     <div
-      className="fixed z-[60] bg-white border border-stone-300 rounded shadow-2xl flex flex-col"
+      className="fixed z-[60] bg-white border-2 border-amber-600 rounded shadow-2xl flex flex-col"
       style={{ top: curTop, left: curLeft, width: size.w, height: size.h }}
+      onMouseDown={onDragStart}
     >
       <div
         className="flex items-center justify-between px-3 py-2 border-b border-stone-200 bg-stone-50 cursor-move shrink-0 select-none"
-        onMouseDown={onDragStart}
       >
         <div className="text-base font-bold text-stone-700 truncate pr-2">{doc.name}</div>
         <div className="flex items-center gap-1 shrink-0">
@@ -7501,7 +8244,7 @@ const ZipImportDialog = ({ open, onClose, onImported }) => {
  * UI: HIERARCHY IMPORT DIALOG
  * =============================================================================
  */
-const HierarchyImportDialog = ({ open, onClose, onImported }) => {
+const HierarchyImportDialog = ({ open, onClose, onImported, tree, defaultTargetNodeId }) => {
   const { t } = useLang();
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
@@ -7509,16 +8252,31 @@ const HierarchyImportDialog = ({ open, onClose, onImported }) => {
   const [preview, setPreview] = useState(null);   // null | { root, count, order }
   const [result, setResult] = useState(null);     // null | { created, skipped }
   const [dedupeNames, setDedupeNames] = useState(false);
+  const [targetNodeId, setTargetNodeId] = useState(""); // "" = top level (project root)
   const fileInputRef = useRef(null);
 
   useEffect(() => {
     if (open) {
       setText(""); setBusy(false); setErrors([]); setPreview(null); setResult(null);
       setDedupeNames(false);
+      // Default to the folder the user had selected when opening this dialog,
+      // so "import CSV under this folder" works without an extra click --
+      // this is what was missing before: imports always landed on the whole
+      // project tree's root regardless of what was selected in the sidebar.
+      setTargetNodeId(defaultTargetNodeId || "");
     }
-  }, [open]);
+  }, [open, defaultTargetNodeId]);
 
   if (!open) return null;
+
+  // Flatten the tree into indented <option> rows for the folder picker.
+  const folderOptions = [];
+  const walkFolders = (node, depth) => {
+    if (!node) return;
+    folderOptions.push({ id: node.id, name: node.name, depth });
+    (node.children || []).forEach((c) => walkFolders(c, depth + 1));
+  };
+  walkFolders(tree, 0);
 
   const handleFile = (file) => {
     if (!file) return;
@@ -7580,11 +8338,11 @@ const HierarchyImportDialog = ({ open, onClose, onImported }) => {
     if (!confirm(t(`即将在文档树中创建 ${preview.count} 个节点。确定继续？`, `About to create ${preview.count} nodes in the document tree. Continue?`))) return;
     setBusy(true); setErrors([]);
     try {
-      const data = await StorageAdapter.hierarchyCreate(text, dedupeNames);
+      const data = await StorageAdapter.hierarchyCreate(text, dedupeNames, targetNodeId || null);
       if (!data.ok) { setErrors(data.errors); }
       else {
         setResult(data);
-        onImported();
+        onImported(targetNodeId || null);
       }
     } catch (e) {
       setErrors([`Network error: ${e.message}`]);
@@ -7644,6 +8402,28 @@ const HierarchyImportDialog = ({ open, onClose, onImported }) => {
               onChange={(e) => { setText(e.target.value); setErrors([]); setPreview(null); setResult(null); }}
             />
             <div className="mt-1 text-[12px] text-stone-600">{t("格式：CSV，每行 2–3 列：文件夹名, 父文件夹名, 说明。第一行是根文件夹。", "Format: CSV, 2–3 columns per line: folder name, parent folder name, description. The first line is the root folder.")}</div>
+          </div>
+
+          {/* Target folder */}
+          <div>
+            <label className="block text-[12px] uppercase tracking-wider text-stone-700 mb-1.5">
+              {t("导入到", "Import into")}
+            </label>
+            <select
+              className="w-full text-sm border border-stone-300 rounded px-2.5 py-1.5 focus:outline-none focus:border-amber-600"
+              value={targetNodeId}
+              onChange={(e) => { setTargetNodeId(e.target.value); setErrors([]); setResult(null); }}
+            >
+              <option value="">{t("顶层（项目根目录）", "Top level (project root)")}</option>
+              {folderOptions.map((f) => (
+                <option key={f.id} value={f.id}>{"  ".repeat(f.depth) + f.name}</option>
+              ))}
+            </select>
+            <div className="mt-1 text-[12px] text-stone-600">
+              {targetNodeId
+                ? t("文件中的根文件夹将作为该文件夹的子文件夹创建。", "The file's root folder will be created as a subfolder of this folder.")
+                : t("未选择时，文件中的根文件夹会与项目根目录合并（仅在没有更合适的现有文件夹时使用）。", "If left unset, the file's root folder is merged against the whole project's root (only use this when there's no existing folder to import into).")}
+            </div>
           </div>
 
           {/* Duplicate-name handling */}
@@ -9678,6 +10458,11 @@ function Root() {
  * Documents already linked to the current node are shown but disabled.
  * =============================================================================
  */
+const LINK_PICKER_MIN_W = 520;
+const LINK_PICKER_MIN_H = 400;
+const SEARCH_RAIL_MIN_W = 160;
+const SEARCH_RAIL_MAX_W = 480;
+const SEARCH_RAIL_DEFAULT_W = 224; // matches the original w-56
 const LinkPicker = ({
   open, onClose, onLink, onLinkMany,
   docIndex, tree, refMap, currentNodeId, currentNodeName,
@@ -9688,6 +10473,101 @@ const LinkPicker = ({
   const [q, setQ] = useState("");
   const [browseNodeId, setBrowseNodeId] = useState(null);
   const [selectedIds, setSelectedIds] = useState(new Set());
+  // Folders checked as batch-link targets, separate from browseNodeId (which
+  // just controls what the right/left panel is currently previewing). Empty
+  // means "use currentNodeId" -- the original single-folder behavior.
+  const [selectedNodeIds, setSelectedNodeIds] = useState(new Set());
+
+  // Stretchable window size (edges/corner), persisted across sessions like
+  // the sidebar width -- this dialog unmounts on close (see `if (!open)
+  // return null` below), so a plain useState alone would forget the size
+  // every time it's reopened; localStorage is what makes it stick.
+  const [size, setSize] = useState(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem("dms:link-picker-size") || "null");
+      if (saved && saved.w >= LINK_PICKER_MIN_W && saved.h >= LINK_PICKER_MIN_H) return saved;
+    } catch {}
+    return {
+      w: typeof window !== "undefined" ? Math.min(768, window.innerWidth - 32) : 768,
+      h: typeof window !== "undefined" ? Math.round(window.innerHeight * 0.8) : 600,
+    };
+  });
+  const [interacting, setInteracting] = useState(null); // null | "x" | "y" | "xy"
+  const resizeRef = useRef(null);
+
+  // axis: "x" (right edge, width only), "y" (bottom edge, height only), or
+  // "xy" (corner, both at once) -- same three-handle pattern as the folder
+  // plot dialog's floating window.
+  const onResizeStart = (axis) => (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    resizeRef.current = { startX: e.clientX, startY: e.clientY, origW: size.w, origH: size.h };
+    setInteracting(axis);
+    const onMove = (ev) => {
+      const d = resizeRef.current;
+      if (!d) return;
+      const dx = ev.clientX - d.startX;
+      const dy = ev.clientY - d.startY;
+      const maxW = window.innerWidth - 32;
+      const maxH = window.innerHeight - 32;
+      setSize((prev) => ({
+        w: axis !== "y" ? Math.min(maxW, Math.max(LINK_PICKER_MIN_W, d.origW + dx)) : prev.w,
+        h: axis !== "x" ? Math.min(maxH, Math.max(LINK_PICKER_MIN_H, d.origH + dy)) : prev.h,
+      }));
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      resizeRef.current = null;
+      setInteracting(null);
+      setSize((cur) => {
+        try { localStorage.setItem("dms:link-picker-size", JSON.stringify(cur)); } catch {}
+        return cur;
+      });
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+  const resizeCursor = interacting === "x" ? "ew-resize"
+    : interacting === "y" ? "ns-resize"
+    : interacting === "xy" ? "nwse-resize"
+    : interacting === "rail" ? "col-resize"
+    : "default";
+
+  // Search tab's two columns (doc list / drop-target folder rail) --
+  // width of the right rail is adjustable; the left column just takes
+  // whatever's left (flex-1). Persisted like the window size above.
+  const [searchRailWidth, setSearchRailWidth] = useState(() => {
+    try {
+      const saved = parseInt(localStorage.getItem("dms:link-picker-rail-width"), 10);
+      if (saved && saved >= SEARCH_RAIL_MIN_W && saved <= SEARCH_RAIL_MAX_W) return saved;
+    } catch {}
+    return SEARCH_RAIL_DEFAULT_W;
+  });
+
+  const onRailResizeStart = (e) => {
+    e.preventDefault();
+    // Dragging the handle right shrinks the rail (it eats into the rail's
+    // space from the left), so width moves opposite to the mouse delta.
+    const startX = e.clientX;
+    const origW = searchRailWidth;
+    setInteracting("rail");
+    const onMove = (ev) => {
+      const dx = ev.clientX - startX;
+      setSearchRailWidth(Math.min(SEARCH_RAIL_MAX_W, Math.max(SEARCH_RAIL_MIN_W, origW - dx)));
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      setInteracting(null);
+      setSearchRailWidth((cur) => {
+        try { localStorage.setItem("dms:link-picker-rail-width", String(cur)); } catch {}
+        return cur;
+      });
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
 
   // Drag-to-link: entirely local to this modal, separate from the app-wide
   // drag-to-*move*-a-document feature (draggingDocIdRef/handleDocDragStart/
@@ -9710,12 +10590,22 @@ const LinkPicker = ({
   const [dragDocId, setDragDocId] = useState(null);
   const [dragOverNodeId, setDragOverNodeId] = useState(null);
   const [linkFeedback, setLinkFeedback] = useState("");
+  // Which folder (if any) the Search tab's results are narrowed to -- set by
+  // clicking a folder's name in that tab's tree rail. Independent of
+  // selectedNodeIds (checkbox = batch-link target); this is purely a filter
+  // on what's shown in the left-hand doc list, restoring "find a doc by
+  // browsing the tree" to the tab people land on by default (previously
+  // that only worked on the separate Browse tree tab, where a folder click
+  // sets browseNodeId but the Search tab never read it).
+  const [searchFolderFilter, setSearchFolderFilter] = useState(null);
 
   useEffect(() => {
     if (open) {
       setQ("");
       setBrowseNodeId(tree?.id || null);
       setSelectedIds(new Set());
+      setSelectedNodeIds(new Set());
+      setSearchFolderFilter(null);
       setTab("search");
       dragDocIdRef.current = null;
       setDragDocId(null);
@@ -9747,7 +10637,17 @@ const LinkPicker = ({
   };
 
   const searchWords = q.trim().toLowerCase().split(/\s+/).filter(Boolean);
-  const searchResults = docIndex.filter((d) => matchesQuery(d, searchWords));
+  // Folder filter narrows the pool to one folder's directly-attached docs
+  // (same as Browse tab's browseDocs, not recursive) before the text query
+  // is applied on top -- lets a user combine "in this folder" with typing
+  // to narrow further, or just click a folder with no query to see everything in it.
+  const searchFolderNode = searchFolderFilter ? findNode(tree, searchFolderFilter) : null;
+  const searchPool = searchFolderNode
+    ? (searchFolderNode.documents || [])
+        .map((ref) => docIndex.find((e) => e.id === ref.id))
+        .filter(Boolean)
+    : docIndex;
+  const searchResults = searchPool.filter((d) => matchesQuery(d, searchWords));
 
   // Browse mode: docs attached to the currently-browsed node
   const browseNode = browseNodeId ? findNode(tree, browseNodeId) : null;
@@ -9767,11 +10667,23 @@ const LinkPicker = ({
     });
   };
 
+  const toggleSelectNode = (id) => {
+    setSelectedNodeIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
   const commit = async () => {
     // One batched call, not a loop of onLink calls -- looping would apply
     // each link against the same pre-commit tree snapshot and each save
-    // would overwrite the last (see linkDocsToNode's comment).
-    await onLinkMany(Array.from(selectedIds));
+    // would overwrite the last (see linkDocsToNode's comment). Same reasoning
+    // extends to multiple target folders: onLinkMany does every doc x every
+    // folder in one persistTree.
+    const nodeIds = selectedNodeIds.size > 0 ? Array.from(selectedNodeIds) : [currentNodeId];
+    await onLinkMany(Array.from(selectedIds), nodeIds);
     onClose();
   };
 
@@ -9832,10 +10744,11 @@ const LinkPicker = ({
     const docCount = (node.documents || []).length;
     const isCurrent = node.id === browseNodeId;
     const isDropTarget = dragOverNodeId === node.id;
+    const isLinkTarget = selectedNodeIds.has(node.id);
     return (
       <div key={node.id}>
         <div
-          onClick={() => setBrowseNodeId(node.id)}
+          onClick={() => { setBrowseNodeId(node.id); setSearchFolderFilter(node.id); }}
           // Unconditional preventDefault -- this tree only ever receives
           // drags originating from renderRow in this same modal, so there's
           // no real "is this a valid drop target" decision to make, and no
@@ -9858,12 +10771,22 @@ const LinkPicker = ({
           className={`flex items-center gap-1.5 py-1 px-2 cursor-pointer text-sm border-l-2 transition-colors ${
             isDropTarget
               ? "bg-amber-100 border-amber-600 ring-1 ring-inset ring-amber-500"
-              : isCurrent
-                ? "bg-amber-50 border-amber-600 text-stone-900"
-                : "border-transparent text-stone-700 hover:bg-stone-100"
+              : isLinkTarget
+                ? "bg-amber-50 border-amber-500 text-stone-900"
+                : isCurrent
+                  ? "bg-amber-50 border-amber-600 text-stone-900"
+                  : "border-transparent text-stone-700 hover:bg-stone-100"
           }`}
           style={{ paddingLeft: `${depth * 12 + 8}px` }}
         >
+          <input
+            type="checkbox"
+            checked={isLinkTarget}
+            onClick={(e) => e.stopPropagation()}
+            onChange={() => toggleSelectNode(node.id)}
+            title={t("勾选以将此文件夹加入本次批量链接目标", "Check to include this folder as a batch-link target")}
+            className="shrink-0"
+          />
           <Folder size={12} className="text-amber-700 shrink-0" />
           <span className="truncate flex-1">{node.name}</span>
           {docCount > 0 && (
@@ -9881,7 +10804,8 @@ const LinkPicker = ({
       onClick={onClose}
     >
       <div
-        className="bg-white w-full max-w-3xl h-[80vh] rounded shadow-2xl flex flex-col"
+        className="relative bg-white rounded shadow-2xl flex flex-col"
+        style={{ width: size.w, height: size.h, maxWidth: "calc(100vw - 32px)", maxHeight: "calc(100vh - 32px)" }}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="px-4 py-3 border-b border-stone-200">
@@ -9889,7 +10813,12 @@ const LinkPicker = ({
             <div>
               <div className="text-base font-semibold text-stone-900">{t("链接现有文档", "Link an existing document")}</div>
               <div className="text-[13px] text-stone-700">
-                {t("添加至：", "Add to: ")}<span className="font-mono">{currentNodeName}</span>
+                {t("添加至：", "Add to: ")}
+                <span className="font-mono">
+                  {selectedNodeIds.size > 0
+                    ? Array.from(selectedNodeIds).map((id) => findNode(tree, id)?.name).filter(Boolean).join(", ")
+                    : currentNodeName}
+                </span>
               </div>
             </div>
             <button
@@ -9941,25 +10870,60 @@ const LinkPicker = ({
                     className="w-full pl-8 pr-3 py-1.5 text-sm border border-stone-300 rounded focus:outline-none focus:border-amber-600"
                   />
                 </div>
-                <div className="text-[13px] text-stone-700 shrink-0">
-                  {t(`文件库中共 ${searchResults.length} 份文档`, `${searchResults.length} documents in the library`)}
+                <div className="flex items-center gap-2 text-[13px] text-stone-700 shrink-0">
+                  {searchFolderNode ? (
+                    <span className="inline-flex items-center gap-1 pl-2 pr-1 py-0.5 bg-amber-100 border border-amber-300 rounded-full text-amber-800">
+                      <Folder size={11} className="shrink-0" />
+                      <span className="max-w-[220px] truncate">{searchFolderNode.name}</span>
+                      <button
+                        onClick={() => setSearchFolderFilter(null)}
+                        title={t("清除文件夹筛选，显示所有文档", "Clear folder filter and show all documents")}
+                        className="hover:text-amber-950 px-0.5"
+                      >
+                        <X size={11} />
+                      </button>
+                    </span>
+                  ) : null}
+                  <span>
+                    {searchFolderNode
+                      ? t(`此文件夹中共 ${searchResults.length} 份文档`, `${searchResults.length} document(s) in this folder`)
+                      : t(`文件库中共 ${searchResults.length} 份文档`, `${searchResults.length} documents in the library`)}
+                  </span>
                 </div>
                 <div className="flex-1 overflow-auto space-y-1.5">
                   {searchResults.length === 0 && (
                     <div className="text-sm text-stone-700 italic text-center py-8">
                       {docIndex.length === 0
                         ? t("尚未上传任何文档。请先上传文档，再来此处链接到其他节点。", "No documents uploaded yet. Upload a document first, then come back here to link it to other nodes.")
-                        : t("没有与搜索条件匹配的文档。", "No documents match your search.")}
+                        : searchFolderNode
+                          ? t("此文件夹暂无附加文档。", "No documents attached to this folder yet.")
+                          : t("没有与搜索条件匹配的文档。", "No documents match your search.")}
                     </div>
                   )}
                   {searchResults.map(renderRow)}
                 </div>
               </div>
+              {/* Drag handle — adjusts the rail's width, same narrow-bar-with-
+                  wider-hit-area pattern as the app's sidebar resize handle. */}
+              <div
+                onMouseDown={onRailResizeStart}
+                title={t("拖动可调整两栏宽度", "Drag to resize the two columns")}
+                className={`relative w-1 shrink-0 cursor-col-resize ${
+                  interacting === "rail" ? "bg-amber-500" : "bg-stone-200 hover:bg-amber-400"
+                }`}
+              >
+                <div className="absolute inset-y-0 -left-1 -right-1" />
+              </div>
               {/* Persistent drop-target rail so a search result can be dragged
-                  straight onto a folder without switching to the Browse tab. */}
-              <div className="w-56 shrink-0 border-l border-stone-200 overflow-auto p-2">
+                  straight onto a folder without switching to the Browse tab.
+                  Clicking a folder's name also filters the doc list on the
+                  left to that folder's contents (see searchFolderFilter). */}
+              <div
+                className="shrink-0 overflow-auto p-2"
+                style={{ width: searchRailWidth }}
+              >
                 <div className="text-[11px] text-stone-600 uppercase tracking-wider mb-1.5 px-1">
-                  {t("拖到此处以链接", "Drag here to link")}
+                  {t("点击文件夹以按其内容筛选；拖到此处以链接；勾选可批量链接到多个文件夹", "Click a folder to filter by its contents, drag a doc here to link, or check several folders to batch-link")}
                 </div>
                 {tree && renderBrowseTree(tree)}
               </div>
@@ -9969,6 +10933,9 @@ const LinkPicker = ({
           {tab === "browse" && (
             <>
               <div className="w-1/3 border-r border-stone-200 overflow-auto">
+                <div className="text-[11px] text-stone-600 uppercase tracking-wider mb-1.5 px-2 pt-2">
+                  {t("勾选多个文件夹以批量链接", "Check several folders to batch-link")}
+                </div>
                 {tree && renderBrowseTree(tree)}
               </div>
               <div className="flex-1 p-3 overflow-auto">
@@ -10000,7 +10967,9 @@ const LinkPicker = ({
             {linkFeedback
               ? <span className="text-green-700 font-medium">{linkFeedback}</span>
               : selectedIds.size > 0
-                ? t(`已选择 ${selectedIds.size} 份文档`, `${selectedIds.size} documents selected`)
+                ? (selectedNodeIds.size > 1
+                    ? t(`已选择 ${selectedIds.size} 份文档 → ${selectedNodeIds.size} 个文件夹`, `${selectedIds.size} document(s) → ${selectedNodeIds.size} folders`)
+                    : t(`已选择 ${selectedIds.size} 份文档`, `${selectedIds.size} documents selected`))
                 : t("请选择一个或多个文档进行链接，或将其拖到右侧文件夹", "Select one or more documents to link, or drag one onto a folder on the right")}
           </div>
           <div className="flex gap-2">
@@ -10015,10 +10984,38 @@ const LinkPicker = ({
               disabled={selectedIds.size === 0}
               className="px-4 py-1.5 text-sm bg-amber-600 hover:bg-amber-700 text-white rounded disabled:opacity-40"
             >
-              {t("链接", "Link")} {selectedIds.size > 0 ? `(${selectedIds.size})` : ""}
+              {t("链接", "Link")}{" "}
+              {selectedIds.size > 0
+                ? (selectedNodeIds.size > 1
+                    ? `(${selectedIds.size} × ${selectedNodeIds.size})`
+                    : `(${selectedIds.size})`)
+                : ""}
             </button>
           </div>
         </div>
+
+        {/* Resize handles */}
+        <div
+          onMouseDown={onResizeStart("x")}
+          className="absolute top-0 right-0 w-1.5 h-full cursor-ew-resize"
+          title={t("水平拖动可调整宽度", "Drag to resize width")}
+        />
+        <div
+          onMouseDown={onResizeStart("y")}
+          className="absolute bottom-0 left-0 w-full h-1.5 cursor-ns-resize"
+          title={t("垂直拖动可调整高度", "Drag to resize height")}
+        />
+        <div
+          onMouseDown={onResizeStart("xy")}
+          className="absolute bottom-0 right-0 w-4 h-4 cursor-nwse-resize"
+          style={{
+            background: "linear-gradient(135deg, transparent 0%, transparent 45%, #a8a29e 45%, #a8a29e 55%, transparent 55%, transparent 100%)",
+          }}
+          title={t("拖动可同时调整宽高", "Drag to resize both width and height")}
+        />
+        {interacting && (
+          <div className="fixed inset-0 z-[55]" style={{ cursor: resizeCursor }} />
+        )}
       </div>
     </div>
   );
@@ -11711,27 +12708,33 @@ function DMS({ storagePath, onChangeFolder }) {
     setRecycleSelectMode(false);
   };
 
-  // Add a link from an existing document to a node (idempotent — won't duplicate).
-  // Links one or more documents to a node in a single tree update. Linking
-  // several docs must go through ONE persistTree call, not one call per
-  // doc: linkDocToNode's `tree` is a snapshot captured at render time, so a
-  // loop of several sequential awaited calls would each rebuild `newTree`
-  // from that same stale snapshot and each persistTree/saveTree fully
-  // overwrites the server's tree — the last call standing wins and every
-  // earlier link in the loop gets silently discarded. (Found live: linking
-  // 2+ documents at once from LinkPicker left only the last one linked.)
-  const linkDocsToNode = async (docIds, nodeId) => {
-    const target = findNode(tree, nodeId);
-    if (!target) return;
-    const existing = new Set((target.documents || []).map((d) => d.id));
-    const toAdd = docIds.filter((id) => !existing.has(id));
-    if (toAdd.length === 0) return;
-    const newTree = updateNodeInTree(tree, nodeId, (n) => ({
-      ...n,
-      documents: [...(n.documents || []), ...toAdd.map((id) => ({ id }))],
-    }));
+  // Add a link from one or more existing documents to one or more nodes
+  // (idempotent per doc/node pair — won't duplicate). Every doc x every node
+  // must land in ONE persistTree call, not one call per doc or per node:
+  // `tree` here is a snapshot captured at render time, so a loop of several
+  // sequential awaited persistTree/saveTree calls would each rebuild from
+  // that same stale snapshot and each save fully overwrites the server's
+  // tree — the last call standing wins and every earlier link in the loop
+  // gets silently discarded. (Found live: linking 2+ documents at once from
+  // LinkPicker left only the last one linked.)
+  const linkDocsToNodes = async (docIds, nodeIds) => {
+    let newTree = tree;
+    for (const nodeId of nodeIds) {
+      const target = findNode(newTree, nodeId);
+      if (!target) continue;
+      const existing = new Set((target.documents || []).map((d) => d.id));
+      const toAdd = docIds.filter((id) => !existing.has(id));
+      if (toAdd.length === 0) continue;
+      newTree = updateNodeInTree(newTree, nodeId, (n) => ({
+        ...n,
+        documents: [...(n.documents || []), ...toAdd.map((id) => ({ id }))],
+      }));
+    }
+    if (newTree === tree) return;
     await persistTree(newTree);
   };
+
+  const linkDocsToNode = (docIds, nodeId) => linkDocsToNodes(docIds, [nodeId]);
 
   const linkDocToNode = (docId, nodeId) => linkDocsToNode([docId], nodeId);
 
@@ -12895,6 +13898,12 @@ function DMS({ storagePath, onChangeFolder }) {
         onClose={() => setShowPlotDialog(false)}
         onOpenDoc={openDoc}
         onOpenAISettings={() => setShowAISettings(true)}
+        onDocsChanged={async () => {
+          const { tree: freshTree } = await StorageAdapter.getTree();
+          if (freshTree) setTree(freshTree);
+          const idx = await StorageAdapter.listDocumentIndex();
+          setDocIndex(idx);
+        }}
       />
 
       <VerifyDatesDialog
@@ -12918,7 +13927,7 @@ function DMS({ storagePath, onChangeFolder }) {
         open={showLinkPicker}
         onClose={() => setShowLinkPicker(false)}
         onLink={(docId, nodeId) => linkDocToNode(docId, nodeId || selectedId)}
-        onLinkMany={(docIds) => linkDocsToNode(docIds, selectedId)}
+        onLinkMany={(docIds, nodeIds) => linkDocsToNodes(docIds, nodeIds || [selectedId])}
         docIndex={docIndex}
         tree={tree}
         refMap={refMap}
@@ -12931,14 +13940,24 @@ function DMS({ storagePath, onChangeFolder }) {
       <HierarchyImportDialog
         open={showHierarchyImport}
         onClose={() => setShowHierarchyImport(false)}
-        onImported={async () => {
+        tree={tree}
+        defaultTargetNodeId={selectedId}
+        onImported={async (targetNodeId) => {
           // Reload tree from server so the new nodes are visible immediately
           const r = await StorageAdapter.getTree();
           const t = r.tree;
           if (t) {
             setTree(t);
-            setExpandedIds(new Set([t.id]));
-            setSelectedId(t.id);
+            if (targetNodeId) {
+              // Reveal where the import actually landed instead of jumping
+              // back to the project root -- the whole point of picking a
+              // target folder is to see the new nodes appear inside it.
+              // (expandToNode also sets selectedId.)
+              expandToNode(targetNodeId);
+            } else {
+              setExpandedIds(new Set([t.id]));
+              setSelectedId(t.id);
+            }
           }
           setShowHierarchyImport(false);
         }}
