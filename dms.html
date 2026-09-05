@@ -150,6 +150,14 @@ const ImageIcon = (p) => (
     <polyline points="21 15 16 10 5 21" />
   </I>
 );
+const FilePlus = (p) => (
+  <I {...p}>
+    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+    <polyline points="14 2 14 8 20 8" />
+    <line x1="12" y1="18" x2="12" y2="12" />
+    <line x1="9" y1="15" x2="15" y2="15" />
+  </I>
+);
 const File = (p) => (
   <I {...p}>
     <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
@@ -777,8 +785,8 @@ const StorageAdapter = {
     return res.json();   // { ok, results:{key:{value,found}}, found_count, pages_used }
   },
 
-  async getAISettings() {
-    const res = await fetch(API_BASE + "/api/ai-settings");
+  async getAISettings(provider = "gemini") {
+    const res = await fetch(API_BASE + "/api/ai-settings?provider=" + encodeURIComponent(provider));
     if (!res.ok) return { configured: false, library_installed: false };
     return res.json();
   },
@@ -792,13 +800,61 @@ const StorageAdapter = {
     return res.json();
   },
 
-  // Cross-document Q&A (Gemini, opt-in) -- reasons over many documents'
-  // existing text/metadata at once instead of exact-keyword matching.
-  async askAI(question, scopeNodeId = null) {
+  // Ask a free-form question about ONE document (Gemini or DeepSeek, opt-in)
+  // and file the Q&A into a running log kept next to the document.
+  async askDocAI(docId, question, provider = "gemini", nodeId = null) {
+    const res = await fetch(API_BASE + "/api/docs/" + docId + "/ask", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question, provider, node_id: nodeId }),
+    });
+    if (!res.ok) {
+      let detail = "";
+      try { detail = (await res.json()).error || ""; } catch {}
+      throw new Error(detail || tOutsideReact(`AI 问答失败: HTTP ${res.status}`, `AI Q&A failed: HTTP ${res.status}`));
+    }
+    return res.json();   // { ok, answer, provider, model, log_doc_id, log_name }
+  },
+
+  // Organize + polish a free-form notes block (a description the user typed
+  // or dictated) via Gemini / DeepSeek. Facts preserved, nothing invented.
+  async polishText(text, { provider = "gemini", lang = "auto", style = "organize" } = {}) {
+    const res = await fetch(API_BASE + "/api/polish-text", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, provider, lang, style }),
+    });
+    if (!res.ok) {
+      let detail = "";
+      try { detail = (await res.json()).error || ""; } catch {}
+      throw new Error(detail || tOutsideReact(`AI 整理失败: HTTP ${res.status}`, `AI polish failed: HTTP ${res.status}`));
+    }
+    return res.json();   // { ok, text, provider, model }
+  },
+
+  // Save a reviewed block of panel text (description / OCR output / AI answer)
+  // as a new .txt document filed into the same folder as the source document.
+  async saveTextAsDoc(docId, { text, title = "", nodeId = null, source = "", reuse = false } = {}) {
+    const res = await fetch(API_BASE + "/api/docs/" + docId + "/save-text-as-doc", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, title, node_id: nodeId, source, reuse }),
+    });
+    if (!res.ok) {
+      let detail = "";
+      try { detail = (await res.json()).error || ""; } catch {}
+      throw new Error(detail || tOutsideReact(`保存为新文档失败: HTTP ${res.status}`, `Save as new document failed: HTTP ${res.status}`));
+    }
+    return res.json();   // { ok, doc_id, name, size, node_id }
+  },
+
+  // Cross-document Q&A (Gemini or DeepSeek, opt-in) -- reasons over many
+  // documents' existing text/metadata at once instead of exact-keyword matching.
+  async askAI(question, scopeNodeId = null, provider = "gemini") {
     const res = await fetch(API_BASE + "/api/ask-ai", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question, scope_node_id: scopeNodeId }),
+      body: JSON.stringify({ question, scope_node_id: scopeNodeId, provider }),
     });
     if (!res.ok) {
       let detail = "";
@@ -891,6 +947,78 @@ const computeFileHash = async (file) => {
   return Array.from(new Uint8Array(hashBuf)).map((b) => b.toString(16).padStart(2, "0")).join("");
 };
 
+// Mirrors exactly what DocumentViewer's own isImage/isPdf/isText/isHeic
+// checks can actually render inline (see there) -- kept in sync with those
+// by hand since this runs *before* the viewer opens, to decide whether it
+// also needs to fire off a native-app open alongside it (see openDoc).
+// Anything not covered here falls back to "Download to open" inside the
+// viewer's own preview pane, which is why that case gets the native app
+// opened too -- the viewer itself still opens either way, for its toolbar
+// (Add description, View map location, Ask AI, Download, ...).
+const isInlinePreviewable = (meta) => {
+  const mime = meta?.mime || "";
+  const ext = (meta?.name || "").split(".").pop().toLowerCase();
+  if (mime.startsWith("image/") || ext === "heic" || ext === "heif") return true;
+  if (mime === "application/pdf") return true;
+  if (mime.startsWith("text/") || mime === "application/json") return true;
+  return false;
+};
+
+/* =============================================================================
+ * DRAG-AND-DROP FOLDER READING
+ * =============================================================================
+ * Plain HTML5 drag-and-drop only ever hands back e.dataTransfer.files, and a
+ * dropped *folder* shows up there as a single bogus zero-byte File named after
+ * the folder -- it silently fails to upload. Chrome/Safari/Edge expose a
+ * separate, non-standard entries API (DataTransferItem.webkitGetAsEntry) that
+ * can walk a dropped folder's real contents recursively; this mirrors what a
+ * `<input webkitdirectory>` picker (see handleMultiFolderPickerChange) already
+ * gives the "Upload folder" button, so a dropped folder can be routed through
+ * that same, already-tested flow instead of being reported as a failed file.
+ */
+const readDroppedItems = async (dataTransferItems) => {
+  const readAllEntries = (reader) => new Promise((resolve, reject) => {
+    const all = [];
+    const readBatch = () => {
+      // A single readEntries() call is capped (e.g. 100 in Chrome) -- keep
+      // calling until it comes back empty, which is how the spec signals "done".
+      reader.readEntries((entries) => {
+        if (!entries.length) { resolve(all); return; }
+        all.push(...entries);
+        readBatch();
+      }, reject);
+    };
+    readBatch();
+  });
+
+  const walk = async (entry, path) => {
+    if (entry.isFile) {
+      const file = await new Promise((resolve, reject) => entry.file(resolve, reject));
+      // Fake up webkitRelativePath so this File is indistinguishable from one
+      // that came out of a webkitdirectory <input> -- every downstream folder-
+      // upload helper (resolveMirroredTargets, handleMultiFolderPickerChange)
+      // keys off that property.
+      try {
+        Object.defineProperty(file, "webkitRelativePath", { value: `${path}${entry.name}`, configurable: true });
+      } catch (_) {}
+      return [file];
+    }
+    if (entry.isDirectory) {
+      const children = await readAllEntries(entry.createReader());
+      const nested = await Promise.all(children.map((c) => walk(c, `${path}${entry.name}/`)));
+      return nested.flat();
+    }
+    return [];
+  };
+
+  const topEntries = Array.from(dataTransferItems)
+    .map((item) => (item.kind === "file" && typeof item.webkitGetAsEntry === "function") ? item.webkitGetAsEntry() : null)
+    .filter(Boolean);
+  const hasDirectory = topEntries.some((e) => e.isDirectory);
+  const results = await Promise.all(topEntries.map((e) => walk(e, "")));
+  return { files: results.flat(), hasDirectory };
+};
+
 const genNodeId = () => {
   const rand = Math.random().toString(36).slice(2, 8).toUpperCase();
   return `NODE-${rand}`;
@@ -946,6 +1074,18 @@ const findParentNode = (root, nodeId) => {
     if (found) return found;
   }
   return null;
+};
+
+// IDs of every ancestor of nodeId, root included, nodeId itself excluded --
+// used to auto-expand a folder-tree picker down to a given starting node.
+const collectAncestorIds = (root, nodeId) => {
+  const ids = [];
+  let cur = nodeId ? findParentNode(root, nodeId) : null;
+  while (cur) {
+    ids.push(cur.id);
+    cur = findParentNode(root, cur.id);
+  }
+  return ids;
 };
 
 const findNodeByName = (root, name) => {
@@ -1817,7 +1957,7 @@ const DEFAULT_MAP_PROVIDER = "amap";
  * UI: DOCUMENT VIEWER
  * =============================================================================
  */
-const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyParameter, onSaveLocalParams, onSaveParams, onSaveDescription, onOpenAISettings }) => {
+const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyParameter, onSaveLocalParams, onSaveParams, onSaveDescription, onSaveTextAsDoc, derivedDocs = [], onOpenAISettings, nodeId }) => {
   const { t } = useLang();
   const isImage = doc?.mime?.startsWith("image/");
   const isPdf = doc?.mime === "application/pdf";
@@ -1841,7 +1981,7 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
   const [ocrInfo, setOcrInfo] = useState(null);
   const [ocrHint, setOcrHint] = useState("");
   const [ocrError, setOcrError] = useState("");
-  // Side panel: null (closed) | "text" (OCR text) | "keys" (key-param extract) | "desc" (description)
+  // Side panel: null (closed) | "text" (OCR text) | "keys" (key-param extract) | "desc" (description) | "ask" (AI Q&A)
   const [panelMode, setPanelMode] = useState(null);
   const [copied, setCopied] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -1849,6 +1989,11 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
   // Description / caption state
   const [description, setDescription] = useState("");
   const [descSaved, setDescSaved] = useState(false);
+  // AI "organize & polish" for the description (Gemini / DeepSeek, opt-in).
+  const [polishStyle, setPolishStyle] = useState("organize");   // organize | polish | concise
+  const [polishing, setPolishing] = useState(false);
+  const [polishError, setPolishError] = useState("");
+  const [polishResult, setPolishResult] = useState(null);   // { text, before } once returned, awaiting accept/discard
 
   // Voice-to-text dictation for the description field (Web Speech API).
   const [voiceLang, setVoiceLang] = useState("zh-CN");
@@ -1886,13 +2031,39 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
   const [useAI, setUseAI] = useState(false);               // opt-in Gemini extraction
   const [aiSettings, setAiSettings] = useState({ configured: false, library_installed: true });
 
+  // Per-document "ask AI a question" state (opt-in, Gemini or DeepSeek).
+  const [askProvider, setAskProvider] = useState("gemini");
+  const [aiSettingsDS, setAiSettingsDS] = useState({ configured: false, library_installed: true });
+  const [askQuestion, setAskQuestion] = useState("");
+  const [askRunning, setAskRunning] = useState(false);
+  const [askError, setAskError] = useState("");
+  const [askAnswer, setAskAnswer] = useState(null);   // {question, answer, model} of the last answer shown
+  const [askLogName, setAskLogName] = useState("");   // filename the last Q&A was saved into
+
+  // "Save this panel's text as a new document" state (shared by the
+  // description / OCR text / AI answer panels).
+  const [savingNewDoc, setSavingNewDoc] = useState(false);
+  const [newDocMsg, setNewDocMsg] = useState(null);   // { name } on success | { error } on failure
+
   useEffect(() => {
-    // Re-fetch whenever the extraction panel opens (not just on first mount)
-    // so a key saved via the settings dialog is picked up without a reload.
-    if (panelMode === "keys") {
-      StorageAdapter.getAISettings().then(setAiSettings).catch(() => {});
+    // Re-fetch whenever a panel that needs AI status opens (not just on
+    // first mount) so a key saved via the settings dialog is picked up
+    // without a reload.
+    if (panelMode === "keys" || panelMode === "ask" || panelMode === "desc") {
+      StorageAdapter.getAISettings("gemini").then(setAiSettings).catch(() => {});
+    }
+    if (panelMode === "ask" || panelMode === "desc") {
+      StorageAdapter.getAISettings("deepseek").then(setAiSettingsDS).catch(() => {});
     }
   }, [panelMode]);
+
+  // If the selected provider turns out not to be configured but the other
+  // one is, switch to the usable one automatically instead of leaving the
+  // radio stuck on a disabled option.
+  useEffect(() => {
+    if (askProvider === "gemini" && !aiSettings.configured && aiSettingsDS.configured) setAskProvider("deepseek");
+    else if (askProvider === "deepseek" && !aiSettingsDS.configured && aiSettings.configured) setAskProvider("gemini");
+  }, [aiSettings.configured, aiSettingsDS.configured]);
 
   const panelOpen = panelMode !== null;
 
@@ -1919,6 +2090,7 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
     setCopied(false); setSaved(false);
     setImgLoadError(false);
     setDescription(doc.description || ""); setDescSaved(false);
+    setPolishResult(null); setPolishError(""); setPolishing(false);
     setVoiceInterim(""); setVoiceError(""); setListening(false);
     // Load this document's locally-added parameters; select NONE by default
     // (request: user explicitly picks what to extract for each document).
@@ -1926,6 +2098,8 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
     setSelectedKeys([]);
     setNewKeyInput(""); setSameLineOnly(true);
     setKeyRows(null); setKeyError(""); setKeyHint(""); setKeyDiag(null); setParamsSaved(false);
+    setAskQuestion(""); setAskRunning(false); setAskError(""); setAskAnswer(null); setAskLogName("");
+    setSavingNewDoc(false); setNewDocMsg(null);
     // Stop any dictation still running from the previously-open document.
     return () => { try { recognitionRef.current && recognitionRef.current.stop(); } catch {} };
   }, [doc?.id]);
@@ -1986,6 +2160,93 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
     setDescSaved(true);
     setTimeout(() => setDescSaved(false), 1800);
   };
+
+  // --- AI "organize & polish" the description --------------------------------
+  const aiPolishReady = aiSettings.configured || aiSettingsDS.configured;
+  const polishProvider = aiSettings.configured ? "gemini" : "deepseek";
+
+  const runPolish = async () => {
+    const text = description.trim();
+    if (!text || polishing || !aiPolishReady) return;
+    setPolishing(true); setPolishError(""); setPolishResult(null);
+    try {
+      const r = await StorageAdapter.polishText(text, { provider: polishProvider, style: polishStyle });
+      setPolishResult({ text: (r.text || "").trim(), provider: r.provider });
+    } catch (e) {
+      setPolishError(e.message || String(e));
+    } finally {
+      setPolishing(false);
+    }
+  };
+  const acceptPolish = () => {
+    if (!polishResult) return;
+    setDescription(polishResult.text);
+    setDescSaved(false);
+    setPolishResult(null);
+  };
+
+  // Save a block of side-panel text as its own new .txt document, filed into
+  // the same folder as this document. `source` is "desc" | "ocr" | "ai".
+  const SRC_LABELS = {
+    desc: t("描述", "Description"),
+    ocr: t("提取的文字", "Extracted text"),
+    ai: t("AI 回答", "AI answer"),
+  };
+  // Map the panel's short source tag to the server's `sourceFeature` value.
+  const normSource = (source) => (source === "desc" ? "description" : source);
+
+  // A .txt already saved from this panel for this document, if any. When one
+  // exists we overwrite it in place (one file across repeated edits) instead
+  // of prompting for a name and creating another document. Only the
+  // description panel reuses its file -- OCR text is a one-off and each AI
+  // answer is genuinely a new document.
+  const existingDerivedDoc = (source) =>
+    (source === "desc"
+      ? (derivedDocs || []).find((e) => (e.sourceFeature || "") === "description")
+      : null) || null;
+
+  const saveAsNewDoc = async (rawText, source) => {
+    const text = (rawText || "").trim();
+    if (!text || !onSaveTextAsDoc || savingNewDoc) return;
+
+    const existing = existingDerivedDoc(source);
+    let title = "";
+    if (!existing) {
+      const stem = (doc.name || "").replace(/\.[^.]+$/, "");
+      const suggested = `${stem} - ${SRC_LABELS[source] || t("笔记", "Notes")}`;
+      const answer = window.prompt(
+        t("新文档名称（保存为 .txt，存入同一文件夹）：", "New document name (saved as .txt in the same folder):"),
+        suggested
+      );
+      if (answer === null) return;   // user cancelled
+      title = answer.trim();
+    }
+
+    setSavingNewDoc(true); setNewDocMsg(null);
+    try {
+      // For the description panel, also fold the text into the doc index so
+      // the field is repopulated (and searchable) next time the doc is opened
+      // -- that's what lets a later edit accumulate onto the same .txt file.
+      if (source === "desc" && onSaveDescription) {
+        try { await onSaveDescription(doc.id, text); setDescSaved(true); } catch {}
+      }
+      const res = await onSaveTextAsDoc(doc.id, {
+        text,
+        title,
+        source: normSource(source),
+        reuse: !!existing,
+      });
+      setNewDocMsg({ name: res.name, updated: !!res.updated });
+      setTimeout(() => setNewDocMsg(null), 4000);
+    } catch (e) {
+      setNewDocMsg({ error: e.message || String(e) });
+    } finally {
+      setSavingNewDoc(false);
+    }
+  };
+
+  const newDocButtonClass =
+    "text-sm px-2.5 py-1 border border-indigo-300 text-indigo-800 bg-indigo-50 hover:bg-indigo-100 rounded flex items-center gap-1 disabled:opacity-40";
 
   // --- Voice-to-text dictation (description field) ---------------------------
   const stopListening = () => {
@@ -2124,6 +2385,25 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
       setKeyError(e.message || String(e));
     } finally {
       setKeyRunning(false);
+    }
+  };
+
+  // Ask a free-form question about this document (Gemini or DeepSeek,
+  // opt-in). The answer gets filed into a running Q&A log next to the
+  // document by the backend -- see /api/docs/<id>/ask.
+  const runAskAI = async () => {
+    const question = askQuestion.trim();
+    if (!question) return;
+    setAskRunning(true); setAskError(""); setAskAnswer(null); setAskLogName("");
+    try {
+      const r = await StorageAdapter.askDocAI(doc.id, question, askProvider, nodeId || null);
+      setAskAnswer({ question, answer: r.answer, model: r.model });
+      setAskLogName(r.log_name || "");
+      setAskQuestion("");
+    } catch (e) {
+      setAskError(e.message || String(e));
+    } finally {
+      setAskRunning(false);
     }
   };
 
@@ -2309,6 +2589,16 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
                 <ListChecks size={13} /> {t("提取关键参数", "Extract key parameters")}
               </button>
             )}
+            <button
+              onClick={() => setPanelMode(panelMode === "ask" ? null : "ask")}
+              title={t("就本文档提问，AI 会读取文档内容作答，问答会存档在同一文件夹", "Ask a question about this document — the AI reads its content and the Q&A is filed in the same folder")}
+              className={"text-sm px-3 py-1.5 rounded flex items-center gap-1.5 border " +
+                (panelMode === "ask"
+                  ? "border-purple-400 text-purple-800 bg-purple-100"
+                  : "border-purple-300 text-purple-800 bg-purple-50 hover:bg-purple-100")}
+            >
+              <Sparkles size={13} /> {t("提问 AI", "Ask AI")}
+            </button>
             {ocrEligible && ocrText && panelMode !== "text" && (
               <button
                 onClick={() => setPanelMode("text")}
@@ -2361,21 +2651,29 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
             ) : isText ? (
               <iframe src={doc.dataUrl} title={doc.name} className="w-full h-full border-0 bg-white font-mono" />
             ) : (
+              // openDoc() already fired a native-app open for this file before
+              // the viewer ever got here (it's the only place that sets a doc
+              // into this viewer) -- so this pane isn't the user's way of
+              // getting the file open, just a status note. No "Download to
+              // open" button: that action already happened; the toolbar's
+              // own Download button above covers the "I want a copy" case.
               <div className="h-full flex flex-col items-center justify-center text-stone-700 gap-3 p-6">
                 <File size={52} className="text-stone-600" />
                 <div className="text-base font-medium text-stone-700 text-center">{doc.name}</div>
                 <div className="text-sm text-stone-600 font-mono">{doc.mime}</div>
+                <div className="text-sm text-stone-600 text-center max-w-xs">
+                  {t(
+                    "此文件类型无法在浏览器中预览，已在系统默认应用中打开。",
+                    "This file type can't be previewed in the browser — it opened in your system's default app."
+                  )}
+                </div>
                 <a
                   href={doc.dataUrl}
                   download={doc.name}
-                  className="mt-2 flex items-center gap-2 px-5 py-2.5 bg-amber-600 hover:bg-amber-700 text-white text-base font-medium rounded-lg"
+                  className="text-sm text-amber-700 hover:text-amber-900 underline"
                 >
-                  <Download size={15} /> Download to open
+                  {t("未自动打开？点击下载", "Didn't open automatically? Click to download")}
                 </a>
-                <div className="text-sm text-stone-600 text-center max-w-xs">
-                  This file type cannot be previewed in the browser.
-                  Download it and open with the appropriate app.
-                </div>
               </div>
             )}
           </div>
@@ -2440,6 +2738,45 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
                 <div className="px-3 py-1 text-[12px] text-red-600 bg-red-50 border-b border-red-100">{voiceError}</div>
               )}
 
+              {/* AI: organize & polish the description (Gemini / DeepSeek, opt-in) */}
+              <div className="px-3 py-1.5 border-b border-stone-200 bg-purple-50/50 flex items-center gap-2 flex-wrap">
+                <span className="text-[12px] text-purple-800 flex items-center gap-1 shrink-0">
+                  <Sparkles size={12} className="text-purple-600" /> {t("AI 整理", "AI cleanup")}
+                </span>
+                <select
+                  value={polishStyle}
+                  onChange={(e) => setPolishStyle(e.target.value)}
+                  title={t("选择整理方式", "Choose how the AI should rework the notes")}
+                  className="text-[12px] border border-stone-300 rounded px-1 py-0.5 bg-white text-stone-700"
+                >
+                  <option value="organize">{t("整理结构", "Organize")}</option>
+                  <option value="polish">{t("润色文字", "Polish wording")}</option>
+                  <option value="concise">{t("精简概括", "Make concise")}</option>
+                </select>
+                {aiPolishReady ? (
+                  <button
+                    onClick={runPolish}
+                    disabled={polishing || !description.trim()}
+                    title={t("用 AI 整理并润色上面的描述，结果需确认后才会替换原文", "Use AI to organize and polish the description above — you confirm before it replaces your text")}
+                    className="text-[12px] px-2 py-1 border border-purple-300 text-purple-800 bg-white hover:bg-purple-50 rounded flex items-center gap-1 disabled:opacity-40"
+                  >
+                    {polishing
+                      ? (<><Loader size={11} className="animate-spin" /> {t("整理中…", "Working…")}</>)
+                      : (<><Sparkles size={11} /> {t("用 AI 整理润色", "Organize & polish")}</>)}
+                  </button>
+                ) : onOpenAISettings && (
+                  <button onClick={onOpenAISettings} className="text-[12px] text-purple-700 hover:underline">
+                    {t("配置 AI（Gemini）", "Set up AI (Gemini)")}
+                  </button>
+                )}
+                {aiPolishReady && (
+                  <span className="text-[11px] text-stone-500 shrink-0">{polishProvider === "deepseek" ? "DeepSeek" : "Gemini"}</span>
+                )}
+              </div>
+              {polishError && (
+                <div className="px-3 py-1 text-[12px] text-red-600 bg-red-50 border-b border-red-100">{polishError}</div>
+              )}
+
               <div className="flex-1 min-h-0 overflow-auto p-3">
                 <textarea
                   value={description}
@@ -2450,19 +2787,72 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
                 />
               </div>
 
-              <div className="px-3 py-2 border-t border-stone-200 bg-stone-50 flex items-center gap-2">
-                {onSaveDescription && (
-                  <button
-                    onClick={saveDescription}
-                    title={t("把描述存入文档索引，使其可被搜索", "Save the description into the document index so it's searchable")}
-                    className="text-sm px-2.5 py-1 border border-emerald-300 text-emerald-800 bg-emerald-50 hover:bg-emerald-100 rounded flex items-center gap-1"
-                  >
-                    <Save size={12} /> {descSaved ? t("已保存", "Saved") : t("保存并可搜索", "Save and make searchable")}
-                  </button>
+              {polishResult && (
+                <div className="border-t border-purple-200 bg-purple-50 px-3 py-2 flex flex-col gap-1.5 max-h-[45%] overflow-auto">
+                  <div className="text-[12px] font-medium text-purple-800 flex items-center gap-1">
+                    <Sparkles size={12} /> {t("AI 整理结果", "AI result")}
+                  </div>
+                  <div className="text-[13px] text-stone-800 whitespace-pre-wrap bg-white border border-purple-200 rounded p-2">
+                    {polishResult.text}
+                  </div>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <button
+                      onClick={acceptPolish}
+                      className="text-[12px] px-2.5 py-1 bg-purple-600 text-white rounded hover:bg-purple-700"
+                    >
+                      {t("应用（替换上方文本）", "Apply (replace text above)")}
+                    </button>
+                    <button
+                      onClick={() => setPolishResult(null)}
+                      className="text-[12px] px-2.5 py-1 border border-stone-300 text-stone-700 rounded hover:bg-white"
+                    >
+                      {t("放弃", "Discard")}
+                    </button>
+                    <span className="text-[11px] text-stone-500 ml-auto">
+                      {t("原文保留，应用后仍需点“保存”", "Your original is kept — remember to Save after applying")}
+                    </span>
+                  </div>
+                </div>
+              )}
+
+              <div className="px-3 py-2 border-t border-stone-200 bg-stone-50 flex flex-col gap-1.5">
+                <div className="flex items-center gap-2 flex-wrap">
+                  {onSaveDescription && (
+                    <button
+                      onClick={saveDescription}
+                      title={t("把描述存入文档索引，使其可被搜索", "Save the description into the document index so it's searchable")}
+                      className="text-sm px-2.5 py-1 border border-emerald-300 text-emerald-800 bg-emerald-50 hover:bg-emerald-100 rounded flex items-center gap-1"
+                    >
+                      <Save size={12} /> {descSaved ? t("已保存", "Saved") : t("保存并可搜索", "Save and make searchable")}
+                    </button>
+                  )}
+                  {onSaveTextAsDoc && (
+                    <button
+                      onClick={() => saveAsNewDoc(description, "desc")}
+                      disabled={savingNewDoc || !description.trim()}
+                      title={existingDerivedDoc("desc")
+                        ? t("覆盖同一文件夹中已保存的描述 .txt 文档（不新建）", "Overwrite the description .txt already saved in this folder (no new file)")
+                        : t("把这段描述另存为同一文件夹中的一份新的 .txt 文档", "Save this description as a new .txt document in the same folder")}
+                      className={newDocButtonClass}
+                    >
+                      {savingNewDoc
+                        ? (<><Loader size={12} className="animate-spin" /> {t("保存中…", "Saving…")}</>)
+                        : existingDerivedDoc("desc")
+                          ? (<><Save size={12} /> {t("更新描述文档", "Update description file")}</>)
+                          : (<><FilePlus size={12} /> {t("另存为新文档", "Save as new document")}</>)}
+                    </button>
+                  )}
+                  <span className="ml-auto text-[12px] text-stone-600">
+                    {doc.description ? t("已索引", "Indexed") : t("未保存", "Not saved")}
+                  </span>
+                </div>
+                {newDocMsg && (
+                  <div className={"text-[12px] " + (newDocMsg.error ? "text-red-600" : "text-green-700")}>
+                    {newDocMsg.error
+                      ? newDocMsg.error
+                      : <>{newDocMsg.updated ? t("已更新：", "Updated: ") : t("已创建：", "Created: ")}<span className="font-mono">{newDocMsg.name}</span></>}
+                  </div>
                 )}
-                <span className="ml-auto text-[12px] text-stone-600">
-                  {doc.description ? t("已索引", "Indexed") : t("未保存", "Not saved")}
-                </span>
               </div>
             </div>
           )}
@@ -2537,27 +2927,48 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
                 )}
               </div>
 
-              <div className="px-3 py-2 border-t border-stone-200 bg-stone-50 flex items-center gap-2">
-                <button
-                  onClick={copyText}
-                  disabled={!ocrText}
-                  className="text-sm px-2.5 py-1 border border-stone-300 text-stone-700 hover:bg-white rounded flex items-center gap-1 disabled:opacity-40"
-                >
-                  <Copy size={12} /> {copied ? t("已复制", "Copied") : t("复制", "Copy")}
-                </button>
-                {onSaveOcr && (
+              <div className="px-3 py-2 border-t border-stone-200 bg-stone-50 flex flex-col gap-1.5">
+                <div className="flex items-center gap-2 flex-wrap">
                   <button
-                    onClick={saveText}
-                    disabled={ocrRunning}
-                    title={t("把文字存入文档索引，使其可被搜索", "Save the text into the document index so it's searchable")}
-                    className="text-sm px-2.5 py-1 border border-emerald-300 text-emerald-800 bg-emerald-50 hover:bg-emerald-100 rounded flex items-center gap-1 disabled:opacity-40"
+                    onClick={copyText}
+                    disabled={!ocrText}
+                    className="text-sm px-2.5 py-1 border border-stone-300 text-stone-700 hover:bg-white rounded flex items-center gap-1 disabled:opacity-40"
                   >
-                    <Save size={12} /> {saved ? t("已保存", "Saved") : t("保存并可搜索", "Save and make searchable")}
+                    <Copy size={12} /> {copied ? t("已复制", "Copied") : t("复制", "Copy")}
                   </button>
+                  {onSaveOcr && (
+                    <button
+                      onClick={saveText}
+                      disabled={ocrRunning}
+                      title={t("把文字存入文档索引，使其可被搜索", "Save the text into the document index so it's searchable")}
+                      className="text-sm px-2.5 py-1 border border-emerald-300 text-emerald-800 bg-emerald-50 hover:bg-emerald-100 rounded flex items-center gap-1 disabled:opacity-40"
+                    >
+                      <Save size={12} /> {saved ? t("已保存", "Saved") : t("保存并可搜索", "Save and make searchable")}
+                    </button>
+                  )}
+                  {onSaveTextAsDoc && (
+                    <button
+                      onClick={() => saveAsNewDoc(ocrText, "ocr")}
+                      disabled={savingNewDoc || ocrRunning || !ocrText.trim()}
+                      title={t("把提取的文字另存为同一文件夹中的一份新的 .txt 文档", "Save the extracted text as a new .txt document in the same folder")}
+                      className={newDocButtonClass}
+                    >
+                      {savingNewDoc
+                        ? (<><Loader size={12} className="animate-spin" /> {t("保存中…", "Saving…")}</>)
+                        : (<><FilePlus size={12} /> {t("另存为新文档", "Save as new document")}</>)}
+                    </button>
+                  )}
+                  <span className="ml-auto text-[12px] text-stone-600">
+                    {doc.ocrText ? t("已索引", "Indexed") : t("未保存", "Not saved")}
+                  </span>
+                </div>
+                {newDocMsg && (
+                  <div className={"text-[12px] " + (newDocMsg.error ? "text-red-600" : "text-green-700")}>
+                    {newDocMsg.error
+                      ? newDocMsg.error
+                      : <>{t("已创建：", "Created: ")}<span className="font-mono">{newDocMsg.name}</span></>}
+                  </div>
                 )}
-                <span className="ml-auto text-[12px] text-stone-600">
-                  {doc.ocrText ? t("已索引", "Indexed") : t("未保存", "Not saved")}
-                </span>
               </div>
             </div>
           )}
@@ -2841,6 +3252,146 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
                   )}
                 </div>
               )}
+            </div>
+          )}
+
+          {/* Ask-AI panel: free-form Q&A about this document, filed to a running log */}
+          {panelMode === "ask" && (
+            <div className="w-[40%] max-w-lg min-h-0 flex flex-col bg-white">
+              <div className="flex items-center justify-between px-3 py-2 border-b border-stone-200 bg-stone-50">
+                <div className="flex items-center gap-1.5 text-sm font-medium text-stone-700">
+                  <Sparkles size={13} className="text-purple-600" /> {t("就本文档提问 AI", "Ask AI about this document")}
+                </div>
+                <button onClick={() => setPanelMode(null)} className="text-stone-600 hover:text-stone-700">
+                  <X size={14} />
+                </button>
+              </div>
+
+              <div className="px-3 py-2 border-b border-stone-100 space-y-2">
+                <div className="text-[13px] text-stone-700">
+                  {t("AI 会根据文档已提取的文字/描述/参数回答，答案和问题会存档为同一文件夹中的一份记录文件。", "The AI answers using the document's extracted text/description/parameters. The question and answer are filed into a record kept in the same folder.")}
+                </div>
+
+                {!aiSettings.configured && !aiSettingsDS.configured ? (
+                  <div className="text-[13px] text-amber-700 bg-amber-50 border border-amber-100 rounded px-2 py-1.5">
+                    {t("需要先配置 Gemini 或 DeepSeek 的 API Key。", "Configure a Gemini or DeepSeek API Key first.")}
+                    {onOpenAISettings && (
+                      <button onClick={onOpenAISettings} className="text-purple-700 hover:underline font-medium ml-1">
+                        {t("去配置", "Configure")}
+                      </button>
+                    )}
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-3 text-[13px] text-stone-700 flex-wrap">
+                    <span>{t("使用：", "Provider:")}</span>
+                    <label className={"flex items-center gap-1 " + (aiSettings.configured ? "cursor-pointer" : "text-stone-600")}>
+                      <input
+                        type="radio"
+                        name="askProvider"
+                        checked={askProvider === "gemini"}
+                        disabled={!aiSettings.configured}
+                        onChange={() => setAskProvider("gemini")}
+                        className="accent-purple-600"
+                      />
+                      Gemini
+                    </label>
+                    {!aiSettings.configured && onOpenAISettings && (
+                      <button onClick={onOpenAISettings} className="text-[12px] text-purple-700 hover:underline">
+                        {t("（未配置，点击配置）", "(not configured — click to set up)")}
+                      </button>
+                    )}
+                    <label className={"flex items-center gap-1 " + (aiSettingsDS.configured ? "cursor-pointer" : "text-stone-600")}>
+                      <input
+                        type="radio"
+                        name="askProvider"
+                        checked={askProvider === "deepseek"}
+                        disabled={!aiSettingsDS.configured}
+                        onChange={() => setAskProvider("deepseek")}
+                        className="accent-purple-600"
+                      />
+                      DeepSeek
+                    </label>
+                    {!aiSettingsDS.configured && onOpenAISettings && (
+                      <button onClick={onOpenAISettings} className="text-[12px] text-purple-700 hover:underline">
+                        {t("（未配置，点击配置）", "(not configured — click to set up)")}
+                      </button>
+                    )}
+                  </div>
+                )}
+
+                <textarea
+                  value={askQuestion}
+                  onChange={(e) => setAskQuestion(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); runAskAI(); } }}
+                  placeholder={t("输入你的问题…（Ctrl/Cmd+Enter 发送）", "Type your question… (Ctrl/Cmd+Enter to send)")}
+                  rows={3}
+                  disabled={!aiSettings.configured && !aiSettingsDS.configured}
+                  className="w-full text-[13px] px-2 py-1.5 border border-stone-300 rounded focus:outline-none focus:border-purple-500 disabled:bg-stone-50"
+                />
+                <button
+                  onClick={runAskAI}
+                  disabled={askRunning || !askQuestion.trim() || (!aiSettings.configured && !aiSettingsDS.configured)}
+                  className={"text-sm px-3 py-1.5 rounded flex items-center gap-1.5 border " +
+                    (askRunning
+                      ? "border-stone-200 text-stone-600 cursor-wait"
+                      : "border-purple-300 text-purple-800 bg-purple-50 hover:bg-purple-100 disabled:opacity-40")}
+                >
+                  {askRunning
+                    ? (<><Loader size={13} className="animate-spin" /> {t("提问中…", "Asking…")}</>)
+                    : (<><Sparkles size={13} /> {t("发送", "Ask")}</>)}
+                </button>
+              </div>
+
+              <div className="flex-1 min-h-0 overflow-auto p-3">
+                {askError && (
+                  <div className="text-sm text-red-600 whitespace-pre-wrap">{askError}</div>
+                )}
+                {!askError && askAnswer && (
+                  <div className="space-y-2">
+                    <div className="text-[13px] text-stone-700">
+                      <span className="font-medium">{t("问：", "Q: ")}</span>{askAnswer.question}
+                    </div>
+                    <div className="text-[13px] text-stone-800 whitespace-pre-wrap bg-stone-50 border border-stone-100 rounded px-2 py-1.5">
+                      <span className="font-medium">{t("答：", "A: ")}</span>{askAnswer.answer}
+                    </div>
+                    <div className="text-[12px] text-stone-600">{askAnswer.model}</div>
+                    {askLogName && (
+                      <div className="text-[12px] text-green-700">
+                        {t("已存档到：", "Filed to: ")}<span className="font-mono">{askLogName}</span>
+                      </div>
+                    )}
+                    {onSaveTextAsDoc && (
+                      <div className="pt-1">
+                        <button
+                          onClick={() => saveAsNewDoc(
+                            `${t("问：", "Q: ")}${askAnswer.question}\n\n${t("答：", "A: ")}${askAnswer.answer}\n\n${askAnswer.model || ""}`.trim(),
+                            "ai"
+                          )}
+                          disabled={savingNewDoc}
+                          title={t("把这条问答另存为同一文件夹中的一份新的 .txt 文档", "Save this Q&A as a new .txt document in the same folder")}
+                          className={newDocButtonClass}
+                        >
+                          {savingNewDoc
+                            ? (<><Loader size={12} className="animate-spin" /> {t("保存中…", "Saving…")}</>)
+                            : (<><FilePlus size={12} /> {t("另存为新文档", "Save as new document")}</>)}
+                        </button>
+                        {newDocMsg && (
+                          <div className={"text-[12px] mt-1 " + (newDocMsg.error ? "text-red-600" : "text-green-700")}>
+                            {newDocMsg.error
+                              ? newDocMsg.error
+                              : <>{t("已创建：", "Created: ")}<span className="font-mono">{newDocMsg.name}</span></>}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+                {!askError && !askAnswer && (
+                  <div className="text-sm text-stone-600">
+                    {t("提问后，答案会显示在这里，并追加到本文档所在文件夹的问答记录文件中。", "Once you ask, the answer appears here and is appended to a Q&A record file in this document's folder.")}
+                  </div>
+                )}
+              </div>
             </div>
           )}
         </div>
@@ -3134,6 +3685,106 @@ const MetadataEditor = ({ metadata, onChange, keyParameters = [], baseMetadata =
   );
 };
 
+/* A compact, collapsible folder-tree picker for narrowing search/AI-Q&A to
+ * one folder (and its descendants) instead of the whole project -- lets the
+ * user browse and click a folder directly, instead of having to first
+ * select it elsewhere and remember a "scope to current folder" checkbox. */
+const FolderScopePicker = ({ tree, scopeId, onChange, docCounts }) => {
+  const { t } = useLang();
+  const [open, setOpen] = useState(false);
+  const [expanded, setExpanded] = useState(() => new Set(
+    tree ? [tree.id, ...collectAncestorIds(tree, scopeId)] : []
+  ));
+
+  const scopeNode = useMemo(
+    () => (tree && scopeId ? findNode(tree, scopeId) : null),
+    [tree, scopeId]
+  );
+
+  const toggleExpanded = (id) => setExpanded((s) => {
+    const next = new Set(s);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    return next;
+  });
+
+  const pick = (id) => { onChange(id); setOpen(false); };
+
+  const renderNode = (node, depth) => {
+    const hasChildren = (node.children || []).length > 0;
+    const isOpen = expanded.has(node.id);
+    const isSelected = scopeId === node.id;
+    const count = docCounts ? docCounts.get(node.id) || 0 : null;
+    return (
+      <div key={node.id}>
+        <div
+          className={"flex items-center gap-1 py-0.5 rounded cursor-pointer text-[13px] " +
+            (isSelected ? "bg-amber-100 text-amber-900 font-medium" : "hover:bg-stone-100 text-stone-700")}
+          style={{ paddingLeft: depth * 14 + 4 }}
+          onClick={() => pick(node.id)}
+        >
+          {hasChildren ? (
+            <button
+              onClick={(e) => { e.stopPropagation(); toggleExpanded(node.id); }}
+              className="text-stone-600 shrink-0"
+            >
+              {isOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+            </button>
+          ) : <span className="w-3 shrink-0" />}
+          {isOpen || isSelected
+            ? <FolderOpen size={13} className="text-amber-600 shrink-0" />
+            : <Folder size={13} className="text-amber-600 shrink-0" />}
+          <span className="truncate flex-1 min-w-0">{node.name}</span>
+          {count != null && <span className="text-[11px] text-stone-600 shrink-0">{count}</span>}
+        </div>
+        {hasChildren && isOpen && node.children.map((c) => renderNode(c, depth + 1))}
+      </div>
+    );
+  };
+
+  if (!tree) return null;
+
+  return (
+    <div className="text-[13px]">
+      <div className="flex items-center gap-1.5 flex-wrap">
+        <button
+          onClick={() => setOpen((o) => !o)}
+          className="flex items-center gap-1 px-2 py-1 border border-stone-300 rounded text-stone-700 hover:bg-stone-100"
+        >
+          <Folder size={12} className="text-amber-600" />
+          {t("按文件夹筛选：", "Filter by folder:")}
+          <span className="font-medium text-amber-800 truncate max-w-[140px]">
+            {scopeNode ? scopeNode.name : t("全部文档", "All documents")}
+          </span>
+          {open ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+        </button>
+        {scopeId && (
+          <button
+            onClick={() => onChange(null)}
+            title={t("清除文件夹范围", "Clear folder scope")}
+            className="text-stone-600 hover:text-red-600"
+          >
+            <X size={13} />
+          </button>
+        )}
+      </div>
+      {open && (
+        <div className="mt-1.5 border border-stone-200 rounded p-1 bg-white max-h-48 overflow-auto">
+          <div
+            className={"flex items-center gap-1 py-0.5 px-1 rounded cursor-pointer " +
+              (!scopeId ? "bg-amber-100 text-amber-900 font-medium" : "hover:bg-stone-100 text-stone-700")}
+            onClick={() => pick(null)}
+          >
+            <span className="w-3 shrink-0" />
+            <Search size={12} className="text-stone-600 shrink-0" />
+            {t("全部文档", "All documents")}
+          </div>
+          {renderNode(tree, 0)}
+        </div>
+      )}
+    </div>
+  );
+};
+
 /* =============================================================================
  * UI: SEARCH PANEL
  * =============================================================================
@@ -3142,32 +3793,65 @@ const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree,
   const { t } = useLang();
   const [q, setQ] = useState("");
   const [showUnref, setShowUnref] = useState(false);
-  const [scopeToFolder, setScopeToFolder] = useState(false);
+  // Folder to restrict search/AI Q&A to (null = whole project). Seeded from
+  // whichever folder is currently open in the main tree, so opening Search
+  // starts scoped to where you already are; the folder-tree picker below
+  // then lets you change or clear it without leaving this panel.
+  const [scopeId, setScopeId] = useState(() => scopeNodeId || null);
   const [mode, setMode] = useState("keyword"); // "keyword" | "ai"
 
   // --- AI Q&A mode state ------------------------------------------------
   const [aiSettings, setAiSettings] = useState({ configured: false, library_installed: true });
+  const [aiSettingsDS, setAiSettingsDS] = useState({ configured: false, library_installed: true });
+  const [aiProvider, setAiProvider] = useState("gemini");
   const [question, setQuestion] = useState("");
   const [asking, setAsking] = useState(false);
   const [aiAnswer, setAiAnswer] = useState(null); // { answer, citations, coverage } | null
   const [aiError, setAiError] = useState("");
 
   useEffect(() => {
-    if (mode === "ai") StorageAdapter.getAISettings().then(setAiSettings).catch(() => {});
+    if (mode === "ai") {
+      StorageAdapter.getAISettings("gemini").then(setAiSettings).catch(() => {});
+      StorageAdapter.getAISettings("deepseek").then(setAiSettingsDS).catch(() => {});
+    }
   }, [mode]);
 
+  const aiAnyConfigured = aiSettings.configured || aiSettingsDS.configured;
+
+  // If the selected provider turns out not to be configured but the other
+  // one is, switch to the usable one automatically instead of leaving the
+  // radio stuck on a disabled option.
+  useEffect(() => {
+    if (aiProvider === "gemini" && !aiSettings.configured && aiSettingsDS.configured) setAiProvider("deepseek");
+    else if (aiProvider === "deepseek" && !aiSettingsDS.configured && aiSettings.configured) setAiProvider("gemini");
+  }, [aiSettings.configured, aiSettingsDS.configured]);
+
   const scopeNode = useMemo(
-    () => (tree && scopeNodeId ? findNode(tree, scopeNodeId) : null),
-    [tree, scopeNodeId]
+    () => (tree && scopeId ? findNode(tree, scopeId) : null),
+    [tree, scopeId]
   );
 
-  useEffect(() => { if (!scopeNode) setScopeToFolder(false); }, [scopeNode]);
+  // Document count per folder (that folder + all descendants), shown next
+  // to each row in the folder-tree picker so users can tell at a glance
+  // which folders actually have documents worth searching.
+  const folderDocCounts = useMemo(() => {
+    const counts = new Map();
+    const walk = (node) => {
+      if (!node) return 0;
+      let n = (node.documents || []).length;
+      for (const c of node.children || []) n += walk(c);
+      counts.set(node.id, n);
+      return n;
+    };
+    if (tree) walk(tree);
+    return counts;
+  }, [tree]);
 
   const askQuestion = async () => {
     if (!question.trim() || asking) return;
     setAsking(true); setAiError(""); setAiAnswer(null);
     try {
-      const data = await StorageAdapter.askAI(question.trim(), scopeToFolder && scopeNode ? scopeNode.id : null);
+      const data = await StorageAdapter.askAI(question.trim(), scopeNode ? scopeNode.id : null, aiProvider);
       setAiAnswer(data);
     } catch (e) {
       setAiError(e.message || String(e));
@@ -3177,9 +3861,9 @@ const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree,
   };
 
   const scopeDocIdSet = useMemo(() => {
-    if (!scopeToFolder || !scopeNode) return null;
+    if (!scopeNode) return null;
     return new Set(collectAllDocIds(scopeNode));
-  }, [scopeToFolder, scopeNode]);
+  }, [scopeNode]);
 
   const results = useMemo(() => {
     const words = q.trim().toLowerCase().split(/\s+/).filter(Boolean);
@@ -3236,19 +3920,7 @@ const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree,
         </button>
       </div>
 
-      {scopeNode && (
-        <label className="flex items-center gap-1.5 text-[13px] text-stone-700 cursor-pointer">
-          <input
-            type="checkbox"
-            checked={scopeToFolder}
-            onChange={(e) => setScopeToFolder(e.target.checked)}
-          />
-          <span>{t("仅限此节点及子节点：", "This node and its children only:")}</span>
-          <span className="font-medium text-amber-700 truncate max-w-[100px]" title={scopeNode.name}>
-            {scopeNode.name}
-          </span>
-        </label>
-      )}
+      <FolderScopePicker tree={tree} scopeId={scopeId} onChange={setScopeId} docCounts={folderDocCounts} />
 
       {mode === "ai" ? (
         <div className="space-y-2">
@@ -3260,15 +3932,15 @@ const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree,
               onChange={(e) => setQuestion(e.target.value)}
               onKeyDown={(e) => { if (e.key === "Enter") askQuestion(); }}
               placeholder={t("用一句话提问，AI 会跨文档查找答案…", "Ask a question in plain language — AI will search across documents…")}
-              disabled={!aiSettings.configured}
+              disabled={!aiAnyConfigured}
               className="w-full pl-8 pr-3 py-1.5 text-sm border border-stone-300 rounded focus:outline-none focus:border-purple-600 disabled:bg-stone-50 disabled:text-stone-600"
             />
           </div>
 
-          {!aiSettings.configured ? (
+          {!aiAnyConfigured ? (
             <div className="text-[13px] text-stone-700 bg-purple-50 border border-purple-200 rounded p-2 flex items-center gap-1.5">
               <Sparkles size={11} className="text-purple-600 shrink-0" />
-              {t("需要先配置 Gemini API Key 才能使用 AI 问答。", "AI Q&A needs a Gemini API Key configured first.")}
+              {t("需要先配置 Gemini 或 DeepSeek 的 API Key 才能使用 AI 问答。", "AI Q&A needs a Gemini or DeepSeek API Key configured first.")}
               {onOpenAISettings && (
                 <button onClick={onOpenAISettings} className="text-purple-700 hover:underline font-medium shrink-0">
                   {t("配置 API Key", "Configure API Key")}
@@ -3276,15 +3948,55 @@ const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree,
               )}
             </div>
           ) : (
-            <button
-              onClick={askQuestion}
-              disabled={asking || !question.trim()}
-              className="text-sm px-3 py-1.5 rounded flex items-center gap-1.5 border border-purple-300 text-purple-800 bg-purple-50 hover:bg-purple-100 disabled:opacity-40"
-            >
-              {asking
-                ? (<><Loader size={13} className="animate-spin" /> {t("正在查找…", "Searching…")}</>)
-                : (<><Sparkles size={13} /> {t("提问", "Ask")}</>)}
-            </button>
+            <div className="flex items-center gap-3 flex-wrap">
+              <div className="flex items-center gap-3 text-[13px] text-stone-700 flex-wrap">
+                <span>{t("使用：", "Provider:")}</span>
+                <label className={"flex items-center gap-1 " + (aiSettings.configured ? "cursor-pointer" : "text-stone-600")}>
+                  <input
+                    type="radio"
+                    name="aiProvider"
+                    checked={aiProvider === "gemini"}
+                    disabled={!aiSettings.configured}
+                    onChange={() => setAiProvider("gemini")}
+                    className="accent-purple-600"
+                  />
+                  Gemini
+                </label>
+                {!aiSettings.configured && onOpenAISettings && (
+                  <button onClick={onOpenAISettings} className="text-[12px] text-purple-700 hover:underline">
+                    {t("（未配置，点击配置）", "(not configured — click to set up)")}
+                  </button>
+                )}
+                <label
+                  className={"flex items-center gap-1 " + (aiSettingsDS.configured ? "cursor-pointer" : "text-stone-600")}
+                  title={t("适合中国大陆用户（无需科学上网）", "Good for users in mainland China (no VPN needed)")}
+                >
+                  <input
+                    type="radio"
+                    name="aiProvider"
+                    checked={aiProvider === "deepseek"}
+                    disabled={!aiSettingsDS.configured}
+                    onChange={() => setAiProvider("deepseek")}
+                    className="accent-purple-600"
+                  />
+                  DeepSeek
+                </label>
+                {!aiSettingsDS.configured && onOpenAISettings && (
+                  <button onClick={onOpenAISettings} className="text-[12px] text-purple-700 hover:underline">
+                    {t("（未配置，点击配置）", "(not configured — click to set up)")}
+                  </button>
+                )}
+              </div>
+              <button
+                onClick={askQuestion}
+                disabled={asking || !question.trim()}
+                className="text-sm px-3 py-1.5 rounded flex items-center gap-1.5 border border-purple-300 text-purple-800 bg-purple-50 hover:bg-purple-100 disabled:opacity-40"
+              >
+                {asking
+                  ? (<><Loader size={13} className="animate-spin" /> {t("正在查找…", "Searching…")}</>)
+                  : (<><Sparkles size={13} /> {t("提问", "Ask")}</>)}
+              </button>
+            </div>
           )}
 
           {aiError && (
@@ -3617,7 +4329,12 @@ const DatabookPanel = ({ tree, docIndex, getPathFor, formatBytes, onOpenDoc }) =
   const renderNode = (node, depth = 0) => {
     const isExpanded = expanded.has(node.id);
     const hasChildren = (node.children || []).length > 0;
-    const docs = node.documents || [];
+    // A-Z by name (matching the main folder view), not upload order.
+    const docs = [...(node.documents || [])].sort((a, b) => {
+      const na = docsById.get(a.id)?.name || "";
+      const nb = docsById.get(b.id)?.name || "";
+      return na.localeCompare(nb, undefined, { numeric: true, sensitivity: "base" });
+    });
     const canExpand = hasChildren || docs.length > 0;
     const ownState = nodeOwnState(node);
 
@@ -4520,12 +5237,19 @@ const FolderBrowserModal = ({ startPath, onSelect, onClose }) => {
   const [pathInput, setPathInput] = useState(startPath || "");
 
   const load = async (path) => {
-    setState((s) => ({ ...s, loading: true, error: "" }));
+    setState((s) => ({ ...s, loading: true, error: "", attempted: path }));
     try {
       const r = await StorageAdapter.browseFolder(path);
-      setState({ loading: false, path: r.path, parent: r.parent, entries: r.entries || [], roots: r.roots || [], error: "" });
+      setState({ loading: false, path: r.path, parent: r.parent, entries: r.entries || [], roots: r.roots || [], error: "", attempted: path });
       if (r.path) setPathInput(r.path);
     } catch (e) {
+      // On macOS, the first-ever read of a protected folder (Documents,
+      // Desktop, Downloads, …) fires a native "would like to access files
+      // in your ___ folder" TCC prompt AND fails this call immediately —
+      // the OS doesn't hold the syscall open until the user decides. So a
+      // permission error here is often stale by the time it renders: the
+      // user is about to click Allow (or just did). Surface a Retry button
+      // rather than leaving the dialog looking stuck.
       setState((s) => ({ ...s, loading: false, error: e.message || String(e) }));
     }
   };
@@ -4533,7 +5257,20 @@ const FolderBrowserModal = ({ startPath, onSelect, onClose }) => {
   useEffect(() => { load(startPath); }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
-    <div className="fixed inset-0 bg-black/50 z-[60] flex items-center justify-center" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+    <div
+      className="fixed inset-0 bg-black/50 z-[60] flex items-center justify-center"
+      onClick={(e) => {
+        // Stop this from bubbling to `window` — ProjectMenu (and any other
+        // menu that might host this modal) closes itself on any window-level
+        // click that isn't stopped before reaching it (see its "Click-outside
+        // to close" effect). Without this, every click in here — including a
+        // plain click on a folder row — was closing the entire parent menu
+        // and unmounting this modal along with it, before it ever got to
+        // navigate anywhere.
+        e.stopPropagation();
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
       <div className="bg-white rounded-lg shadow-xl w-[36rem] max-h-[32rem] flex flex-col">
         <div className="px-4 py-3 border-b border-stone-200 flex items-center gap-2 shrink-0">
           <h3 className="font-semibold text-base text-stone-800 flex-1">{t("选择文件夹", "Choose a folder")}</h3>
@@ -4577,15 +5314,25 @@ const FolderBrowserModal = ({ startPath, onSelect, onClose }) => {
               {state.loading ? (
                 <div className="text-sm text-stone-600 text-center py-6">{t("加载中…", "Loading…")}</div>
               ) : state.error ? (
-                <div className="text-sm text-red-600 px-3 py-2">{state.error}</div>
+                <div className="text-sm text-red-600 px-3 py-2">
+                  <div className="mb-2">{state.error}</div>
+                  <div className="text-stone-600 mb-2">
+                    {t("如果 macOS 刚弹出了访问权限提示，请点击「允许」后重试。", "If macOS just showed a permission prompt, click Allow there, then retry.")}
+                  </div>
+                  <button
+                    onClick={() => load(state.attempted)}
+                    className="text-sm px-3 py-1 rounded border border-red-300 hover:bg-red-50 text-red-700"
+                  >
+                    {t("重试", "Retry")}
+                  </button>
+                </div>
               ) : state.entries.length === 0 ? (
                 <div className="text-sm text-stone-600 text-center py-6">{t("此文件夹内没有子文件夹", "No subfolders here")}</div>
               ) : (
                 state.entries.map((entry) => (
                   <button
                     key={entry.path}
-                    onClick={() => setPathInput(entry.path)}
-                    onDoubleClick={() => load(entry.path)}
+                    onClick={() => load(entry.path)}
                     className={`w-full text-left px-3 py-1.5 text-sm flex items-center gap-1.5 hover:bg-stone-50 ${pathInput === entry.path ? "bg-amber-50 text-amber-800" : "text-stone-700"}`}
                   >
                     <Folder size={12} className="shrink-0 text-stone-600" />
@@ -5169,8 +5916,8 @@ const FolderPlotDialog = ({ open, node, tree, docIndex, onClose, onOpenDoc, onOp
       paramName: param,
       unit,
       nodeName: node ? node.name : "",
-      isCategorical,
-      chartType,
+      isCategorical: isCategorical || groupMode === "folder",
+      chartType: effectiveChartType,
       xFieldLabel,
       lang,
     };
@@ -6400,7 +7147,10 @@ const EmailSettingsDialog = ({ onClose }) => {
   );
 };
 
-const AISettingsDialog = ({ onClose }) => {
+// One provider's key-management block inside AISettingsDialog (Gemini or
+// DeepSeek) -- each provider is entirely independent: its own saved key,
+// its own "library installed" check, its own status message.
+const AIProviderKeyPanel = ({ provider, label, keyUrl, keyUrlLabel, placeholder, notInstalledMsg }) => {
   const { t } = useLang();
   const [apiKey, setApiKey] = useState("");
   const [loading, setLoading] = useState(true);
@@ -6410,20 +7160,20 @@ const AISettingsDialog = ({ onClose }) => {
   const [status, setStatus] = useState(null); // null | {ok, msg}
 
   useEffect(() => {
-    StorageAdapter.getAISettings()
+    StorageAdapter.getAISettings(provider)
       .then((d) => {
         setConfigured(!!d.configured);
         setLibraryInstalled(d.library_installed !== false);
         setLoading(false);
       })
       .catch(() => setLoading(false));
-  }, []);
+  }, [provider]);
 
   const save = async () => {
     if (!apiKey.trim()) return;
     setSaving(true); setStatus(null);
     try {
-      const d = await StorageAdapter.setAISettings({ api_key: apiKey.trim() });
+      const d = await StorageAdapter.setAISettings({ provider, api_key: apiKey.trim() });
       setConfigured(!!d.configured);
       setApiKey("");
       setStatus({ ok: !!d.ok, msg: d.ok ? t("API Key 已保存（已加密存储）。", "API Key saved (stored encrypted).") : t("保存失败。", "Save failed.") });
@@ -6435,7 +7185,7 @@ const AISettingsDialog = ({ onClose }) => {
   const clearKey = async () => {
     setSaving(true); setStatus(null);
     try {
-      const d = await StorageAdapter.setAISettings({ clear: true });
+      const d = await StorageAdapter.setAISettings({ provider, clear: true });
       setConfigured(!!d.configured);
       setStatus({ ok: true, msg: t("已移除已保存的 API Key。", "The saved API Key has been removed.") });
     } catch (e) {
@@ -6444,60 +7194,107 @@ const AISettingsDialog = ({ onClose }) => {
   };
 
   return (
+    <div className="border border-stone-200 rounded p-3">
+      <div className="text-[12px] uppercase tracking-wider text-stone-700 mb-1.5 font-semibold">{label}</div>
+
+      {!libraryInstalled && (
+        <div className="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded px-2.5 py-2 mb-2">
+          {notInstalledMsg}
+        </div>
+      )}
+
+      {loading ? (
+        <div className="text-stone-600 text-[13px] py-2">{t("加载中…", "Loading…")}</div>
+      ) : (
+        <>
+          <div className="text-[13px] text-stone-700 mb-1.5">
+            {t("当前状态：", "Current status: ")}{configured
+              ? <span className="text-green-700 font-medium">{t("已配置 API Key", "API Key configured")}</span>
+              : <span className="text-stone-700">{t("未配置", "Not configured")}</span>}
+          </div>
+          <input
+            type="password"
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+            placeholder={configured ? t("留空则保持原 Key 不变", "Leave blank to keep the existing key") : placeholder}
+            className="w-full px-2 py-1.5 text-base border border-stone-300 rounded focus:outline-none focus:border-purple-500 mb-1.5 font-mono"
+          />
+          {keyUrl && (
+            <a href={keyUrl} target="_blank" rel="noopener noreferrer" className="text-[13px] text-purple-700 hover:underline">
+              {keyUrlLabel}
+            </a>
+          )}
+        </>
+      )}
+
+      {status && (
+        <div className={`text-[13px] rounded px-2.5 py-1.5 mt-2 ${status.ok ? "bg-green-50 text-green-800 border border-green-200" : "bg-red-50 text-red-700 border border-red-200"}`}>
+          {status.msg}
+        </div>
+      )}
+
+      <div className="flex gap-2 flex-wrap mt-2">
+        {configured && (
+          <button
+            onClick={clearKey}
+            disabled={saving || loading}
+            className="px-2.5 py-1 text-[13px] border border-red-300 text-red-700 hover:bg-red-50 rounded disabled:opacity-40"
+          >
+            {t("移除 Key", "Remove key")}
+          </button>
+        )}
+        <button
+          onClick={save}
+          disabled={saving || loading || !apiKey.trim()}
+          className="flex-1 px-2.5 py-1 text-[13px] bg-purple-600 hover:bg-purple-700 text-white rounded disabled:opacity-40"
+        >
+          {saving ? t("保存中…", "Saving…") : t("保存", "Save")}
+        </button>
+      </div>
+    </div>
+  );
+};
+
+const AISettingsDialog = ({ onClose }) => {
+  const { t } = useLang();
+
+  return (
     <div className="fixed inset-0 bg-stone-900/70 z-50 flex items-center justify-center p-4" onClick={onClose}>
-      <div className="bg-white w-full max-w-md rounded shadow-2xl p-5" onClick={(e) => e.stopPropagation()}>
+      <div className="bg-white w-full max-w-md max-h-[85vh] overflow-y-auto rounded shadow-2xl p-5" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center justify-between mb-3">
           <div className="flex items-center gap-2">
             <Sparkles size={15} className="text-purple-600" />
-            <span className="text-base font-semibold text-stone-900">{t("AI 辅助提取设置（Gemini）", "AI-assisted extraction settings (Gemini)")}</span>
+            <span className="text-base font-semibold text-stone-900">{t("AI 提供商设置", "AI provider settings")}</span>
           </div>
           <button onClick={onClose} className="text-stone-600 hover:text-stone-700"><X size={15} /></button>
         </div>
 
         <div className="text-[13px] text-stone-700 bg-stone-50 border border-stone-200 rounded px-2.5 py-2 mb-3 leading-relaxed">
-          {t("启用后，点击\"提取关键参数\"面板中的\"使用 AI 辅助提取\"，文档页面的图像会被发送至 Google Gemini 进行识别，通常比默认的关键字匹配更准确（尤其是扫描件或格式不规则的文档）。", "Once enabled, checking \"Use AI-assisted extraction\" in the \"Extract key parameters\" panel sends the document page image to Google Gemini for recognition, which is usually more accurate than the default keyword matching (especially for scans or irregularly formatted documents).")}
-          <b>{t("此功能默认关闭，且需要联网", "This feature is off by default and requires an internet connection")}</b>{t("；不启用时应用完全离线运行，不受影响。", "; when disabled, the app runs fully offline and is unaffected.")}
+          {t("配置你自己的 API Key 后，可用于\"提取关键参数\"面板中的 AI 辅助提取，以及文档查看器中的\"提问 AI\"。", "Once you configure your own API Key, it's used by AI-assisted extraction in the \"Extract key parameters\" panel, and by \"Ask AI\" in the document viewer.")}
+          {" "}<b>{t("这些功能默认关闭，且需要联网", "These features are off by default and require an internet connection")}</b>{t("；不启用时应用完全离线运行，不受影响。", "; when disabled, the app runs fully offline and is unaffected.")}
         </div>
 
-        {!libraryInstalled && (
-          <div className="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded px-2.5 py-2 mb-3">
-            {t("此安装未打包 google-genai 库，AI 提取暂不可用。请重新运行 build.py（在已安装 google-genai 的 Python 环境中）以打包此功能。", "This install doesn't bundle the google-genai library, so AI extraction isn't available yet. Re-run build.py (in a Python environment with google-genai installed) to bundle this feature.")}
-          </div>
-        )}
+        <div className="space-y-3">
+          <AIProviderKeyPanel
+            provider="gemini"
+            label="Google Gemini"
+            keyUrl="https://aistudio.google.com/apikey"
+            keyUrlLabel={t("没有 API Key？前往 Google AI Studio 免费获取 →", "Don't have an API Key? Get one for free at Google AI Studio →")}
+            placeholder={t("粘贴你的 Gemini API Key", "Paste your Gemini API Key")}
+            notInstalledMsg={t("此安装未打包 google-genai 库，Gemini 功能暂不可用。请重新运行 build.py（在已安装 google-genai 的 Python 环境中）以打包此功能。", "This install doesn't bundle the google-genai library, so Gemini features aren't available yet. Re-run build.py (in a Python environment with google-genai installed) to bundle this feature.")}
+          />
+          <AIProviderKeyPanel
+            provider="deepseek"
+            label="DeepSeek"
+            keyUrl="https://platform.deepseek.com/api_keys"
+            keyUrlLabel={t("没有 API Key？前往 DeepSeek 开放平台获取 →", "Don't have an API Key? Get one at the DeepSeek platform →")}
+            placeholder={t("粘贴你的 DeepSeek API Key", "Paste your DeepSeek API Key")}
+            notInstalledMsg={t("此安装未打包 requests 库，DeepSeek 功能暂不可用。请重新运行 build.py（在已安装 requests 的 Python 环境中）以打包此功能。", "This install doesn't bundle the requests library, so DeepSeek features aren't available yet. Re-run build.py (in a Python environment with requests installed) to bundle this feature.")}
+          />
+        </div>
 
-        {loading ? (
-          <div className="text-center text-stone-600 text-base py-4">{t("加载中…", "Loading…")}</div>
-        ) : (
-          <>
-            <div className="text-sm text-stone-700 mb-2">
-              {t("当前状态：", "Current status: ")}{configured
-                ? <span className="text-green-700 font-medium">{t("已配置 API Key", "API Key configured")}</span>
-                : <span className="text-stone-700">{t("未配置", "Not configured")}</span>}
-            </div>
-
-            <label className="block text-[12px] uppercase tracking-wider text-stone-700 mb-1">
-              Gemini API Key
-            </label>
-            <input
-              type="password"
-              value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
-              placeholder={configured ? t("留空则保持原 Key 不变", "Leave blank to keep the existing key") : t("粘贴你的 Gemini API Key", "Paste your Gemini API Key")}
-              className="w-full px-2 py-1.5 text-base border border-stone-300 rounded focus:outline-none focus:border-purple-500 mb-2 font-mono"
-            />
-            <a
-              href="https://aistudio.google.com/apikey"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-[13px] text-purple-700 hover:underline"
-            >
-              {t("没有 API Key？前往 Google AI Studio 免费获取 →", "Don't have an API Key? Get one for free at Google AI Studio →")}
-            </a>
-          </>
-        )}
-
-        <div className="text-[13px] text-stone-700 mt-2">
-          {t("详细步骤（含免费/付费 Key 获取方法）：", "Detailed steps (including how to get a free/paid key): ")}
+        <div className="text-[13px] text-stone-700 mt-3">
+          {t("Gemini 详细设置步骤（含免费/付费 Key 获取方法）：", "Detailed Gemini setup steps (including how to get a free/paid key): ")}
           <a
             href="/api/download-gemini-guide"
             download
@@ -6507,30 +7304,8 @@ const AISettingsDialog = ({ onClose }) => {
           </a>
         </div>
 
-        {status && (
-          <div className={`text-sm rounded px-3 py-2 mt-3 ${status.ok ? "bg-green-50 text-green-800 border border-green-200" : "bg-red-50 text-red-700 border border-red-200"}`}>
-            {status.msg}
-          </div>
-        )}
-
         <div className="flex gap-2 flex-wrap mt-3">
-          <button onClick={onClose} className="px-3 py-1.5 text-sm border border-stone-300 hover:bg-stone-100 rounded">{t("关闭", "Close")}</button>
-          {configured && (
-            <button
-              onClick={clearKey}
-              disabled={saving || loading}
-              className="px-3 py-1.5 text-sm border border-red-300 text-red-700 hover:bg-red-50 rounded disabled:opacity-40"
-            >
-              {t("移除 Key", "Remove key")}
-            </button>
-          )}
-          <button
-            onClick={save}
-            disabled={saving || loading || !apiKey.trim()}
-            className="flex-1 px-3 py-1.5 text-sm bg-purple-600 hover:bg-purple-700 text-white rounded disabled:opacity-40"
-          >
-            {saving ? t("保存中…", "Saving…") : t("保存", "Save")}
-          </button>
+          <button onClick={onClose} className="ml-auto px-3 py-1.5 text-sm border border-stone-300 hover:bg-stone-100 rounded">{t("关闭", "Close")}</button>
         </div>
       </div>
     </div>
@@ -9372,6 +10147,9 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
   const [error, setError] = useState(null);
   const [importDialog, setImportDialog] = useState(null); // { file, mode, target }
   const [newDialog, setNewDialog] = useState(null);       // { target }
+  const [newFolderBrowserOpen, setNewFolderBrowserOpen] = useState(false);
+  const [openAnotherDialog, setOpenAnotherDialog] = useState(null); // { target }
+  const [openAnotherFolderBrowserOpen, setOpenAnotherFolderBrowserOpen] = useState(false);
   const [pwDialog, setPwDialog] = useState(null);         // { current, next, confirm, hasExisting } — APP login password
   const [authStatus, setAuthStatus] = useState(null);
   // Project password (see "Per-project identity & password" in dms_server.py)
@@ -9564,6 +10342,37 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
       const data = await res.json();
       setNewDialog(null);
       onProjectChanged(data.storage_path);
+      onClose();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // Open a second, independent project in a new browser tab — a separate
+  // DMS server process on its own port (see POST /api/spawn-instance /
+  // spawn_or_focus_instance() in dms_launcher.py). Deliberately does NOT
+  // touch this window's own tree/docIndex/onProjectChanged — the current
+  // project keeps running untouched here.
+  const doOpenAnother = async () => {
+    if (!openAnotherDialog) return;
+    setError(null);
+    setBusy(true);
+    try {
+      const res = await fetch("/api/spawn-instance", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: openAnotherDialog.target }),
+      });
+      if (!res.ok) {
+        let msg = `HTTP ${res.status}`;
+        try { msg = (await res.json()).error || msg; } catch {}
+        throw new Error(msg);
+      }
+      const data = await res.json();
+      window.open(data.url, "_blank");
+      setOpenAnotherDialog(null);
       onClose();
     } catch (e) {
       setError(e.message);
@@ -9941,6 +10750,19 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
               </div>
             </div>
           </button>
+          <button
+            onClick={() => setOpenAnotherDialog({ target: "" })}
+            disabled={busy}
+            className="w-full text-left px-3 py-2 hover:bg-amber-50 flex items-start gap-2 disabled:opacity-50"
+          >
+            <ExternalLink size={14} className="text-stone-700 mt-0.5 shrink-0" />
+            <div>
+              <div className="text-stone-900">{t("在新窗口打开其他项目", "Open another project in a new window")}</div>
+              <div className="text-[13px] text-stone-700 mt-0.5">
+                {t("同时运行另一个独立的项目，互不影响，当前项目保持打开", "Runs alongside this one as a fully independent instance — this project stays open, untouched")}
+              </div>
+            </div>
+          </button>
           <div className="border-t border-stone-200 my-1" />
           <button
             onClick={openPasswordDialog}
@@ -10151,15 +10973,23 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
             <label className="block text-sm uppercase tracking-wider text-stone-700 mb-1.5">
               {t("项目文件夹路径", "Project folder path")}
             </label>
-            <input
-              type="text"
-              autoFocus
-              value={newDialog.target}
-              onChange={(e) => setNewDialog({ target: e.target.value })}
-              onKeyDown={(e) => { if (e.key === "Enter") doNewProject(); }}
-              placeholder={exampleNew}
-              className="w-full px-2 py-1.5 text-base border border-stone-300 rounded font-mono mb-3"
-            />
+            <div className="flex gap-1.5 mb-3">
+              <input
+                type="text"
+                autoFocus
+                value={newDialog.target}
+                onChange={(e) => setNewDialog({ target: e.target.value })}
+                onKeyDown={(e) => { if (e.key === "Enter") doNewProject(); }}
+                placeholder={exampleNew}
+                className="flex-1 min-w-0 px-2 py-1.5 text-base border border-stone-300 rounded font-mono"
+              />
+              <button
+                onClick={() => setNewFolderBrowserOpen(true)}
+                className="shrink-0 px-3 py-1.5 text-sm border border-stone-300 rounded hover:bg-stone-50 text-stone-700"
+              >
+                {t("浏览…", "Browse…")}
+              </button>
+            </div>
             <div className="text-[13px] text-stone-700 mb-3 leading-snug">
               {t("文件夹须为空（或尚不存在）。DMS 将在该位置创建全新的空白文件库并切换至使用。", "The folder must be empty (or not exist yet). DMS will create a brand-new, empty document library there and switch to using it.")}
             </div>
@@ -10188,6 +11018,92 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
             </div>
           </div>
         </div>
+      )}
+
+      {newFolderBrowserOpen && newDialog && (
+        <FolderBrowserModal
+          startPath={newDialog.target || ""}
+          onClose={() => setNewFolderBrowserOpen(false)}
+          onSelect={(path) => {
+            setNewDialog({ target: path });
+            setNewFolderBrowserOpen(false);
+          }}
+        />
+      )}
+
+      {/* Open another project dialog */}
+      {openAnotherDialog && (
+        <div
+          className="fixed inset-0 bg-stone-900/70 z-50 flex items-center justify-center p-4"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="bg-white w-full max-w-md rounded shadow-2xl p-5">
+            <div className="text-[12px] tracking-[0.2em] uppercase text-stone-700 mb-1">
+              {t("新窗口", "New window")}
+            </div>
+            <h2 className="text-xl font-semibold text-stone-900 mb-3">
+              {t("在新窗口打开其他项目", "Open another project in a new window")}
+            </h2>
+
+            <label className="block text-sm uppercase tracking-wider text-stone-700 mb-1.5">
+              {t("项目文件夹路径", "Project folder path")}
+            </label>
+            <div className="flex gap-1.5 mb-3">
+              <input
+                type="text"
+                autoFocus
+                value={openAnotherDialog.target}
+                onChange={(e) => setOpenAnotherDialog({ target: e.target.value })}
+                onKeyDown={(e) => { if (e.key === "Enter") doOpenAnother(); }}
+                placeholder={exampleNew}
+                className="flex-1 min-w-0 px-2 py-1.5 text-base border border-stone-300 rounded font-mono"
+              />
+              <button
+                onClick={() => setOpenAnotherFolderBrowserOpen(true)}
+                className="shrink-0 px-3 py-1.5 text-sm border border-stone-300 rounded hover:bg-stone-50 text-stone-700"
+              >
+                {t("浏览…", "Browse…")}
+              </button>
+            </div>
+            <div className="text-[13px] text-stone-700 mb-3 leading-snug">
+              {t("已打开过这个项目时，会直接切换到那个已打开的窗口，而不会重复启动。这个项目文件夹可以是全新的，也可以是您已有的另一个项目。", "If this project is already open, DMS just switches to that existing window instead of starting a duplicate. The folder can be brand new, or an existing project of yours.")}
+            </div>
+
+            {error && (
+              <div className="text-sm text-red-700 bg-red-50 border border-red-200 rounded p-2 mb-3 whitespace-pre-wrap">
+                {error}
+              </div>
+            )}
+
+            <div className="flex gap-2 justify-end">
+              <button
+                onClick={() => { setOpenAnotherDialog(null); setError(null); }}
+                disabled={busy}
+                className="px-4 py-1.5 text-sm border border-stone-300 hover:bg-stone-100 rounded disabled:opacity-60"
+              >
+                {t("取消", "Cancel")}
+              </button>
+              <button
+                onClick={doOpenAnother}
+                disabled={busy || !openAnotherDialog.target.trim()}
+                className="px-4 py-1.5 text-sm bg-amber-600 hover:bg-amber-700 text-white rounded disabled:opacity-60"
+              >
+                {busy ? t("打开中…", "Opening…") : t("打开", "Open")}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {openAnotherFolderBrowserOpen && openAnotherDialog && (
+        <FolderBrowserModal
+          startPath={openAnotherDialog.target || ""}
+          onClose={() => setOpenAnotherFolderBrowserOpen(false)}
+          onSelect={(path) => {
+            setOpenAnotherDialog({ target: path });
+            setOpenAnotherFolderBrowserOpen(false);
+          }}
+        />
       )}
 
       {/* Password dialog */}
@@ -11225,6 +12141,22 @@ function DMS({ storagePath, onChangeFolder }) {
     setRecycleSelectedIds(new Set());
   }, [selectedId]);
 
+  // How the current folder's documents are ordered in the list. "name" (A-Z)
+  // is the default sort applied by enrichDocsForNode itself; the other three
+  // re-sort on top of that by a date field. Persisted across sessions like
+  // the other display prefs (sidebar width, etc.) since it's a "how I like
+  // to browse" setting, not per-folder state.
+  const [docSortBy, setDocSortBy] = useState(() => {
+    try {
+      const saved = localStorage.getItem("dms:doc-sort-by");
+      if (["name", "docDate", "dueDate", "uploadedAt"].includes(saved)) return saved;
+    } catch {}
+    return "name";
+  });
+  useEffect(() => {
+    try { localStorage.setItem("dms:doc-sort-by", docSortBy); } catch {}
+  }, [docSortBy]);
+
   // Bulk-download state — lets the user multi-select documents in a normal
   // folder and copy them to a folder on disk (defaults to the OS Downloads
   // folder). Mirrors the recycle-bin select-mode above but drives the
@@ -11237,6 +12169,95 @@ function DMS({ storagePath, onChangeFolder }) {
     setDownloadSelectMode(false);
     setDownloadSelectedIds(new Set());
   }, [selectedId]);
+
+  // AI batch-fill state — lets the user multi-select documents in a normal
+  // folder, pick one parameter, and have Gemini read that field's value
+  // directly off each selected document's page image(s) (same per-document
+  // call the viewer's "AI-extract" button uses, just looped). Results are
+  // shown in a review table — nothing is written until the user hits Apply,
+  // and a not-found/errored row defaults to unchecked so it's never
+  // silently overwritten. Mirrors downloadSelectMode's select-UI.
+  const [aiFillSelectMode, setAiFillSelectMode] = useState(false);
+  const [aiFillSelectedIds, setAiFillSelectedIds] = useState(new Set());
+  const [aiFillSettings, setAiFillSettings] = useState({ configured: false, library_installed: true });
+  // { key, customKey, running, done, total, rows, applying, appliedCount, error }
+  const [aiFillDialog, setAiFillDialog] = useState(null);
+  useEffect(() => {
+    setAiFillSelectMode(false);
+    setAiFillSelectedIds(new Set());
+  }, [selectedId]);
+
+  const openAiFillDialog = () => {
+    StorageAdapter.getAISettings().then(setAiFillSettings).catch(() => {});
+    setAiFillDialog({
+      key: keyParameters[0] || "", customKey: "",
+      running: false, done: 0, total: 0, rows: null,
+      applying: false, appliedCount: 0, error: "",
+    });
+  };
+
+  const runAiFillExtraction = async () => {
+    const docIds = Array.from(aiFillSelectedIds);
+    const key = (aiFillDialog?.customKey || "").trim() || (aiFillDialog?.key || "").trim();
+    if (!key || !docIds.length) return;
+    setAiFillDialog((d) => (d ? { ...d, running: true, error: "", rows: [], done: 0, total: docIds.length } : d));
+    const rows = [];
+    for (const docId of docIds) {
+      const doc = docIndexRef.current.find((e) => e.id === docId);
+      const name = doc?.name || docId;
+      let row;
+      try {
+        const r = await StorageAdapter.extractKeysAI(docId, [key]);
+        const res = (r.results && (r.results[key] || Object.values(r.results)[0])) || {};
+        row = {
+          docId, name,
+          found: !!res.found,
+          value: res.value || "", unit: res.unit || "", description: res.description || "",
+          apply: !!res.found, error: "",
+        };
+      } catch (e) {
+        row = { docId, name, found: false, value: "", unit: "", description: "", apply: false, error: e.message || String(e) };
+      }
+      rows.push(row);
+      setAiFillDialog((d) => (d ? { ...d, rows: [...rows], done: rows.length } : d));
+    }
+    setAiFillDialog((d) => (d ? { ...d, running: false } : d));
+  };
+
+  const toggleAiFillRowApply = (docId) => {
+    setAiFillDialog((d) => (d && d.rows
+      ? { ...d, rows: d.rows.map((r) => (r.docId === docId ? { ...r, apply: !r.apply } : r)) }
+      : d));
+  };
+
+  const applyAiFillResults = async () => {
+    if (!aiFillDialog || !aiFillDialog.rows) return;
+    const key = (aiFillDialog.customKey || "").trim() || (aiFillDialog.key || "").trim();
+    if (!key) return;
+    setAiFillDialog((d) => (d ? { ...d, applying: true } : d));
+    let appliedCount = 0;
+    for (const row of aiFillDialog.rows) {
+      if (!row.apply) continue;
+      const doc = docIndexRef.current.find((e) => e.id === row.docId);
+      const meta = { ...((doc && doc.metadata) || {}) };
+      const prev = meta[key];
+      const prevObj = (prev && typeof prev === "object")
+        ? prev
+        : { design: typeof prev === "string" ? prev : "", actual: "" };
+      // Same shape as DocumentViewer's saveParams: the extracted value lands
+      // in the "Actual (实测值)" slot, "Design / Req." is left untouched.
+      meta[key] = {
+        ...prevObj,
+        actual: row.found ? composeActualString(row.value, row.unit, row.description) : "NF",
+        value: row.value || "", unit: row.unit || "", description: row.description || "",
+      };
+      await updateDocMetadata(row.docId, meta);
+      appliedCount++;
+    }
+    setAiFillDialog((d) => (d ? { ...d, applying: false, appliedCount, rows: null } : d));
+    setAiFillSelectMode(false);
+    setAiFillSelectedIds(new Set());
+  };
 
   // Which document card shows the "working document" highlight — set
   // whenever an inline editor (rename/SN/due/doc-date/metadata) is opened
@@ -11339,6 +12360,13 @@ function DMS({ storagePath, onChangeFolder }) {
   // folder's subfolders as real DMS folders (no date-based routing) instead
   // of the default flat/year-month placement.
   const [mirrorSubfolders, setMirrorSubfolders] = useState(false);
+  // When checked in the "Upload folder" dialog: reproduce each picked
+  // folder verbatim under the current node — the picked folder itself
+  // becomes a new child folder, and every subfolder and file inside it is
+  // recreated at the same relative path. The matching directories are
+  // created on the local drive by the server's PUT /api/tree handler (see
+  // _create_local_folder_structure); the files upload into them normally.
+  const [keepSourceTree, setKeepSourceTree] = useState(false);
   const multiFolderInputRef = useRef(null);
   const [draggingId, setDraggingId] = useState(null);
   const [dropInfo, setDropInfo] = useState(null);
@@ -11963,8 +12991,20 @@ function DMS({ storagePath, onChangeFolder }) {
         }
       }
 
+      // computeFileHash() reads the whole file into memory (file.arrayBuffer())
+      // to hash it -- fine for a document, but for a multi-GB video that's a
+      // multi-GB in-memory buffer on top of the copy the browser is about to
+      // stream out in the upload itself. On a memory-constrained machine that
+      // was enough to crash/reload the tab mid-batch, which then surfaced as
+      // random "file(s) failed to upload" for whichever files were in flight
+      // at the time -- so skip it for large files; contentHash isn't consumed
+      // anywhere yet (duplicate detection above uses name+size instead, for
+      // the same memory-pressure reason).
+      const _HASH_MAX_BYTES = 200 * 1024 * 1024; // 200 MB
       let contentHash = null;
-      try { contentHash = await computeFileHash(file); } catch (_) {}
+      if (file.size <= _HASH_MAX_BYTES) {
+        try { contentHash = await computeFileHash(file); } catch (_) {}
+      }
 
       console.log(`[DMS] Processing file: ${file.name} (${file.size} bytes, ${file.type}) → ${docId}`);
       const _photoExts = new Set(["jpg","jpeg","png","heic","heif","tif","tiff","webp","gif","bmp"]);
@@ -12006,7 +13046,7 @@ function DMS({ storagePath, onChangeFolder }) {
         uploadResult = await StorageAdapter.saveDocument(doc) || {};
       } catch (e) {
         console.error("[DMS] ✗ saveDocument failed:", e);
-        failedFiles.push(file.name);
+        failedFiles.push(`${file.name} — ${e.message || e}`);
         setUploadStatus((s) => s ? { ...s, done: s.done + 1 } : s);
         continue;
       }
@@ -12118,18 +13158,25 @@ function DMS({ storagePath, onChangeFolder }) {
   // File carries a webkitRelativePath like "SourceFolder/sub1/sub2/x.pdf"),
   // resolve — creating as needed — the DMS folder each file belongs in, so
   // the source's subfolder structure is mirrored under baseNodeId exactly.
-  // The picked folder's own top-level name is never recreated as a folder:
-  // its direct contents merge straight into the already-selected node,
-  // only its *subfolders* become new DMS folders. No date-based routing is
-  // ever applied here (unlike the default "year-month" upload mode).
+  // No date-based routing is ever applied here (unlike the default
+  // "year-month" upload mode).
+  //
+  // keepTopLevel = false (default): the picked folder's own top-level name
+  //   is NOT recreated — its direct contents merge straight into the
+  //   already-selected node, only its *subfolders* become new DMS folders.
+  // keepTopLevel = true: the picked folder itself is recreated as a new
+  //   child folder of baseNodeId, and every file/subfolder lands under it,
+  //   so the whole source tree is reproduced verbatim under the current node.
   // Returns [updatedTree, Map<File, nodeId>].
-  const resolveMirroredTargets = (startTree, baseNodeId, files) => {
+  const resolveMirroredTargets = (startTree, baseNodeId, files, keepTopLevel = false) => {
     let workingTree = startTree;
     const pathToNodeId = new Map([["", baseNodeId]]);
     const fileNodeId = new Map();
     for (const file of files) {
       const parts = (file.webkitRelativePath || file.name).split("/");
-      const dirParts = parts.slice(1, -1); // drop the top-level source-folder name and the filename itself
+      const dirParts = keepTopLevel
+        ? parts.slice(0, -1)   // keep the top-level source-folder name, drop only the filename
+        : parts.slice(1, -1);  // drop the top-level source-folder name and the filename itself
       const key = dirParts.join("/");
       let nodeId = pathToNodeId.get(key);
       if (nodeId === undefined) {
@@ -12176,7 +13223,7 @@ function DMS({ storagePath, onChangeFolder }) {
   // used here, since this upload is split across several per-folder calls
   // afterward and would otherwise show one dialog per folder instead of one
   // for the whole operation).
-  const uploadFilesMirroringSubfolders = async (baseNodeId, files) => {
+  const uploadFilesMirroringSubfolders = async (baseNodeId, files, keepTopLevel = false) => {
     if (!files.length) return;
     if (!baseNodeId) {
       alert(t("请先在装配树中点击选择一个文件夹。", "Please click to select a folder in the assembly tree first."));
@@ -12192,7 +13239,7 @@ function DMS({ storagePath, onChangeFolder }) {
       }
     }
 
-    const [mirroredTree, fileNodeId] = resolveMirroredTargets(tree, baseNodeId, files);
+    const [mirroredTree, fileNodeId] = resolveMirroredTargets(tree, baseNodeId, files, keepTopLevel);
 
     if (duplicates.length > 0) {
       setDupDialog({ duplicates, allFiles: files, targetNodeId: baseNodeId, mirror: { tree: mirroredTree, fileNodeId } });
@@ -12230,6 +13277,7 @@ function DMS({ storagePath, onChangeFolder }) {
     if (!selectedNode) { alert(t("请先在装配树中点击选择一个文件夹。", "Please click to select a folder in the assembly tree first.")); return; }
     setPendingFolderFiles([]);
     setMirrorSubfolders(false);
+    setKeepSourceTree(false);
     setFolderPickerOpen(true);
   };
 
@@ -12258,11 +13306,18 @@ function DMS({ storagePath, onChangeFolder }) {
     const allFiles = pendingFolderFiles.flatMap((f) => f.files);
     if (!allFiles.length) return;
     const useMirror = mirrorSubfolders;
+    const useKeepSourceTree = keepSourceTree;
     setFolderPickerOpen(false);
     setPendingFolderFiles([]);
     setMirrorSubfolders(false);
+    setKeepSourceTree(false);
     try {
-      if (useMirror) {
+      if (useKeepSourceTree) {
+        // Reproduce the picked folder(s) verbatim under the current node:
+        // the source folder itself becomes a new child folder, with every
+        // subfolder and file recreated at the same relative path.
+        await uploadFilesMirroringSubfolders(selectedId, allFiles, true);
+      } else if (useMirror) {
         await uploadFilesMirroringSubfolders(selectedId, allFiles);
       } else {
         await uploadFilesToNode(selectedId, allFiles);
@@ -12317,15 +13372,53 @@ function DMS({ storagePath, onChangeFolder }) {
     }
   };
 
-  const handlePanelDrop = (e) => {
-    if (e.dataTransfer.files.length !== 0) {
-      e.preventDefault();
-      if (!selectedId) {
-        alert(t("请先在左侧目录树中点击选择一个文件夹，再拖入文件。", "Please click to select a folder in the tree on the left before dropping files."));
+  const handlePanelDrop = async (e) => {
+    if (e.dataTransfer.files.length === 0) return;
+    e.preventDefault();
+    if (!selectedId) {
+      alert(t("请先在左侧目录树中点击选择一个文件夹，再拖入文件。", "Please click to select a folder in the tree on the left before dropping files."));
+      return;
+    }
+    const items = e.dataTransfer.items;
+    const canWalk = items && items.length > 0 &&
+      Array.from(items).every((it) => it.kind === "file" && typeof it.webkitGetAsEntry === "function");
+    if (canWalk) {
+      const { files, hasDirectory } = await readDroppedItems(items);
+      if (hasDirectory) {
+        // At least one dropped item was a real folder -- route it through the
+        // same "Upload folder" confirmation dialog the picker button uses, so
+        // the user still gets to choose whether subfolders are mirrored.
+        const junkFileNames = new Set([".ds_store", "thumbs.db", "desktop.ini"]);
+        const clean = files.filter((f) => !junkFileNames.has(f.name.toLowerCase()));
+        if (!clean.length) {
+          alert(t("所选文件夹中未找到文件。", "No files were found in the selected folder."));
+          return;
+        }
+        const grouped = new Map(); // folderName -> File[]
+        for (const f of clean) {
+          const folderName = (f.webkitRelativePath || f.name).split("/")[0];
+          if (!grouped.has(folderName)) grouped.set(folderName, []);
+          grouped.get(folderName).push(f);
+        }
+        setPendingFolderFiles((prev) => {
+          const existingNames = new Set(prev.map((g) => g.folderName));
+          const additions = [...grouped.entries()]
+            .filter(([name]) => !existingNames.has(name))
+            .map(([folderName, fs]) => ({ folderName, files: fs }));
+          if (additions.length < grouped.size) {
+            alert(t("部分文件夹已添加，已跳过重复项。", "Some folders were already added and were skipped."));
+          }
+          return [...prev, ...additions];
+        });
+        setMirrorSubfolders(false);
+        setKeepSourceTree(false);
+        setFolderPickerOpen(true);
         return;
       }
-      uploadFilesToNode(selectedId, Array.from(e.dataTransfer.files), { routeMode: "current-folder" });
+      uploadFilesToNode(selectedId, files, { routeMode: "current-folder" });
+      return;
     }
+    uploadFilesToNode(selectedId, Array.from(e.dataTransfer.files), { routeMode: "current-folder" });
   };
 
   // The single choke point every "open this document" action goes through
@@ -12336,6 +13429,15 @@ function DMS({ storagePath, onChangeFolder }) {
     const meta = docIndex.find((d) => d.id === docId);
     if (!meta) return;
     setLastWorkedDocId(docId);
+    // Types the in-app viewer can't actually render inline (video, Office
+    // docs, zip, ...) get opened in the native app too, alongside the
+    // viewer -- not instead of it. The viewer itself still opens (its
+    // preview pane just falls back to "Download to open"), so its toolbar
+    // -- Add description, View map location, Ask AI, Download, Close --
+    // stays available exactly as it is for a previewable file.
+    if (!isInlinePreviewable(meta)) {
+      openDocNative(docId);
+    }
     setViewerDoc({
       id: docId,
       name: meta.name,
@@ -12516,7 +13618,15 @@ function DMS({ storagePath, onChangeFolder }) {
         // folder-specific vs shared.
         return { ...base, metadata: effectiveMetadata(base.metadata, override), _baseMetadata: base.metadata || {} };
       })
-      .filter(Boolean);
+      .filter(Boolean)
+      // Always show a folder's documents A-Z by name, rather than upload
+      // order -- `node.documents` itself stays in insertion order (nothing
+      // else depends on display order), this just sorts at render time so
+      // renames/new uploads/re-links all settle into place automatically,
+      // with no separate "sort now" step for the user. `numeric: true` also
+      // orders embedded numbers naturally (file2 before file10), matching
+      // Finder/Explorer's own A-Z sort.
+      .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }));
   };
 
   // Documents that exist in the index but aren't referenced by any node.
@@ -12920,6 +14030,21 @@ function DMS({ storagePath, onChangeFolder }) {
     setViewerDoc((cur) => (cur && cur.id === docId ? { ...cur, metadata } : cur));
   };
 
+  // Save a block of viewer side-panel text (description / OCR output / AI
+  // answer) as a brand-new .txt document filed into the same folder, then
+  // reload the tree + index so it shows up in the folder immediately.
+  const handleSaveTextAsDoc = async (docId, opts) => {
+    const res = await StorageAdapter.saveTextAsDoc(docId, {
+      ...opts,
+      nodeId: opts.nodeId || selectedId || null,
+    });
+    const { tree: freshTree } = await StorageAdapter.getTree();
+    if (freshTree) setTree(freshTree);
+    const freshIndex = await StorageAdapter.listDocumentIndex();
+    setDocIndex(freshIndex);
+    return res;
+  };
+
   // Persist a user-written description/caption into the doc index so it
   // becomes searchable. Index-only update, like OCR text.
   const handleSaveDescription = async (docId, description) => {
@@ -12955,10 +14080,38 @@ function DMS({ storagePath, onChangeFolder }) {
   };
 
   const isRecycleBinNode = !!(selectedNode && selectedNode.name === NOT_SHOW_FOLDER);
+  // Re-sort a folder's (already A-Z) document list by the user's chosen
+  // field ("docSortBy" state, set from the dropdown in the toolbar below).
+  // Date-like fields are "YYYY-MM-DD" strings, safe to compare
+  // lexicographically; docs missing the field always sort to the end in
+  // either direction, rather than clustering wherever "" happens to land.
+  const sortDocsForDisplay = (docs, sortBy) => {
+    if (sortBy === "name") return docs; // enrichDocsForNode already sorts A-Z
+    const fieldFor = {
+      docDate: (d) => d.docDate || "",
+      dueDate: (d) => d.dueDate || "",
+      uploadedAt: (d) => d.uploadedAt || "",
+    }[sortBy];
+    if (!fieldFor) return docs;
+    // dueDate: soonest first -- matches the urgency color-coding elsewhere.
+    // docDate / uploadedAt (date modified): most recent first.
+    const ascending = sortBy === "dueDate";
+    return [...docs].sort((a, b) => {
+      const va = fieldFor(a), vb = fieldFor(b);
+      if (!va && !vb) return 0;
+      if (!va) return 1;
+      if (!vb) return -1;
+      return ascending ? va.localeCompare(vb) : vb.localeCompare(va);
+    });
+  };
+
   // Same doc list + filter the main panel renders below — shared so
   // "select all" always matches exactly what's visible on screen.
   const visibleDocs = selectedNode
-    ? enrichDocsForNode(selectedNode).filter((doc) => !personDocIds || personDocIds.has(doc.id))
+    ? sortDocsForDisplay(
+        enrichDocsForNode(selectedNode).filter((doc) => !personDocIds || personDocIds.has(doc.id)),
+        docSortBy
+      )
     : [];
 
   if (loading) {
@@ -13678,17 +14831,45 @@ function DMS({ storagePath, onChangeFolder }) {
                   </div>
                 )}
 
+                {!isRecycleBinNode && (selectedNode.documents || []).length > 1 && (
+                  <div className="flex items-center gap-2 mb-2 px-1">
+                    <label className="text-[12px] text-stone-700">
+                      {t("排序：", "Sort by:")}
+                    </label>
+                    <select
+                      value={docSortBy}
+                      onChange={(e) => setDocSortBy(e.target.value)}
+                      title={t("选择文档列表的排序方式", "Choose how the document list is ordered")}
+                      className="text-[13px] border border-stone-300 rounded px-1.5 py-1 bg-white hover:border-amber-400 focus:outline-none focus:border-amber-500"
+                    >
+                      <option value="name">{t("名称 (A–Z)", "Name (A–Z)")}</option>
+                      <option value="docDate">{t("日期（元数据）", "Date (metadata)")}</option>
+                      <option value="dueDate">{t("到期日（元数据）", "Due (metadata)")}</option>
+                      <option value="uploadedAt">{t("修改日期", "Date modified")}</option>
+                    </select>
+                  </div>
+                )}
+
                 {!isRecycleBinNode && (selectedNode.documents || []).length > 0 && (
                   <div className="flex items-center justify-between mb-3 px-3 py-2 border border-stone-300 rounded bg-stone-50">
                     <div className="flex items-center gap-2">
-                      {!downloadSelectMode ? (
-                        <button
-                          onClick={() => { setDownloadSelectMode(true); setDownloadSelectedIds(new Set()); }}
-                          className="text-sm px-3 py-1.5 border border-stone-300 hover:bg-amber-50 hover:border-amber-400 text-stone-700 rounded flex items-center gap-1.5"
-                        >
-                          <CheckSquare size={12} /> {t("多选", "Select")}
-                        </button>
-                      ) : (
+                      {!downloadSelectMode && !aiFillSelectMode ? (
+                        <>
+                          <button
+                            onClick={() => { setDownloadSelectMode(true); setDownloadSelectedIds(new Set()); }}
+                            className="text-sm px-3 py-1.5 border border-stone-300 hover:bg-amber-50 hover:border-amber-400 text-stone-700 rounded flex items-center gap-1.5"
+                          >
+                            <CheckSquare size={12} /> {t("多选", "Select")}
+                          </button>
+                          <button
+                            onClick={() => { setAiFillSelectMode(true); setAiFillSelectedIds(new Set()); }}
+                            className="text-sm px-3 py-1.5 border border-purple-300 hover:bg-purple-50 hover:border-purple-400 text-purple-700 rounded flex items-center gap-1.5"
+                            title={t("批量选择多份文档，用 AI 从中读取某个参数的值并填入", "Multi-select documents and have AI read one parameter's value off each, to fill in")}
+                          >
+                            <Sparkles size={12} /> {t("AI 填参数", "AI-fill parameter")}
+                          </button>
+                        </>
+                      ) : downloadSelectMode ? (
                         <>
                           <button
                             onClick={() => setDownloadSelectedIds(new Set(visibleDocs.map((d) => d.id)))}
@@ -13700,6 +14881,20 @@ function DMS({ storagePath, onChangeFolder }) {
                           >{t("清除", "Clear")}</button>
                           <span className="text-[13px] text-stone-700">
                             {t(`已选 ${downloadSelectedIds.size} / ${visibleDocs.length}`, `${downloadSelectedIds.size} / ${visibleDocs.length} selected`)}
+                          </span>
+                        </>
+                      ) : (
+                        <>
+                          <button
+                            onClick={() => setAiFillSelectedIds(new Set(visibleDocs.map((d) => d.id)))}
+                            className="text-sm px-3 py-1.5 border border-purple-300 hover:bg-purple-50 hover:border-purple-400 text-purple-700 rounded"
+                          >{t("全选", "Select all")}</button>
+                          <button
+                            onClick={() => setAiFillSelectedIds(new Set())}
+                            className="text-sm px-3 py-1.5 border border-stone-300 hover:bg-stone-100 text-stone-700 rounded"
+                          >{t("清除", "Clear")}</button>
+                          <span className="text-[13px] text-stone-700">
+                            {t(`已选 ${aiFillSelectedIds.size} / ${visibleDocs.length}`, `${aiFillSelectedIds.size} / ${visibleDocs.length} selected`)}
                           </span>
                         </>
                       )}
@@ -13731,6 +14926,24 @@ function DMS({ storagePath, onChangeFolder }) {
                           title={t("从此文件夹移除选中的文档（无其他链接的会移至回收站，文件不会丢失）", "Remove the selected documents from this folder (any with no other links move to the recycle bin — files aren't lost)")}
                         >
                           <Trash2 size={12} /> {t("删除", "Delete")} ({downloadSelectedIds.size})
+                        </button>
+                      </div>
+                    )}
+                    {aiFillSelectMode && (
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => { setAiFillSelectMode(false); setAiFillSelectedIds(new Set()); }}
+                          className="text-sm px-3 py-1.5 border border-stone-300 hover:bg-stone-100 text-stone-700 rounded flex items-center gap-1.5"
+                        >
+                          <X size={12} /> {t("取消", "Cancel")}
+                        </button>
+                        <button
+                          onClick={openAiFillDialog}
+                          disabled={aiFillSelectedIds.size === 0}
+                          className="text-sm px-3 py-1.5 border border-purple-400 bg-purple-50 hover:bg-purple-100 text-purple-700 rounded flex items-center gap-1.5 disabled:opacity-40"
+                          title={t("选择要提取的参数，AI 会逐份读取选中文档并给出结果供你确认后再写入", "Pick a parameter — AI reads each selected document and shows results for you to confirm before anything is written")}
+                        >
+                          <Sparkles size={12} /> {t("AI 提取所选", "AI-extract selected")} ({aiFillSelectedIds.size})
                         </button>
                       </div>
                     )}
@@ -13773,9 +14986,13 @@ function DMS({ storagePath, onChangeFolder }) {
                           n.has(doc.id) ? n.delete(doc.id) : n.add(doc.id);
                           return n;
                         })}
-                        selectMode={isRecycleBinNode ? recycleSelectMode : downloadSelectMode}
-                        selected={isRecycleBinNode ? recycleSelectedIds.has(doc.id) : downloadSelectedIds.has(doc.id)}
-                        onToggleSelect={() => (isRecycleBinNode ? setRecycleSelectedIds : setDownloadSelectedIds)((prev) => {
+                        selectMode={isRecycleBinNode ? recycleSelectMode : (downloadSelectMode || aiFillSelectMode)}
+                        selected={isRecycleBinNode ? recycleSelectedIds.has(doc.id)
+                          : aiFillSelectMode ? aiFillSelectedIds.has(doc.id)
+                          : downloadSelectedIds.has(doc.id)}
+                        onToggleSelect={() => (isRecycleBinNode ? setRecycleSelectedIds
+                          : aiFillSelectMode ? setAiFillSelectedIds
+                          : setDownloadSelectedIds)((prev) => {
                           const n = new Set(prev);
                           n.has(doc.id) ? n.delete(doc.id) : n.add(doc.id);
                           return n;
@@ -13808,7 +15025,10 @@ function DMS({ storagePath, onChangeFolder }) {
         onSaveLocalParams={handleSaveLocalParams}
         onSaveParams={handleSaveParams}
         onSaveDescription={handleSaveDescription}
+        onSaveTextAsDoc={handleSaveTextAsDoc}
+        derivedDocs={viewerDoc ? docIndex.filter((e) => e.derivedFrom === viewerDoc.id) : []}
         onOpenAISettings={() => setShowAISettings(true)}
+        nodeId={selectedId}
       />
 
       <FaceTaggingDialog
@@ -14037,7 +15257,7 @@ function DMS({ storagePath, onChangeFolder }) {
       />
 
       {folderPickerOpen && (
-        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center" onClick={(e) => { if (e.target === e.currentTarget) { setFolderPickerOpen(false); setPendingFolderFiles([]); setMirrorSubfolders(false); } }}>
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center" onClick={(e) => { if (e.target === e.currentTarget) { setFolderPickerOpen(false); setPendingFolderFiles([]); setMirrorSubfolders(false); setKeepSourceTree(false); } }}>
           <div className="bg-white rounded-lg shadow-xl p-6 w-96 flex flex-col gap-4">
             <h3 className="font-semibold text-base text-stone-800">{t("上传多个文件夹", "Upload multiple folders")}</h3>
             <div className="min-h-[80px] space-y-1.5">
@@ -14057,10 +15277,11 @@ function DMS({ storagePath, onChangeFolder }) {
               {t("+ 添加文件夹", "+ Add folder")}
               <input ref={multiFolderInputRef} type="file" webkitdirectory="" multiple onChange={handleMultiFolderPickerChange} className="hidden" />
             </label>
-            <label className="flex items-start gap-2 text-sm text-stone-700 border border-stone-200 rounded px-3 py-2 bg-stone-50 cursor-pointer">
+            <label className={`flex items-start gap-2 text-sm border border-stone-200 rounded px-3 py-2 bg-stone-50 ${keepSourceTree ? "opacity-40 cursor-not-allowed" : "text-stone-700 cursor-pointer"}`}>
               <input
                 type="checkbox"
-                checked={mirrorSubfolders}
+                checked={mirrorSubfolders && !keepSourceTree}
+                disabled={keepSourceTree}
                 onChange={(e) => setMirrorSubfolders(e.target.checked)}
                 className="accent-amber-600 mt-0.5"
               />
@@ -14071,14 +15292,28 @@ function DMS({ storagePath, onChangeFolder }) {
                 </span>
               </span>
             </label>
+            <label className="flex items-start gap-2 text-sm text-stone-700 border border-stone-200 rounded px-3 py-2 bg-stone-50 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={keepSourceTree}
+                onChange={(e) => setKeepSourceTree(e.target.checked)}
+                className="accent-amber-600 mt-0.5"
+              />
+              <span>
+                {t("在当前文件夹下重建所选文件夹（含子文件夹和文件）", "Recreate the picked folder under the current folder (with its subfolders and files)")}
+                <span className="block text-[12px] text-stone-600 mt-0.5">
+                  {t("所选文件夹本身会成为当前文件夹下的新子文件夹，其全部子文件夹按原样重建，文件也上传到对应的文件夹中；并在本地磁盘同步创建目录。", "The picked folder itself becomes a new subfolder of the current folder; every subfolder is recreated as-is and each file is uploaded into its matching folder. The directories are also created on the local drive.")}
+                </span>
+              </span>
+            </label>
             <div className="flex justify-end gap-2">
-              <button onClick={() => { setFolderPickerOpen(false); setPendingFolderFiles([]); setMirrorSubfolders(false); }} className="text-sm px-3 py-1.5 rounded border border-stone-300 hover:bg-stone-50 text-stone-700">{t("取消", "Cancel")}</button>
+              <button onClick={() => { setFolderPickerOpen(false); setPendingFolderFiles([]); setMirrorSubfolders(false); setKeepSourceTree(false); }} className="text-sm px-3 py-1.5 rounded border border-stone-300 hover:bg-stone-50 text-stone-700">{t("取消", "Cancel")}</button>
               <button
                 onClick={handleMultiFolderUpload}
                 disabled={pendingFolderFiles.length === 0}
                 className="text-sm px-3 py-1.5 rounded bg-amber-600 hover:bg-amber-700 text-white disabled:opacity-40 disabled:cursor-not-allowed"
               >
-                {t("上传", "Upload")} {pendingFolderFiles.length > 0 ? t(`(${pendingFolderFiles.flatMap((f) => f.files).length} 个文件)`, `(${pendingFolderFiles.flatMap((f) => f.files).length} files)`) : ""}
+                {`${t("上传", "Upload")} ${pendingFolderFiles.length > 0 ? t(`(${pendingFolderFiles.flatMap((f) => f.files).length} 个文件)`, `(${pendingFolderFiles.flatMap((f) => f.files).length} files)`) : ""}`}
               </button>
             </div>
           </div>
@@ -14142,6 +15377,147 @@ function DMS({ storagePath, onChangeFolder }) {
                 <Download size={12} /> {downloadDialog.busy ? t("下载中…", "Downloading…") : t("下载", "Download")}
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {aiFillDialog && (
+        <div
+          className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center"
+          onClick={(e) => { if (e.target === e.currentTarget && !aiFillDialog.running && !aiFillDialog.applying) setAiFillDialog(null); }}
+        >
+          <div className="bg-white rounded-lg shadow-xl p-6 w-[36rem] max-h-[85vh] flex flex-col gap-3">
+            <h3 className="font-semibold text-base text-stone-800 flex items-center gap-1.5">
+              <Sparkles size={15} className="text-purple-600" />
+              {t(`AI 提取参数 — ${aiFillSelectedIds.size} 份文档`, `AI-extract parameter — ${aiFillSelectedIds.size} document(s)`)}
+            </h3>
+
+            {aiFillDialog.appliedCount > 0 && aiFillDialog.rows === null ? (
+              <>
+                <div className="text-sm text-green-700 bg-green-50 border border-green-200 rounded px-3 py-2">
+                  {t(`已将 “${aiFillDialog.customKey.trim() || aiFillDialog.key}” 写入 ${aiFillDialog.appliedCount} 份文档。`,
+                     `Wrote "${aiFillDialog.customKey.trim() || aiFillDialog.key}" into ${aiFillDialog.appliedCount} document(s).`)}
+                </div>
+                <div className="flex justify-end">
+                  <button
+                    onClick={() => setAiFillDialog(null)}
+                    className="text-sm px-3 py-1.5 rounded bg-purple-600 hover:bg-purple-700 text-white"
+                  >{t("完成", "Done")}</button>
+                </div>
+              </>
+            ) : aiFillDialog.rows === null ? (
+              <>
+                {!aiFillSettings.configured && (
+                  <div className="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded px-3 py-2 flex items-center justify-between gap-2">
+                    {t("需要先配置 Gemini API Key 才能使用 AI 提取。", "AI extraction needs a Gemini API Key configured first.")}
+                    <button
+                      onClick={() => { setAiFillDialog(null); setShowAISettings(true); }}
+                      className="shrink-0 text-purple-700 hover:underline"
+                    >{t("去配置", "Configure")}</button>
+                  </div>
+                )}
+                <label className="text-sm text-stone-700">
+                  {t("要提取的参数", "Parameter to extract")}
+                  <select
+                    value={aiFillDialog.key}
+                    onChange={(e) => setAiFillDialog((d) => ({ ...d, key: e.target.value, customKey: "" }))}
+                    className="mt-1 w-full text-sm px-2 py-1.5 border border-stone-300 rounded"
+                  >
+                    {keyParameters.map((k) => <option key={k} value={k}>{k}</option>)}
+                  </select>
+                </label>
+                <label className="text-sm text-stone-700">
+                  {t("或输入一个不在列表中的参数名", "Or type a parameter name not in the list above")}
+                  <input
+                    type="text"
+                    value={aiFillDialog.customKey}
+                    onChange={(e) => setAiFillDialog((d) => ({ ...d, customKey: e.target.value }))}
+                    placeholder={t("例如：额定电压", "e.g. Rated Voltage")}
+                    className="mt-1 w-full text-sm px-2 py-1.5 border border-stone-300 rounded"
+                  />
+                </label>
+                <p className="text-[13px] text-stone-500">
+                  {t("AI 会逐份读取所选文档的页面图像来查找该参数的值（无需与文档中的文字完全一致），结果会先给你确认，再写入「实测值」。",
+                     "AI reads each selected document's page image to find that parameter's value (it doesn't need to match the document's wording exactly) — results are shown for you to confirm before anything is written into \"Actual\".")}
+                </p>
+                {aiFillDialog.error && (
+                  <div className="text-sm text-red-600 bg-red-50 border border-red-200 rounded px-2 py-1.5">{aiFillDialog.error}</div>
+                )}
+                <div className="flex justify-end gap-2 mt-1">
+                  <button
+                    onClick={() => setAiFillDialog(null)}
+                    className="text-sm px-3 py-1.5 rounded border border-stone-300 hover:bg-stone-50 text-stone-700"
+                  >{t("取消", "Cancel")}</button>
+                  <button
+                    onClick={runAiFillExtraction}
+                    disabled={!aiFillSettings.configured || !((aiFillDialog.customKey || aiFillDialog.key || "").trim())}
+                    className="text-sm px-3 py-1.5 rounded bg-purple-600 hover:bg-purple-700 text-white disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5"
+                  >
+                    <Sparkles size={12} /> {t("开始提取", "Start extraction")}
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                {aiFillDialog.running && (
+                  <div className="text-sm text-stone-600 flex items-center gap-1.5">
+                    <Loader size={13} className="animate-spin" />
+                    {t(`正在提取 ${aiFillDialog.done} / ${aiFillDialog.total}…`, `Extracting ${aiFillDialog.done} / ${aiFillDialog.total}…`)}
+                  </div>
+                )}
+                <div className="flex-1 min-h-0 overflow-y-auto border border-stone-200 rounded divide-y divide-stone-100">
+                  {aiFillDialog.rows.map((row) => (
+                    <label
+                      key={row.docId}
+                      className={`flex items-start gap-2 px-3 py-2 text-sm cursor-pointer ${row.apply ? "bg-purple-50/40" : ""}`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={row.apply}
+                        onChange={() => toggleAiFillRowApply(row.docId)}
+                        className="accent-purple-600 mt-0.5"
+                      />
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate text-stone-800" title={row.name}>{row.name}</div>
+                        {row.error ? (
+                          <div className="text-[13px] text-red-600">{row.error}</div>
+                        ) : row.found ? (
+                          <div className="text-[13px] text-green-700">
+                            {composeActualString(row.value, row.unit, row.description) || t("(空值)", "(empty)")}
+                          </div>
+                        ) : (
+                          <div className="text-[13px] text-stone-500">{t("未找到", "Not found")}</div>
+                        )}
+                      </div>
+                    </label>
+                  ))}
+                  {aiFillDialog.running && aiFillDialog.done < aiFillDialog.total && (
+                    <div className="px-3 py-2 text-[13px] text-stone-400">{t("处理中…", "Working…")}</div>
+                  )}
+                </div>
+                <div className="flex items-center justify-between gap-2 mt-1">
+                  <span className="text-[13px] text-stone-500">
+                    {t(`将写入 ${aiFillDialog.rows.filter((r) => r.apply).length} 份文档`, `Will write to ${aiFillDialog.rows.filter((r) => r.apply).length} document(s)`)}
+                  </span>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => setAiFillDialog(null)}
+                      disabled={aiFillDialog.applying}
+                      className="text-sm px-3 py-1.5 rounded border border-stone-300 hover:bg-stone-50 text-stone-700 disabled:opacity-40"
+                    >{t("取消", "Cancel")}</button>
+                    <button
+                      onClick={applyAiFillResults}
+                      disabled={aiFillDialog.running || aiFillDialog.applying || aiFillDialog.rows.filter((r) => r.apply).length === 0}
+                      className="text-sm px-3 py-1.5 rounded bg-purple-600 hover:bg-purple-700 text-white disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5"
+                    >
+                      {aiFillDialog.applying
+                        ? (<><Loader size={13} className="animate-spin" /> {t("写入中…", "Applying…")}</>)
+                        : (<><Save size={12} /> {t("应用", "Apply")}</>)}
+                    </button>
+                  </div>
+                </div>
+              </>
+            )}
           </div>
         </div>
       )}

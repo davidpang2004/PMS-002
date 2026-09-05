@@ -28,7 +28,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, PageBreak, Table, TableStyle,
+    SimpleDocTemplate, Paragraph, Spacer, PageBreak, Table, TableStyle, HRFlowable,
 )
 
 PAGE_W, PAGE_H = letter
@@ -607,6 +607,71 @@ def build_databook(
     out = io.BytesIO()
     writer.write(out)
     return out.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Per-document AI Q&A log — rendered as a PDF (see /api/docs/<id>/ask in
+# dms_server.py). Unlike the merged-document flow above, this has no source
+# PDF to merge; it's a plain platypus document, closer to _build_cover_pdf.
+# ---------------------------------------------------------------------------
+def build_qa_log_pdf(doc_name: str, entries: list[dict]) -> bytes:
+    """Render a document's running AI Q&A history as a PDF.
+
+    entries: [{"timestamp": str, "model": str, "question": str, "answer": str}, ...]
+    in the order they should appear (oldest first). PDF isn't append-friendly,
+    so the caller (post_doc_ask) keeps this entry list as the source of truth
+    on the log document's docIndex entry and calls this to rebuild the whole
+    file from scratch each time a new question is answered — the same
+    "read the structured history, add one row, rewrite the file" pattern
+    used for the Excel plot-snapshot history, just with a PDF renderer
+    instead of openpyxl.
+    """
+    _init_fonts()
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=letter,
+        leftMargin=MARGIN, rightMargin=MARGIN,
+        topMargin=MARGIN, bottomMargin=MARGIN,
+        title=f"AI Q&A — {doc_name}",
+    )
+
+    styles = getSampleStyleSheet()
+    h_title = ParagraphStyle(
+        "QATitle", parent=styles["Normal"],
+        fontName=_FONT_BOLD, fontSize=16, leading=20, textColor=black, spaceAfter=12,
+    )
+    h_meta = ParagraphStyle(
+        "QAMeta", parent=styles["Normal"],
+        fontName=_FONT, fontSize=9, leading=12, textColor=SUBTLE, spaceAfter=4,
+    )
+    p_q = ParagraphStyle(
+        "QAQ", parent=styles["Normal"],
+        fontName=_FONT_BOLD, fontSize=10.5, leading=15, textColor=black, spaceAfter=3,
+    )
+    p_a = ParagraphStyle(
+        "QAA", parent=styles["Normal"],
+        fontName=_FONT, fontSize=10.5, leading=15, textColor=black, spaceAfter=6,
+    )
+
+    def _para_text(s: str) -> str:
+        # Escape first, then turn newlines into <br/> -- Paragraph markup
+        # doesn't treat "\n" as a line break on its own.
+        return _escape(s).replace("\n", "<br/>")
+
+    story: list = [Paragraph(_escape(f"AI Q&A — {doc_name}"), h_title)]
+
+    if not entries:
+        story.append(Paragraph("(no questions asked yet)", h_meta))
+    for i, e in enumerate(entries):
+        if i > 0:
+            story.append(HRFlowable(width="100%", thickness=0.5, color=BORDER, spaceBefore=6, spaceAfter=10))
+        meta_bits = " · ".join(filter(None, [e.get("timestamp", ""), e.get("model", "")]))
+        story.append(Paragraph(_escape(meta_bits), h_meta))
+        story.append(Paragraph("Q: " + _para_text(e.get("question", "")), p_q))
+        story.append(Paragraph("A: " + _para_text(e.get("answer", "")), p_a))
+
+    doc.build(story)
+    return buf.getvalue()
 
 
 def _build_missing_doc_pdf(doc: dict, error: str = "File not found on disk") -> bytes:

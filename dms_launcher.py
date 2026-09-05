@@ -162,7 +162,7 @@ logging.getLogger("waitress").setLevel(logging.ERROR)
 # ---------------------------------------------------------------------------
 # Find an open port
 # ---------------------------------------------------------------------------
-def find_free_port(start: int = 8000, end: int = 8050) -> int:
+def find_free_port(start: int = 8765, end: int = 8815) -> int:
     for p in range(start, end):
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -171,6 +171,78 @@ def find_free_port(start: int = 8000, end: int = 8050) -> int:
         except OSError:
             continue
     raise RuntimeError(f"No free port available in {start}–{end}")
+
+
+# ---------------------------------------------------------------------------
+# Multi-instance registry — lets several projects run concurrently, each its
+# own OS process on its own port, while still reusing an already-open
+# instance when relaunched for the *same* project (today's single-instance
+# "already running" behavior, now scoped per project instead of globally).
+# ---------------------------------------------------------------------------
+_INSTANCES_PATH = Path.home() / ".pms_dms_instances.json"
+# Same file dms_server.py's CONFIG_PATH points at (kept as a plain literal
+# here, not an import, since this runs before Flask/dms_server are loaded —
+# see the "check before importing Flask" comment below).
+_SHARED_CONFIG_PATH = Path.home() / ".pms_dms_config.json"
+
+
+def _probe_port(port: int, connect_timeout: float = 0.5, http_timeout: float = 2) -> bool:
+    """True if a healthy DMS instance answers on 127.0.0.1:port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(connect_timeout)
+        try:
+            s.connect(("127.0.0.1", port))
+        except OSError:
+            return False  # nothing listening there
+    import urllib.request as _req
+    try:
+        with _req.urlopen(f"http://127.0.0.1:{port}/", timeout=http_timeout) as resp:
+            return resp.status == 200
+    except Exception:
+        return False  # port bound but not a responsive DMS instance
+
+
+def _load_instances() -> dict:
+    import json
+    try:
+        return json.loads(_INSTANCES_PATH.read_text())
+    except Exception:
+        return {}
+
+
+def _save_instances(reg: dict) -> None:
+    import json
+    try:
+        _INSTANCES_PATH.write_text(json.dumps(reg, indent=2))
+    except Exception:
+        pass
+
+
+def _prune_dead_instances(reg: dict) -> dict:
+    """Drop entries whose port no longer answers (crashed/killed instances).
+
+    A launch racing another launch for the same brand-new project path is a
+    low-probability, human-timescale race — accepted here rather than
+    guarded with a lock file, same risk/cost tradeoff as this app already
+    makes for SECRET_KEY_PATH's lazy first-time creation.
+    """
+    return {path: info for path, info in reg.items() if _probe_port(info.get("port", 0))}
+
+
+def _resolve_default_project_path() -> str:
+    """Best-effort read of the shared config's storage_path.
+
+    Duplicates the trivial part of dms_server.load_config()/get_storage_root()
+    rather than importing dms_server, to keep this on the same "resolve
+    everything before touching Flask" footing the old single-instance guard
+    used.
+    """
+    import json
+    try:
+        cfg = json.loads(_SHARED_CONFIG_PATH.read_text())
+        return (cfg.get("storage_path") or "").strip()
+    except Exception:
+        return ""
 
 
 def get_all_local_ips() -> list[tuple[str, str]]:
@@ -250,10 +322,55 @@ def get_local_ip() -> str:
         return "127.0.0.1"
 
 
-PORT       = 8765  # fixed port so ngrok tunnel always forwards to the right place
+# ---------------------------------------------------------------------------
+# Resolve which project this launch targets, then either focus an already-
+# running instance for that exact project or claim a fresh port for a new
+# one. Runs before importing Flask/dms_server (same as the single-instance
+# guard this replaces used to) so a launch that's just going to hand off to
+# a sibling and exit stays cheap.
+# ---------------------------------------------------------------------------
+_cli_project_path = sys.argv[1] if len(sys.argv) > 1 else ""
+# Optional second argument: an explicit port, set only when a running
+# instance spawns this one via spawn_or_focus_instance() below (it picks
+# the port itself so it can hand the URL back to the browser immediately,
+# instead of racing this process to discover it independently).
+_cli_forced_port = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 0
+
+if _cli_project_path:
+    _resolved_target = str(Path(_cli_project_path).expanduser().resolve())
+else:
+    _default_path = _resolve_default_project_path()
+    _resolved_target = str(Path(_default_path).expanduser().resolve()) if _default_path else ""
+
+_instances = _prune_dead_instances(_load_instances())
+_existing_instance = _instances.get(_resolved_target) if _resolved_target else None
+
+if _existing_instance:
+    PORT = _existing_instance["port"]
+    URL = f"http://127.0.0.1:{PORT}"
+    webbrowser.open(URL)
+    _r = tk.Tk()
+    _r.withdraw()
+    import tkinter.messagebox as _mb
+    _mb.showinfo(
+        "DMS Already Running",
+        f"This project is already open.\n\nOpening browser to {URL}",
+        parent=_r,
+    )
+    _r.destroy()
+    os._exit(0)
+
+PORT       = _cli_forced_port or find_free_port()
 URL        = f"http://127.0.0.1:{PORT}"
 LOCAL_IP   = get_local_ip()
 MOBILE_URL = f"http://{LOCAL_IP}:{PORT}/mobile"
+
+# Claim this project/port pairing immediately, before the server itself
+# starts, so a launch racing this one sees it. Removed again in
+# LauncherWindow._quit() (every quit path funnels through there).
+if _resolved_target:
+    _instances[_resolved_target] = {"port": PORT, "pid": os.getpid(), "started_at": time.time()}
+    _save_instances(_instances)
 
 # ---------------------------------------------------------------------------
 # Tunnel state — one cloudflared tunnel per session, reused across dialogs
@@ -464,72 +581,9 @@ end tell
         )
 
 
-# ---------------------------------------------------------------------------
-# Single-instance guard — check BEFORE importing Flask or starting any server
-# ---------------------------------------------------------------------------
-def _kill_stale_port_owner() -> None:
-    """Windows only: kill whatever process holds PORT so we can rebind."""
-    if not sys.platform.startswith("win"):
-        return
-    import subprocess
-    try:
-        result = subprocess.run(
-            ["netstat", "-ano"], capture_output=True, text=True, timeout=5
-        )
-        for line in result.stdout.splitlines():
-            cols = line.split()
-            # cols: Proto  Local  Foreign  State  PID
-            if len(cols) >= 5 and f":{PORT}" in cols[1] and cols[3] == "LISTENING":
-                pid = cols[4]
-                if pid.isdigit() and pid != "0":
-                    subprocess.run(
-                        ["taskkill", "/F", "/PID", pid],
-                        capture_output=True, timeout=3,
-                    )
-    except Exception:
-        pass
-
-
-def _already_running() -> bool:
-    """Return True if a healthy DMS instance is already serving on PORT.
-
-    Three cases:
-      • Port closed              → not running          → return False
-      • Port open + HTTP 200     → healthy instance     → return True
-      • Port open + HTTP fails   → stale/stuck process  → kill it, return False
-    """
-    # Quick socket probe first (cheap).
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(0.5)
-        try:
-            s.connect(("127.0.0.1", PORT))
-        except OSError:
-            return False  # nothing on that port
-
-    # Port is open — confirm the server actually responds to HTTP.
-    import urllib.request as _req
-    try:
-        with _req.urlopen(f"http://127.0.0.1:{PORT}/", timeout=2) as resp:
-            return resp.status == 200
-    except Exception:
-        # Port is bound but server is unresponsive (stuck/zombie).
-        # Kill the stale process so the new instance can bind the port.
-        _kill_stale_port_owner()
-        return False
-
-
-if _already_running():
-    webbrowser.open(URL)
-    _r = tk.Tk()
-    _r.withdraw()
-    import tkinter.messagebox as _mb
-    _mb.showinfo(
-        "DMS Already Running",
-        f"DMS is already running.\n\nOpening browser to {URL}",
-        parent=_r,
-    )
-    _r.destroy()
-    os._exit(0)
+# Single-instance-per-project guard already happened above, right after
+# PORT/URL were resolved (before this file even imports Flask) — see the
+# "Resolve which project this launch targets" block near find_free_port().
 
 
 # ---------------------------------------------------------------------------
@@ -538,18 +592,76 @@ if _already_running():
 from dms_server import app  # noqa: E402
 import dms_server as _dms_server  # noqa: E402
 
-# If a project folder was passed as a command-line argument, use it as the
-# storage root for this instance only (does not touch ~/.dms_server_config.json).
-_cli_project_path = sys.argv[1] if len(sys.argv) > 1 else ""
+# If a project folder was passed as a command-line argument (either a plain
+# dev-mode invocation or a sibling instance spawned via
+# spawn_or_focus_instance() below), use it as the storage root for this
+# instance only -- does not touch the shared CONFIG_PATH. _resolved_target
+# was already computed above, before Flask was imported.
 if _cli_project_path:
-    p = Path(_cli_project_path).expanduser().resolve()
-    if not p.exists():
-        p.mkdir(parents=True, exist_ok=True)
-    _dms_server._storage_path_override = str(p)
+    if not Path(_resolved_target).exists():
+        Path(_resolved_target).mkdir(parents=True, exist_ok=True)
+    _dms_server._storage_path_override = _resolved_target
+
+# So each concurrently-running instance's session cookies don't collide in
+# the browser's shared cookie jar (cookies aren't port-scoped) -- see
+# _session_cookie_name()/_project_cookie_name() in dms_server.py.
+_dms_server._server_port = str(PORT)
 
 # Register the tunnel-start callback so send_to_phone can auto-start
 # the cloudflared tunnel on demand (no same-WiFi requirement).
 _dms_server._tunnel_start_fn = _get_or_start_tunnel
+
+# Register the "open another project in a new window" callback, backing
+# POST /api/spawn-instance (see the Project menu in dms.html).
+_dms_server._spawn_instance_fn = lambda path: spawn_or_focus_instance(path)
+
+
+def _self_relaunch_command(project_path: str, port: int) -> list[str]:
+    """Argv for re-launching this same app, pinned to project_path/port.
+
+    Mirrors how this instance itself was started: packaged builds have no
+    Finder/Explorer file association (see DMS.spec / build.py -- --windowed,
+    argv_emulation=False), so `sys.executable` *is* the launcher when frozen
+    (sys.frozen, set by PyInstaller); from source it's the interpreter, and
+    dms_launcher.py needs to be named explicitly.
+    """
+    if getattr(sys, "frozen", False):
+        return [sys.executable, project_path, str(port)]
+    return [sys.executable, str(Path(__file__).resolve()), project_path, str(port)]
+
+
+def spawn_or_focus_instance(path: str) -> dict:
+    """Open `path` as a project, in a second concurrently-running instance.
+
+    Backs POST /api/spawn-instance (dms_server.py), itself triggered by the
+    "open another project" entry in dms.html's Project menu. Reuses an
+    already-open instance for the exact same (resolved) path rather than
+    spawning a duplicate -- same dedup the startup guard above does for the
+    default launch, just invoked mid-session instead of at process start.
+    """
+    p = Path(path).expanduser().resolve()
+    if not p.exists():
+        p.mkdir(parents=True, exist_ok=True)
+    target = str(p)
+
+    instances = _prune_dead_instances(_load_instances())
+    existing = instances.get(target)
+    if existing:
+        return {"port": existing["port"], "url": f"http://127.0.0.1:{existing['port']}/", "reused": True}
+
+    port = find_free_port()
+    import subprocess
+    subprocess.Popen(_self_relaunch_command(target, port))
+
+    # Wait for the new instance to actually come up (it writes its own
+    # registry entry and starts serving) before handing the URL back --
+    # the frontend opens it in a new tab as soon as this returns.
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        if _probe_port(port):
+            return {"port": port, "url": f"http://127.0.0.1:{port}/", "reused": False}
+        time.sleep(0.3)
+    raise RuntimeError("The new instance didn't finish starting in time.")
 
 
 # ---------------------------------------------------------------------------
@@ -567,8 +679,19 @@ def serve() -> None:
             host="0.0.0.0",   # accept connections from all interfaces (including iPhone on LAN)
             port=PORT,
             threads=8,
-            channel_timeout=300,
+            # 1200s (20 min) — was 300s. Large video uploads to a slow/external
+            # drive were exceeding the old 5-minute limit, which kills the
+            # connection mid-transfer with no HTTP response; the browser then
+            # surfaces this as a bare "Failed to fetch" (see post_doc's
+            # streamed save in dms_server.py, and the matching note near
+            # _deepface_install_worker in dms_server.py).
+            channel_timeout=1200,
             connection_limit=50,
+            # waitress's own default cap is 1 GiB, independent of Flask's
+            # MAX_CONTENT_LENGTH (dms_server.py) — match that here so large
+            # .dms imports/uploads (or, e.g., multi-GB class-recording videos)
+            # aren't rejected before Flask ever sees the request.
+            max_request_body_size=20 * 1024 * 1024 * 1024,  # 20 GB
         )
     except Exception:
         import traceback
@@ -651,9 +774,15 @@ class LauncherWindow:
         # Window close button (red X) → quit
         self.root.protocol("WM_DELETE_WINDOW", self._quit)
 
-        # Mark ready after a short pause, then open browser
+        # Mark ready after a short pause, then open browser -- but not when
+        # this instance was spawned by a sibling's "open another project in
+        # a new window" (see spawn_or_focus_instance() / _cli_forced_port
+        # above): the calling browser tab already does its own
+        # window.open(data.url) once this instance is confirmed up, so
+        # auto-opening here too would open the same project in two tabs.
         self.root.after(400, self._mark_ready)
-        self.root.after(900, lambda: webbrowser.open(URL))
+        if not _cli_forced_port:
+            self.root.after(900, lambda: webbrowser.open(URL))
 
         # Check for server startup errors once, after 3 s
         self.root.after(3000, self._check_server)
@@ -973,6 +1102,17 @@ class LauncherWindow:
             _dms_server._auto_backup()
         except Exception:
             pass
+
+        # Remove this instance from the multi-instance registry so the next
+        # launch (or "open another project" from a sibling) doesn't try to
+        # reuse a port nothing is listening on anymore.
+        if _resolved_target:
+            try:
+                _reg = _load_instances()
+                _reg.pop(_resolved_target, None)
+                _save_instances(_reg)
+            except Exception:
+                pass
 
         # Kill the cloudflared tunnel process object directly (instant).
         global _tunnel_proc

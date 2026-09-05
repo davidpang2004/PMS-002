@@ -21,6 +21,11 @@ from pdf_extraction import split_value_unit_description
 DEFAULT_MODEL = "gemini-3.5-flash"
 FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash"]
 
+# DeepSeek's API is OpenAI-compatible REST, so it's called with plain
+# `requests` rather than a dedicated SDK -- one fewer optional dependency.
+DEEPSEEK_API_BASE = "https://api.deepseek.com"
+DEEPSEEK_DEFAULT_MODEL = "deepseek-chat"
+
 
 class AIExtractionError(Exception):
     """Raised for any AI-extraction failure with a message safe to show the user."""
@@ -29,6 +34,14 @@ class AIExtractionError(Exception):
 def gemini_available() -> bool:
     try:
         import google.genai  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def deepseek_available() -> bool:
+    try:
+        import requests  # noqa: F401
         return True
     except ImportError:
         return False
@@ -140,6 +153,59 @@ def extract_keys_with_gemini(image_bytes_list: list[bytes], keys: list[str],
     return results
 
 
+def _build_cross_doc_prompt(question: str, snippets: list[dict]) -> str:
+    """Shared prompt for cross-document Q&A -- same wording regardless of
+    which model answers it, so results are comparable across providers."""
+    doc_blocks = []
+    for s in snippets:
+        text = (s.get("text") or "").strip() or "(no extracted text)"
+        doc_blocks.append(f"### {s.get('name', '')} (ID: {s.get('doc_id', '')})\n{text}")
+
+    return (
+        "You are answering a question using ONLY the documents provided "
+        "below -- do not use outside knowledge. Each document is delimited "
+        "by a heading giving its name and ID.\n\n"
+        "If the answer isn't in any of the documents, say so plainly instead "
+        "of guessing.\n\n"
+        f"Question: {question}\n\n"
+        "Documents:\n\n" + "\n\n".join(doc_blocks) + "\n\n"
+        "Respond with ONLY a single JSON object of the form "
+        '{"answer": "<your answer, in the same language as the question>", '
+        '"cited_doc_ids": ["<ID of each document you actually used>", ...]}. '
+        "No explanation, no markdown code fences, just the JSON object."
+    )
+
+
+def _parse_cross_doc_answer(raw: str) -> dict:
+    """Shared response parsing for cross-document Q&A -- see
+    _build_cross_doc_prompt. Returns {"answer": str, "cited_doc_ids": [str, ...]}."""
+    parsed = _extract_json_object(raw)
+    if not isinstance(parsed, dict):
+        raise AIExtractionError("AI 返回的内容格式不正确（不是一个 JSON 对象）。")
+
+    answer = str(parsed.get("answer") or "").strip()
+    if not answer:
+        raise AIExtractionError("AI 未返回有效的回答。")
+    cited = parsed.get("cited_doc_ids") or []
+    if not isinstance(cited, list):
+        cited = []
+    cited_doc_ids = [str(c).strip() for c in cited if str(c).strip()]
+
+    return {"answer": answer, "cited_doc_ids": cited_doc_ids}
+
+
+def _check_cross_doc_inputs(question: str, snippets: list[dict], api_key: str, label: str) -> str:
+    """Shared validation for cross-document Q&A. Returns the trimmed question."""
+    if not api_key:
+        raise AIExtractionError(f"未配置 {label} API Key，请先在设置中添加。")
+    question = (question or "").strip()
+    if not question:
+        raise AIExtractionError("请输入问题。")
+    if not snippets:
+        raise AIExtractionError("没有可供检索的文档（可能都还没有可提取的文字）。")
+    return question
+
+
 def answer_question_with_gemini(question: str, snippets: list[dict],
                                  api_key: str, model: str = DEFAULT_MODEL) -> dict:
     """Answer a natural-language question against a set of documents' text.
@@ -153,13 +219,7 @@ def answer_question_with_gemini(question: str, snippets: list[dict],
     treat cited_doc_ids as untrusted and cross-check them against the actual
     candidate set before showing them as clickable citations.
     """
-    if not api_key:
-        raise AIExtractionError("未配置 Gemini API Key，请先在设置中添加。")
-    question = (question or "").strip()
-    if not question:
-        raise AIExtractionError("请输入问题。")
-    if not snippets:
-        raise AIExtractionError("没有可供检索的文档（可能都还没有可提取的文字）。")
+    question = _check_cross_doc_inputs(question, snippets, api_key, "Gemini")
 
     try:
         from google import genai
@@ -167,24 +227,7 @@ def answer_question_with_gemini(question: str, snippets: list[dict],
         raise AIExtractionError(
             "未安装 google-genai 库。请在运行此程序的 Python 中执行：pip install google-genai")
 
-    doc_blocks = []
-    for s in snippets:
-        text = (s.get("text") or "").strip() or "(no extracted text)"
-        doc_blocks.append(f"### {s.get('name', '')} (ID: {s.get('doc_id', '')})\n{text}")
-
-    prompt = (
-        "You are answering a question using ONLY the documents provided "
-        "below -- do not use outside knowledge. Each document is delimited "
-        "by a heading giving its name and ID.\n\n"
-        "If the answer isn't in any of the documents, say so plainly instead "
-        "of guessing.\n\n"
-        f"Question: {question}\n\n"
-        "Documents:\n\n" + "\n\n".join(doc_blocks) + "\n\n"
-        "Respond with ONLY a single JSON object of the form "
-        '{"answer": "<your answer, in the same language as the question>", '
-        '"cited_doc_ids": ["<ID of each document you actually used>", ...]}. '
-        "No explanation, no markdown code fences, just the JSON object."
-    )
+    prompt = _build_cross_doc_prompt(question, snippets)
 
     client = genai.Client(api_key=api_key)
     candidates = [model] + [m for m in FALLBACK_MODELS if m != model]
@@ -206,19 +249,19 @@ def answer_question_with_gemini(question: str, snippets: list[dict],
         raise AIExtractionError(f"调用 Gemini API 失败：{last_error}")
 
     raw = getattr(response, "text", None) or ""
-    parsed = _extract_json_object(raw)
-    if not isinstance(parsed, dict):
-        raise AIExtractionError("AI 返回的内容格式不正确（不是一个 JSON 对象）。")
+    return _parse_cross_doc_answer(raw)
 
-    answer = str(parsed.get("answer") or "").strip()
-    if not answer:
-        raise AIExtractionError("AI 未返回有效的回答。")
-    cited = parsed.get("cited_doc_ids") or []
-    if not isinstance(cited, list):
-        cited = []
-    cited_doc_ids = [str(c).strip() for c in cited if str(c).strip()]
 
-    return {"answer": answer, "cited_doc_ids": cited_doc_ids}
+def answer_question_with_deepseek(question: str, snippets: list[dict],
+                                   api_key: str, model: str = DEEPSEEK_DEFAULT_MODEL) -> dict:
+    """DeepSeek equivalent of answer_question_with_gemini -- same prompt and
+    response contract, so callers (and the UI) can treat both providers
+    identically. See that function's docstring for the snippets/return shape.
+    """
+    question = _check_cross_doc_inputs(question, snippets, api_key, "DeepSeek")
+    prompt = _build_cross_doc_prompt(question, snippets)
+    raw = _deepseek_chat([{"role": "user", "content": prompt}], api_key, model=model)
+    return _parse_cross_doc_answer(raw)
 
 
 def comment_on_trend_with_gemini(param_name: str, unit: str, points: list[dict],
@@ -297,3 +340,214 @@ def comment_on_trend_with_gemini(param_name: str, unit: str, points: list[dict],
         raise AIExtractionError("AI 未返回有效的分析结果。")
 
     return {"comment": comment}
+
+
+def _deepseek_chat(messages: list[dict], api_key: str,
+                    model: str = DEEPSEEK_DEFAULT_MODEL, timeout: int = 60) -> str:
+    """POST one chat-completion request to DeepSeek's OpenAI-compatible API.
+    Returns the assistant's reply text."""
+    try:
+        import requests
+    except ImportError:
+        raise AIExtractionError(
+            "未安装 requests 库。请在运行此程序的 Python 中执行：pip install requests")
+
+    try:
+        resp = requests.post(
+            f"{DEEPSEEK_API_BASE}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"model": model, "messages": messages, "stream": False},
+            timeout=timeout,
+        )
+    except requests.RequestException as e:
+        raise AIExtractionError(f"调用 DeepSeek API 失败（网络错误）：{e}")
+
+    if resp.status_code != 200:
+        raise AIExtractionError(f"调用 DeepSeek API 失败：HTTP {resp.status_code} {resp.text[:300]}")
+
+    try:
+        data = resp.json()
+        return data["choices"][0]["message"]["content"] or ""
+    except (ValueError, KeyError, IndexError, TypeError):
+        raise AIExtractionError("DeepSeek 返回的内容格式不正确。")
+
+
+def answer_question_about_document(question: str, doc_name: str, doc_text: str,
+                                    api_key: str, provider: str = "gemini") -> dict:
+    """Answer a free-form question about ONE document's already-extracted
+    text (OCR text, description, metadata -- whatever the caller assembled),
+    using either Gemini or DeepSeek.
+
+    Unlike answer_question_with_gemini (which reasons over many documents
+    and returns citations), this is a single-document Q&A with a plain-text
+    answer -- the caller already knows which document it asked about.
+
+    Returns {"answer": str, "model": str}.
+    """
+    question = (question or "").strip()
+    if not question:
+        raise AIExtractionError("请输入问题。")
+    if not api_key:
+        label = "DeepSeek" if provider == "deepseek" else "Gemini"
+        raise AIExtractionError(f"未配置 {label} API Key，请先在设置中添加。")
+
+    text = (doc_text or "").strip() or "(no extracted text available for this document)"
+    prompt = (
+        "You are answering a question about ONE document, using ONLY the "
+        "text extracted from it below -- do not use outside knowledge. If "
+        "the answer isn't in the text, say so plainly instead of guessing.\n\n"
+        f"Document: {doc_name}\n\n{text}\n\n"
+        f"Question: {question}\n\n"
+        "Answer concisely, in the same language as the question."
+    )
+
+    if provider == "deepseek":
+        answer = _deepseek_chat([{"role": "user", "content": prompt}], api_key).strip()
+        model_used = DEEPSEEK_DEFAULT_MODEL
+        if not answer:
+            raise AIExtractionError("AI 未返回有效的回答。")
+        return {"answer": answer, "model": model_used}
+
+    try:
+        from google import genai
+    except ImportError:
+        raise AIExtractionError(
+            "未安装 google-genai 库。请在运行此程序的 Python 中执行：pip install google-genai")
+
+    client = genai.Client(api_key=api_key)
+    candidates = [DEFAULT_MODEL] + [m for m in FALLBACK_MODELS if m != DEFAULT_MODEL]
+    response = None
+    last_error = None
+    model_used = None
+    for candidate in candidates:
+        try:
+            response = client.models.generate_content(model=candidate, contents=[prompt])
+            model_used = candidate
+            last_error = None
+            break
+        except Exception as e:
+            last_error = e
+            msg = str(e)
+            if "NOT_FOUND" in msg or "404" in msg or "no longer available" in msg:
+                continue
+            break
+
+    if last_error is not None:
+        raise AIExtractionError(f"调用 Gemini API 失败：{last_error}")
+
+    answer = (getattr(response, "text", None) or "").strip()
+    if not answer:
+        raise AIExtractionError("AI 未返回有效的回答。")
+    return {"answer": answer, "model": model_used}
+
+
+# Style presets for polish_description_text(). Keep the wording tight -- these
+# are appended to a fixed instruction block, not shown to the user.
+_POLISH_STYLES = {
+    "polish": (
+        "Fix grammar, spelling, punctuation and awkward phrasing. Merge "
+        "fragments into complete sentences. Keep it close to the original "
+        "length -- do not pad."
+    ),
+    "organize": (
+        "Reorganize the notes into a clear structure: group related points "
+        "together, put them in a sensible order, and use short paragraphs or "
+        "a bullet list ('- ' prefix) when there are several distinct points. "
+        "Fix grammar, spelling and punctuation along the way."
+    ),
+    "concise": (
+        "Rewrite as a tight, well-structured summary: drop filler and "
+        "repetition, keep every concrete fact, fix grammar and punctuation."
+    ),
+}
+
+
+def polish_description_text(text: str, api_key: str, provider: str = "gemini",
+                            lang: str = "auto", style: str = "organize") -> dict:
+    """Clean up a free-form description/notes block the user typed or dictated.
+
+    Dictated notes in particular come in as run-on text with no punctuation;
+    this organizes and polishes them WITHOUT inventing facts. The caller shows
+    the result next to the original so the user can accept or discard it.
+
+    lang:  "auto" (keep the note's own language), "zh" or "en" to force one.
+    style: one of _POLISH_STYLES ("polish" | "organize" | "concise").
+
+    Returns {"text": str, "model": str}.
+    """
+    text = (text or "").strip()
+    if not text:
+        raise AIExtractionError("没有可整理的文字。")
+    if not api_key:
+        label = "DeepSeek" if provider == "deepseek" else "Gemini"
+        raise AIExtractionError(f"未配置 {label} API Key，请先在设置中添加。")
+
+    style_instruction = _POLISH_STYLES.get(style) or _POLISH_STYLES["organize"]
+    if lang == "zh":
+        lang_instruction = "Write the result in Chinese (简体中文)."
+    elif lang == "en":
+        lang_instruction = "Write the result in English."
+    else:
+        lang_instruction = (
+            "Write the result in the SAME language as the input (if the input "
+            "is Chinese, respond in Chinese; if English, respond in English)."
+        )
+
+    prompt = (
+        "You are an editor tidying up a photo/document description that "
+        "someone typed or dictated. It may be a run-on with no punctuation.\n\n"
+        "Rules:\n"
+        "- Preserve every fact, name, number, date and measurement exactly. "
+        "Do NOT add information, opinions or details that aren't in the notes.\n"
+        "- Do NOT remove any distinct piece of information.\n"
+        f"- {style_instruction}\n"
+        f"- {lang_instruction}\n"
+        "- Return ONLY the cleaned-up text -- no preamble, no explanation, no "
+        "markdown code fences, no surrounding quotes.\n\n"
+        "Notes to clean up:\n"
+        "-----\n"
+        f"{text}\n"
+        "-----"
+    )
+
+    if provider == "deepseek":
+        out = _deepseek_chat([{"role": "user", "content": prompt}], api_key).strip()
+        if not out:
+            raise AIExtractionError("AI 未返回有效的结果。")
+        return {"text": out, "model": DEEPSEEK_DEFAULT_MODEL}
+
+    try:
+        from google import genai
+    except ImportError:
+        raise AIExtractionError(
+            "未安装 google-genai 库。请在运行此程序的 Python 中执行：pip install google-genai")
+
+    client = genai.Client(api_key=api_key)
+    candidates = [DEFAULT_MODEL] + [m for m in FALLBACK_MODELS if m != DEFAULT_MODEL]
+    response = None
+    last_error = None
+    model_used = None
+    for candidate in candidates:
+        try:
+            response = client.models.generate_content(model=candidate, contents=[prompt])
+            model_used = candidate
+            last_error = None
+            break
+        except Exception as e:
+            last_error = e
+            msg = str(e)
+            if "NOT_FOUND" in msg or "404" in msg or "no longer available" in msg:
+                continue
+            break
+
+    if last_error is not None:
+        raise AIExtractionError(f"调用 Gemini API 失败：{last_error}")
+
+    out = (getattr(response, "text", None) or "").strip()
+    # Models sometimes wrap the answer in a ``` fence despite being told not to.
+    if out.startswith("```"):
+        out = re.sub(r"^```[a-zA-Z]*\n?", "", out)
+        out = re.sub(r"\n?```$", "", out).strip()
+    if not out:
+        raise AIExtractionError("AI 未返回有效的结果。")
+    return {"text": out, "model": model_used}

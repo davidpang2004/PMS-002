@@ -30,12 +30,14 @@ import io
 import json
 import mimetypes
 import os
+import queue
 import secrets
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+import threading as _threading
 import webbrowser
 import zipfile
 from datetime import datetime
@@ -128,11 +130,27 @@ def save_config(cfg: dict) -> None:
 
 
 # Set by the launcher when a project path is passed as a command-line argument.
-# Takes precedence over the shared ~/.dms_server_config.json storage_path.
+# Takes precedence over the shared CONFIG_PATH storage_path -- see
+# set_storage_path() below for how the two interact when the path changes
+# from within a running, overridden instance.
 _storage_path_override: str = ""
 _tunnel_base_url: str = ""   # set by launcher after cloudflared starts
 _tunnel_start_fn = None      # injected by launcher: callable() -> public_url str
 _tunnel_start_lock = _Lock() # prevents two requests from starting the tunnel simultaneously
+
+# Set by the launcher right after `from dms_server import app`, when this
+# instance's port was picked dynamically (multiple concurrent projects --
+# see spawn_or_focus_instance() in dms_launcher.py). Used only to keep each
+# instance's session cookies from colliding with a sibling instance's, since
+# browsers don't scope cookies by port (see _session_cookie_name() below).
+# Left unset (falsy) when running dms_server.py directly with no launcher,
+# which keeps today's plain cookie names.
+_server_port: str = ""
+
+# Injected by the launcher: callable(path: str) -> {"port": int, "url": str,
+# "reused": bool}. Backs POST /api/spawn-instance ("open another project in
+# a new window") -- unset when dms_server.py runs standalone.
+_spawn_instance_fn = None
 
 
 def get_storage_root():
@@ -144,6 +162,36 @@ def get_storage_root():
     if not p:
         return None
     return Path(p).expanduser().resolve()
+
+
+def set_storage_path(new_path: str) -> None:
+    """Point this server at a different project folder.
+
+    If this instance was launched pinned to a specific project
+    (_storage_path_override set -- see spawn_or_focus_instance() in
+    dms_launcher.py), switching projects from inside it must only update
+    its own in-memory pointer: writing through to the shared CONFIG_PATH
+    here would silently redirect whatever *other*, unpinned instance reads
+    that file next, and wouldn't even take effect for this instance anyway
+    since get_storage_root() keeps preferring the override. An unpinned
+    (the ordinary, single-instance) run keeps today's exact behavior:
+    written straight to the shared config.
+    """
+    global _storage_path_override
+    if _storage_path_override:
+        _storage_path_override = new_path
+    else:
+        cfg = load_config()
+        cfg["storage_path"] = new_path
+        save_config(cfg)
+
+
+def _session_cookie_name() -> str:
+    return f"dms_session_{_server_port}" if _server_port else "dms_session"
+
+
+def _project_cookie_name() -> str:
+    return f"dms_project_session_{_server_port}" if _server_port else "dms_project_session"
 
 
 def get_docs_dir():
@@ -1191,7 +1239,7 @@ def is_project_authenticated() -> bool:
     _sync_project_session_scope()
     if not project_password_required():
         return True
-    token = request.cookies.get("dms_project_session", "")
+    token = request.cookies.get(_project_cookie_name(), "")
     return token in _PROJECT_SESSION_TOKENS
 
 
@@ -1214,7 +1262,7 @@ _REMOTE_TOKENS: dict[str, dict] = {}
 def is_authenticated() -> bool:
     if not password_required():
         return True
-    token = request.cookies.get("dms_session", "")
+    token = request.cookies.get(_session_cookie_name(), "")
     return token in _SESSION_TOKENS
 
 
@@ -1465,7 +1513,11 @@ def build_tree_order(nodes: dict, root: str) -> list:
 # Flask application
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024 * 1024  # 4 GB per upload
+app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024 * 1024  # 20 GB per upload — was 4 GB, too
+# small for full-length class-recording videos (some run 6-10+ GB). A request over this cap
+# gets its connection aborted mid-stream rather than a clean HTTP error, which the browser
+# then reports as a bare "Failed to fetch". Keep in sync with max_request_body_size in
+# dms_launcher.py's waitress_serve() call, which must be >= this value.
 
 
 # Endpoints that don't require authentication (login itself, plus auth status check)
@@ -2467,22 +2519,22 @@ def auth_login():
         # No password set — issue a token anyway so the client behaves consistently
         token = issue_session_token()
         resp = jsonify({"ok": True, "no_password": True})
-        resp.set_cookie("dms_session", token, httponly=True, samesite="Strict")
+        resp.set_cookie(_session_cookie_name(), token, httponly=True, samesite="Strict")
         return resp
     if not pw or not verify_password(pw):
         return jsonify({"error": "Incorrect password"}), 401
     token = issue_session_token()
     resp = jsonify({"ok": True})
-    resp.set_cookie("dms_session", token, httponly=True, samesite="Strict")
+    resp.set_cookie(_session_cookie_name(), token, httponly=True, samesite="Strict")
     return resp
 
 
 @app.route("/api/auth/logout", methods=["POST"])
 def auth_logout():
-    token = request.cookies.get("dms_session", "")
+    token = request.cookies.get(_session_cookie_name(), "")
     _SESSION_TOKENS.discard(token)
     resp = jsonify({"ok": True})
-    resp.delete_cookie("dms_session")
+    resp.delete_cookie(_session_cookie_name())
     return resp
 
 
@@ -2528,7 +2580,7 @@ def auth_set_password():
     # Re-issue a session for the requester so they're not locked out
     token = issue_session_token()
     resp = jsonify({"ok": True, "password_now_set": bool(new)})
-    resp.set_cookie("dms_session", token, httponly=True, samesite="Strict")
+    resp.set_cookie(_session_cookie_name(), token, httponly=True, samesite="Strict")
     return resp
 
 
@@ -2558,7 +2610,7 @@ def project_auth_login():
     if not project_password_required(root):
         token = issue_project_session_token()
         resp = jsonify({"ok": True, "no_password": True})
-        resp.set_cookie("dms_project_session", token, httponly=True, samesite="Strict")
+        resp.set_cookie(_project_cookie_name(), token, httponly=True, samesite="Strict")
         return resp
     if not pw or not verify_project_password(root, pw):
         return jsonify({"error": "Incorrect password"}), 401
@@ -2569,7 +2621,7 @@ def project_auth_login():
     token = issue_project_session_token()
     _project_password_cache = pw  # memory-only — see module docstring above
     resp = jsonify({"ok": True, "name": get_project_name(root)})
-    resp.set_cookie("dms_project_session", token, httponly=True, samesite="Strict")
+    resp.set_cookie(_project_cookie_name(), token, httponly=True, samesite="Strict")
     return resp
 
 
@@ -2578,11 +2630,11 @@ def project_auth_logout():
     """Locks the currently active project again (without affecting the app
     login or any other project)."""
     global _project_password_cache
-    token = request.cookies.get("dms_project_session", "")
+    token = request.cookies.get(_project_cookie_name(), "")
     _PROJECT_SESSION_TOKENS.discard(token)
     _project_password_cache = ""
     resp = jsonify({"ok": True})
-    resp.delete_cookie("dms_project_session")
+    resp.delete_cookie(_project_cookie_name())
     return resp
 
 
@@ -2646,7 +2698,7 @@ def project_set_password():
         # _project_session_root to the current root, which would otherwise
         # wipe a cache value set beforehand (see _sync_project_session_scope).
         token = issue_project_session_token()
-        resp.set_cookie("dms_project_session", token, httponly=True, samesite="Strict")
+        resp.set_cookie(_project_cookie_name(), token, httponly=True, samesite="Strict")
     if new_cache_value is not None:
         _project_password_cache = new_cache_value
     return resp
@@ -2748,9 +2800,7 @@ def set_settings():
                 except OSError:
                     pass  # non-fatal — user will see an empty tree instead
 
-    cfg = load_config()
-    cfg["storage_path"] = str(p)
-    save_config(cfg)
+    set_storage_path(str(p))
     return jsonify({"ok": True, "resolved_path": str(p), "had_existing_data": had_existing_data})
 
 
@@ -3045,6 +3095,47 @@ def default_download_folder():
     return jsonify({"path": str(_default_downloads_dir())})
 
 
+_BROWSE_TIMEOUT = 6  # seconds
+
+
+def _run_with_timeout(fn, timeout=_BROWSE_TIMEOUT):
+    """Run fn() on a throwaway daemon thread and return its result, raising
+    TimeoutError if it doesn't finish in time.
+
+    On macOS, the first read of a protected folder (Documents/Desktop/
+    Downloads/…) fires a native "would like to access files" permission
+    prompt — and for a windowless background process like this one, macOS
+    sometimes never manages to surface that prompt at all, leaving the
+    blocking syscall (and the request thread waiting on it) stuck
+    indefinitely. Bounding the call here turns that into a fast, actionable
+    error instead of a request that never returns. The abandoned thread is
+    daemonic and cheap to leak if the underlying call really does hang
+    forever; each retry gets its own fresh thread rather than queuing
+    behind a previous stuck one.
+    """
+    result_q: "queue.Queue" = queue.Queue(maxsize=1)
+
+    def _worker():
+        try:
+            result_q.put(("ok", fn()))
+        except BaseException as e:  # forward any exception to the caller
+            result_q.put(("error", e))
+
+    _threading.Thread(target=_worker, daemon=True).start()
+    try:
+        kind, value = result_q.get(timeout=timeout)
+    except queue.Empty:
+        raise TimeoutError(
+            f"Timed out after {timeout}s waiting for the filesystem — this usually means "
+            "macOS is waiting on a permission decision that never got shown. Open System "
+            "Settings → Privacy & Security → Files and Folders and grant DMS access "
+            "to Documents/Desktop/Downloads, then try again."
+        )
+    if kind == "error":
+        raise value
+    return value
+
+
 def _browse_roots() -> list:
     """Shortcut locations (home, common subfolders, drives/volumes) shown in the
     sidebar of the folder-browser dialog, so users can jump around without typing."""
@@ -3102,34 +3193,45 @@ def browse_folder():
     Response: { ok, path, parent, entries: [{name, path}], roots: [{name, path}] }
     """
     raw = (request.args.get("path") or "").strip()
-    roots = _browse_roots()
+    try:
+        roots = _run_with_timeout(_browse_roots)
+    except TimeoutError as e:
+        return jsonify({"error": str(e)}), 504
 
     if not raw:
         return jsonify({"ok": True, "path": None, "parent": None, "entries": roots, "roots": roots})
 
-    target = Path(raw).expanduser()
-    try:
-        target = target.resolve()
-    except OSError:
-        return jsonify({"error": f"Cannot resolve path: {raw}"}), 400
-
-    if not target.exists():
-        return jsonify({"error": f"Folder does not exist: {target}"}), 404
-    if not target.is_dir():
-        target = target.parent
-
-    entries = []
-    try:
-        for entry in target.iterdir():
+    def _resolve_and_list():
+        # expanduser/resolve/exists/is_dir/iterdir are all filesystem
+        # syscalls that can equally hang on a protected macOS folder, so
+        # the whole validate-then-list sequence runs as one
+        # timeout-guarded unit rather than piecemeal.
+        t = Path(raw).expanduser().resolve()
+        if not t.exists():
+            raise FileNotFoundError(str(t))
+        if not t.is_dir():
+            t = t.parent
+        found = []
+        for entry in t.iterdir():
             if entry.name.startswith("."):
                 continue
             try:
                 if entry.is_dir():
-                    entries.append({"name": entry.name, "path": str(entry)})
+                    found.append({"name": entry.name, "path": str(entry)})
             except OSError:
                 continue
-    except PermissionError:
-        return jsonify({"error": f"Permission denied: {target}"}), 403
+        return t, found
+
+    try:
+        target, entries = _run_with_timeout(_resolve_and_list)
+    except TimeoutError as e:
+        return jsonify({"error": str(e)}), 504
+    except OSError as e:
+        if isinstance(e, FileNotFoundError):
+            return jsonify({"error": f"Folder does not exist: {e}"}), 404
+        if isinstance(e, PermissionError):
+            return jsonify({"error": f"Permission denied: {e}"}), 403
+        return jsonify({"error": f"Cannot resolve path: {raw}"}), 400
     entries.sort(key=lambda e: e["name"].lower())
 
     parent = target.parent
@@ -3293,9 +3395,17 @@ def post_doc():
     photo_month = request.form.get("photo_month", "").strip() or None
     route_mode = request.form.get("route_mode", "year-month").strip() or "year-month"
     photo_base_node_id = request.form.get("photo_base_node_id", "").strip() or None
-    file_data = f.read()
 
     is_photo = _is_photo_file(ext, mime)
+    # Only photos need the whole file in memory (for the EXIF date/GPS scans
+    # below), and photos are never anywhere near video/PDF size. Everything
+    # else is streamed straight to disk further down instead of buffering a
+    # multi-GB file into one Python `bytes` object -- which used to make big
+    # uploads far slower than a plain filesystem copy (extra full-size copies
+    # in RAM, on top of Werkzeug's own on-disk temp file) and could swap-
+    # thrash a machine once the file approached free RAM.
+    file_data = f.read() if is_photo else None
+
     _valid_date = _valid_photo_year_month(photo_year, photo_month)
     if is_photo and not _valid_date and route_mode != "current-folder":
         photo_year, photo_month = _read_photo_date(file_data, mime)
@@ -3325,7 +3435,13 @@ def post_doc():
         out_dir = docs_dir
 
     out_path = out_dir / f"{doc_id}__{safe_name}"
-    out_path.write_bytes(file_data)
+    if file_data is not None:
+        out_path.write_bytes(file_data)
+    else:
+        # Stream straight from the upload (Werkzeug's own spooled temp file)
+        # to the destination in fixed-size chunks -- bounded memory use no
+        # matter how large the file is.
+        f.save(out_path, buffer_size=4 * 1024 * 1024)
 
     # Scan the document's own text for a date (for the "parameter vs. time"
     # plot feature) so the client can propose it as the document's date right
@@ -3357,9 +3473,11 @@ def post_doc():
                 print(f"[DMS] GPS location: {location}")
         except (ValueError, Exception):
             pass
-    if gps_lat is None:
+    if gps_lat is None and is_photo:
         # Client couldn't extract GPS (e.g. HEIC, or memory pressure on large folder uploads)
-        # — try server-side Pillow fallback for any image format
+        # — try server-side Pillow fallback for any image format. Gated on is_photo (rather
+        # than running unconditionally) so a big video/PDF/other upload never pays for a
+        # second full-size copy of file_data into a BytesIO just to have Pillow reject it.
         lat, lon = _read_photo_gps(file_data)
         if lat is not None:
             gps_lat, gps_lon = lat, lon
@@ -4872,15 +4990,22 @@ def post_doc_ocr(doc_id):
     })
 
 
+def _ai_key_field(provider: str) -> str:
+    return "gemini_api_key_enc" if provider != "deepseek" else "deepseek_api_key_enc"
+
+
 @app.route("/api/ai-settings", methods=["GET"])
 def get_ai_settings():
-    """Report whether AI-assisted extraction (Gemini) is configured.
+    """Report whether AI-assisted extraction is configured for a provider.
 
-    Never returns the key itself -- only whether one is saved and whether
-    the google-genai library is present in this Python environment.
+    Query: ?provider=gemini|deepseek (default "gemini", for back-compat with
+    callers that predate DeepSeek support). Never returns the key itself --
+    only whether one is saved and whether the provider's library/dependency
+    is present in this Python environment.
     """
+    provider = (request.args.get("provider") or "gemini").strip().lower()
     cfg = load_config()
-    enc = cfg.get("gemini_api_key_enc", "")
+    enc = cfg.get(_ai_key_field(provider), "")
     configured = False
     if enc:
         try:
@@ -4890,26 +5015,35 @@ def get_ai_settings():
             configured = False
     try:
         import ai_extraction
-        library_installed = ai_extraction.gemini_available()
+        library_installed = (
+            ai_extraction.deepseek_available() if provider == "deepseek"
+            else ai_extraction.gemini_available()
+        )
     except Exception:
         library_installed = False
-    return jsonify({"configured": configured, "library_installed": library_installed})
+    return jsonify({"configured": configured, "library_installed": library_installed, "provider": provider})
 
 
 @app.route("/api/ai-settings", methods=["POST"])
 def set_ai_settings():
-    """Save (encrypted) or clear the Gemini API key. Body: {api_key} or {clear: true}."""
+    """Save (encrypted) or clear a provider's API key.
+
+    Body: {api_key, provider?} or {clear: true, provider?}. provider
+    defaults to "gemini" for back-compat; pass "deepseek" for the DeepSeek key.
+    """
     data = request.get_json(force=True) or {}
+    provider = (data.get("provider") or "gemini").strip().lower()
+    key_field = _ai_key_field(provider)
     cfg = load_config()
     if data.get("clear"):
-        cfg.pop("gemini_api_key_enc", None)
+        cfg.pop(key_field, None)
         save_config(cfg)
-        return jsonify({"ok": True, "configured": False})
+        return jsonify({"ok": True, "configured": False, "provider": provider})
     api_key = (data.get("api_key") or "").strip()
     if api_key:
-        cfg["gemini_api_key_enc"] = encrypt_secret(api_key)
+        cfg[key_field] = encrypt_secret(api_key)
         save_config(cfg)
-    return jsonify({"ok": True, "configured": bool(cfg.get("gemini_api_key_enc"))})
+    return jsonify({"ok": True, "configured": bool(cfg.get(key_field)), "provider": provider})
 
 
 @app.route("/api/download-gemini-guide", methods=["GET"])
@@ -4958,12 +5092,14 @@ def _doc_snippet_text(entry: dict) -> str:
 @app.route("/api/ask-ai", methods=["POST"])
 def ask_ai():
     """Answer a natural-language question against this project's documents
-    using Gemini (opt-in, same key as /api/ai-settings). Unlike per-document
-    key extraction, this reasons over many documents' existing text/metadata
-    at once and cites which ones it used.
+    using Gemini or DeepSeek (opt-in, same keys as /api/ai-settings). Unlike
+    per-document key extraction, this reasons over many documents' existing
+    text/metadata at once and cites which ones it used.
 
-    Body (JSON): { "question": str, "scope_node_id": str|null }
-    Returns { ok, answer, citations: [{docId, name}], coverage: {withText, total} }.
+    Body (JSON): { "question": str, "scope_node_id": str|null,
+    "provider": "gemini"|"deepseek" (default "gemini") }
+    Returns { ok, answer, provider, citations: [{docId, name}],
+    coverage: {withText, total} }.
     """
     docs_dir = get_docs_dir()
     if not docs_dir:
@@ -4974,11 +5110,15 @@ def ask_ai():
     if not question:
         return jsonify({"error": "Provide a non-empty 'question'"}), 400
     scope_node_id = data.get("scope_node_id")
+    provider = (data.get("provider") or "gemini").strip().lower()
+    if provider not in ("gemini", "deepseek"):
+        return jsonify({"error": "Unknown provider"}), 400
 
     cfg = load_config()
-    enc = cfg.get("gemini_api_key_enc", "")
+    enc = cfg.get(_ai_key_field(provider), "")
+    label = "DeepSeek" if provider == "deepseek" else "Gemini"
     if not enc:
-        return jsonify({"error": "未配置 Gemini API Key，请先在设置中添加。"}), 400
+        return jsonify({"error": f"未配置 {label} API Key，请先在设置中添加。"}), 400
     try:
         api_key = decrypt_secret(enc)
     except Exception:
@@ -5049,7 +5189,11 @@ def ask_ai():
 
     try:
         import ai_extraction
-        result = ai_extraction.answer_question_with_gemini(question, snippets, api_key)
+        answer_fn = (
+            ai_extraction.answer_question_with_deepseek if provider == "deepseek"
+            else ai_extraction.answer_question_with_gemini
+        )
+        result = answer_fn(question, snippets, api_key)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -5063,6 +5207,7 @@ def ask_ai():
     return jsonify({
         "ok": True,
         "answer": result["answer"],
+        "provider": provider,
         "citations": citations,
         "coverage": {"withText": with_text, "total": len(candidates)},
     })
@@ -5121,6 +5266,59 @@ def ai_fit_trend():
         return jsonify({"error": str(e)}), 500
 
     return jsonify({"ok": True, "comment": result["comment"]})
+
+
+@app.route("/api/polish-text", methods=["POST"])
+def polish_text():
+    """Organize and polish a free-form notes block (a photo/document
+    description the user typed or dictated) via Gemini or DeepSeek -- same
+    opt-in keys as /api/ai-settings. Facts are preserved; nothing is
+    invented. The text is client-side only, so no document access is needed.
+
+    Body: { "text": str,
+            "provider": "gemini"|"deepseek" (default "gemini"),
+            "lang": "auto"|"zh"|"en" (default "auto"),
+            "style": "polish"|"organize"|"concise" (default "organize") }
+    Returns { ok, text, provider, model }.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "没有可整理的文字。"}), 400
+    if len(text) > 20000:
+        return jsonify({"error": "文字过长，请分段整理（上限约 20000 字符）。"}), 400
+
+    provider = (data.get("provider") or "gemini").strip().lower()
+    if provider not in ("gemini", "deepseek"):
+        return jsonify({"error": "Unknown provider"}), 400
+    lang = (data.get("lang") or "auto").strip().lower()
+    style = (data.get("style") or "organize").strip().lower()
+
+    cfg = load_config()
+    enc = cfg.get(_ai_key_field(provider), "")
+    label = "DeepSeek" if provider == "deepseek" else "Gemini"
+    if not enc:
+        return jsonify({"error": f"未配置 {label} API Key，请先在设置中添加。"}), 400
+    try:
+        api_key = decrypt_secret(enc)
+    except Exception:
+        return jsonify({"error": "无法读取已保存的 API Key，请重新设置。"}), 400
+
+    try:
+        import ai_extraction
+        result = ai_extraction.polish_description_text(
+            text, api_key, provider=provider, lang=lang, style=style)
+    except ai_extraction.AIExtractionError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({
+        "ok": True,
+        "text": result["text"],
+        "provider": provider,
+        "model": result.get("model"),
+    })
 
 
 @app.route("/api/docs/<doc_id>/extract-keys-ai", methods=["POST"])
@@ -5186,6 +5384,301 @@ def post_doc_extract_keys_ai(doc_id):
         "found_count": found_n,
         "pages_used": len(images),
         "method": "gemini-ai",
+    })
+
+
+@app.route("/api/docs/<doc_id>/ask", methods=["POST"])
+def post_doc_ask(doc_id):
+    """Ask a free-form question about one document (opt-in AI, Gemini or
+    DeepSeek -- keys saved via /api/ai-settings), then append the question
+    and answer to a running Q&A log PDF kept alongside the document, in the
+    same on-disk folder.
+
+    Body (JSON): { "question": str, "provider": "gemini"|"deepseek" (default
+    "gemini"), "node_id": str (which folder's copy of the doc to file the
+    log next to; falls back to the document's original folder) }
+
+    Returns { ok, answer, provider, model, log_doc_id, log_name }. log_doc_id
+    is null if there was no folder to file the log into (document not
+    currently linked into any node).
+    """
+    docs_dir = get_docs_dir()
+    if not docs_dir:
+        return jsonify({"error": "Storage path not configured"}), 503
+    if "/" in doc_id or "\\" in doc_id or ".." in doc_id:
+        return jsonify({"error": "Invalid doc_id"}), 400
+
+    payload = request.get_json(force=True, silent=True) or {}
+    question = (payload.get("question") or "").strip()
+    provider = (payload.get("provider") or "gemini").strip().lower()
+    node_id = (payload.get("node_id") or "").strip()
+    if not question:
+        return jsonify({"error": "Provide a non-empty 'question'"}), 400
+    if provider not in ("gemini", "deepseek"):
+        return jsonify({"error": "Unknown provider"}), 400
+
+    cfg = load_config()
+    enc = cfg.get(_ai_key_field(provider), "")
+    label = "DeepSeek" if provider == "deepseek" else "Gemini"
+    if not enc:
+        return jsonify({"error": f"未配置 {label} API Key，请先在设置中添加。"}), 400
+    try:
+        api_key = decrypt_secret(enc)
+    except Exception:
+        return jsonify({"error": "无法读取已保存的 API Key，请重新设置。"}), 400
+
+    idx = read_index()
+    doc_index = idx.get("docIndex") or []
+    entry = next((d for d in doc_index if d.get("id") == doc_id), None)
+    if not entry:
+        return jsonify({"error": "Document not found"}), 404
+
+    doc_text = _doc_snippet_text(entry)
+    if not doc_text:
+        # No text/metadata yet -- try a one-off OCR pass, same as ask_ai does
+        # per-candidate, so a fresh upload can still be asked about.
+        matches = list(docs_dir.rglob(f"{doc_id}__*")) or list(docs_dir.rglob(f"{doc_id}*"))
+        if matches:
+            try:
+                import pdf_extraction
+                text, _info = pdf_extraction.extract_text_from_file(matches[0])
+            except Exception:
+                text = ""
+            if text:
+                entry["ocrText"] = text
+                doc_text = _doc_snippet_text(entry)
+                write_index(idx)
+
+    try:
+        import ai_extraction
+        result = ai_extraction.answer_question_about_document(
+            question, entry.get("name", ""), doc_text, api_key, provider=provider)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    answer = result["answer"]
+    model_used = result.get("model") or provider
+
+    # Append to a per-document running Q&A log, saved as a real PDF file in
+    # the same on-disk folder as the source document (find-or-create, same
+    # per-folder pattern as plot_snapshot's Excel history). PDF isn't
+    # append-friendly, so the entry list itself is kept as JSON on the log
+    # document's docIndex entry (aiQaLog) and the PDF is fully regenerated
+    # from that list on every question -- see databook.build_qa_log_pdf.
+    log_doc_id, log_name = None, None
+    tree = idx.get("tree")
+    target_node_id = node_id or entry.get("originalNodeId") or ""
+    node = _find_node_by_id(tree, target_node_id) if tree else None
+    if node is not None:
+        try:
+            import databook
+        except ImportError as e:
+            return jsonify({
+                "error": ("Databook/PDF libraries not installed. Run:\n"
+                          "    pip3 install pypdf reportlab Pillow\n"
+                          "Then restart the server.\n\nDetail: " + str(e))
+            }), 500
+
+        base_name = entry.get("name") or doc_id
+        base_stem = base_name.rsplit(".", 1)[0] if "." in base_name else base_name
+        log_display_name = f"{base_stem} - AI Q&A.pdf"
+        by_id = {d["id"]: d for d in doc_index}
+
+        existing_log_entry = None
+        for ref in (node.get("documents") or []):
+            d = by_id.get(ref.get("id"))
+            if d and (d.get("name") or "").lower() == log_display_name.lower():
+                existing_log_entry = d
+                break
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        new_row = {"timestamp": timestamp, "model": model_used, "question": question, "answer": answer}
+        qa_entries = list((existing_log_entry or {}).get("aiQaLog") or []) + [new_row]
+        pdf_bytes = databook.build_qa_log_pdf(base_name, qa_entries)
+
+        out_dir = _get_node_docs_dir(target_node_id, tree) or docs_dir
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        if existing_log_entry:
+            log_doc_id = existing_log_entry["id"]
+            matches = list(docs_dir.rglob(f"{log_doc_id}__*")) or list(docs_dir.rglob(f"{log_doc_id}*"))
+            log_path = matches[0] if matches else out_dir / f"{log_doc_id}__{_safe_filename_part(log_display_name)}"
+        else:
+            log_doc_id = "DOC-" + datetime.now().strftime("%Y%m%d") + "-" + secrets.token_hex(4).upper()
+            log_path = out_dir / f"{log_doc_id}__{_safe_filename_part(log_display_name)}"
+
+        log_path.write_bytes(pdf_bytes)
+        size = len(pdf_bytes)
+
+        if existing_log_entry:
+            existing_log_entry["size"] = size
+            existing_log_entry["uploadedAt"] = datetime.utcnow().isoformat() + "Z"
+            existing_log_entry["aiQaLog"] = qa_entries
+        else:
+            doc_index.append({
+                "id": log_doc_id, "name": log_display_name, "mime": "application/pdf",
+                "size": size, "uploadedAt": datetime.utcnow().isoformat() + "Z",
+                "originalNodeId": target_node_id, "metadata": {}, "aiQaLog": qa_entries,
+            })
+            node.setdefault("documents", []).append({"id": log_doc_id})
+        log_name = log_display_name
+        write_index(idx)
+
+    return jsonify({
+        "ok": True,
+        "answer": answer,
+        "provider": provider,
+        "model": model_used,
+        "log_doc_id": log_doc_id,
+        "log_name": log_name,
+    })
+
+
+@app.route("/api/docs/<doc_id>/save-text-as-doc", methods=["POST"])
+def post_doc_save_text_as_doc(doc_id):
+    """Save a block of text the user reviewed in the viewer's side panel
+    (a description, OCR output, or an AI answer) as a .txt document, filed
+    into the same on-disk folder as the source document.
+
+    Body (JSON): {
+      "text":    str,                              # required, the content to save
+      "title":   str,                              # optional filename (without .txt)
+      "node_id": str,                              # folder to file it into; falls
+                                                   #   back to the source doc's folder
+      "source":  "description"|"ocr"|"ai"|str,     # optional, shown in the header
+      "reuse":   bool                              # optional: if a .txt already
+                                                   #   exists for this source doc +
+                                                   #   `source`, overwrite it in
+                                                   #   place instead of making a new
+                                                   #   one (keeps one file across
+                                                   #   repeated edits)
+    }
+    Returns { ok, doc_id, name, size, node_id, updated }.
+    """
+    docs_dir = get_docs_dir()
+    if not docs_dir:
+        return jsonify({"error": "Storage path not configured"}), 503
+    if "/" in doc_id or "\\" in doc_id or ".." in doc_id:
+        return jsonify({"error": "Invalid doc_id"}), 400
+
+    payload = request.get_json(force=True, silent=True) or {}
+    text = (payload.get("text") or "").strip()
+    title = (payload.get("title") or "").strip()
+    node_id = (payload.get("node_id") or "").strip()
+    source = (payload.get("source") or "").strip().lower()
+    reuse = bool(payload.get("reuse"))
+    if not text:
+        return jsonify({"error": "Provide non-empty 'text'"}), 400
+
+    # Normalise a few source aliases so "one file per source doc + feature"
+    # matches regardless of which alias the client sent.
+    norm_source = {"desc": "description", "text": "ocr"}.get(source, source)
+
+    idx = read_index()
+    doc_index = idx.get("docIndex") or []
+    entry = next((d for d in doc_index if d.get("id") == doc_id), None)
+    if not entry:
+        return jsonify({"error": "Document not found"}), 404
+
+    tree = idx.get("tree")
+    target_node_id = node_id or entry.get("originalNodeId") or ""
+    node = _find_node_by_id(tree, target_node_id) if tree else None
+
+    src_label = {
+        "description": "Description",
+        "desc": "Description",
+        "ocr": "Extracted text (OCR)",
+        "text": "Extracted text (OCR)",
+        "ai": "AI answer",
+    }.get(source, "")
+
+    base_name = entry.get("name") or doc_id
+    base_stem = base_name.rsplit(".", 1)[0] if "." in base_name else base_name
+    if title:
+        display_name = title if title.lower().endswith(".txt") else title + ".txt"
+    else:
+        display_name = f"{base_stem} - {src_label or 'Notes'}.txt"
+
+    header = [
+        src_label or "Saved text",
+        f"From: {base_name} ({doc_id})",
+        "Saved: " + datetime.now().strftime("%Y-%m-%d %H:%M"),
+    ]
+    body = "\n".join(header) + "\n" + ("-" * 40) + "\n\n" + text + "\n"
+    file_bytes = body.encode("utf-8")
+
+    # Reuse mode: if a .txt was already saved for this source document and
+    # this same feature, overwrite it in place so repeated edits keep landing
+    # in a single file instead of spawning "Description (2)", "(3)", ...
+    if reuse and norm_source:
+        existing = next(
+            (d for d in doc_index
+             if d.get("derivedFrom") == doc_id
+             and (d.get("sourceFeature") or "") == norm_source),
+            None,
+        )
+        if existing:
+            matches = (list(docs_dir.rglob(f"{existing['id']}__*"))
+                       or list(docs_dir.rglob(f"{existing['id']}*")))
+            out_path = matches[0] if matches else None
+            if out_path is None:
+                out_dir = _get_node_docs_dir(
+                    existing.get("originalNodeId") or target_node_id, tree) or docs_dir
+                out_dir.mkdir(parents=True, exist_ok=True)
+                out_path = out_dir / f"{existing['id']}__{_safe_filename_part(existing.get('name') or display_name)}"
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_bytes(file_bytes)
+            existing["size"] = len(file_bytes)
+            existing["uploadedAt"] = datetime.utcnow().isoformat() + "Z"
+            existing["ocrText"] = text
+            write_index(idx)
+            return jsonify({
+                "ok": True,
+                "doc_id": existing["id"],
+                "name": existing.get("name") or display_name,
+                "size": len(file_bytes),
+                "node_id": existing.get("originalNodeId") or target_node_id,
+                "updated": True,
+            })
+
+    if node is None:
+        return jsonify({"error": "No folder to file the new document into"}), 400
+
+    if not _reserve_doc_slots(idx, 1):
+        return jsonify({
+            "error": f"Document upload limit reached ({_get_max_documents()} total).",
+            "code": "upload_limit_reached",
+        }), 403
+
+    new_doc_id = "DOC-" + datetime.now().strftime("%Y%m%d") + "-" + secrets.token_hex(4).upper()
+    out_dir = _get_node_docs_dir(target_node_id, tree) or docs_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{new_doc_id}__{_safe_filename_part(display_name)}"
+    out_path.write_bytes(file_bytes)
+
+    doc_index.append({
+        "id": new_doc_id,
+        "name": display_name,
+        "mime": "text/plain",
+        "size": len(file_bytes),
+        "uploadedAt": datetime.utcnow().isoformat() + "Z",
+        "originalNodeId": target_node_id,
+        "metadata": {},
+        # Make the saved text searchable straight away, and record its origin.
+        "ocrText": text,
+        "derivedFrom": doc_id,
+        "sourceFeature": norm_source or None,
+    })
+    node.setdefault("documents", []).append({"id": new_doc_id})
+    write_index(idx)
+
+    return jsonify({
+        "ok": True,
+        "doc_id": new_doc_id,
+        "name": display_name,
+        "size": len(file_bytes),
+        "node_id": target_node_id,
+        "updated": False,
     })
 
 
@@ -6013,6 +6506,15 @@ def export_project_full():
     if not root or not root.exists():
         return jsonify({"error": "Storage path not configured"}), 503
 
+    # Make sure every tree node has a physical on-disk folder before backing
+    # up — a node whose documents are all *linked* references to a file
+    # stored under a different node (see the LinkPicker drag-to-link
+    # feature) never gets its own folder created lazily, since no file is
+    # ever written into it directly. Without this, such a folder is simply
+    # absent from disk and from the backup, which reads as "missing" even
+    # though nothing is actually lost (the doc still opens fine by id).
+    _create_local_folder_structure(read_index().get("tree"))
+
     filename = _dms_backup_filename(root, "COMP")
     out_path = root / filename
     with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -6032,8 +6534,16 @@ def export_project_full():
         docs_dir = root / "docs"
         if docs_dir.exists():
             for fpath in sorted(docs_dir.rglob("*")):
-                if fpath.is_file():
-                    zf.write(fpath, arcname=str(fpath.relative_to(root)))
+                rel = str(fpath.relative_to(root))
+                if fpath.is_dir():
+                    # Explicit directory entry so folders with no files of
+                    # their own (link-only folders, or just empty folders)
+                    # still round-trip through the zip instead of silently
+                    # vanishing — plain files-only zips don't preserve
+                    # empty directories.
+                    zf.writestr(rel.replace(os.sep, "/") + "/", "")
+                elif fpath.is_file():
+                    zf.write(fpath, arcname=rel)
     _maybe_encrypt_dms_file_in_place(out_path, root)
     _enforce_dms_backup_retention(root)
     return send_file(out_path, as_attachment=True, download_name=filename,
@@ -6202,9 +6712,16 @@ def import_project():
                 zf.extract(name, target)
 
         # Switch DMS to use this folder
-        cfg = load_config()
-        cfg["storage_path"] = str(target)
-        save_config(cfg)
+        set_storage_path(str(target))
+
+        # Backstop: make sure every node in the imported tree has a physical
+        # on-disk folder, even ones with no files of their own (e.g. a node
+        # whose only documents are links to a file stored under a different
+        # node — see the LinkPicker drag-to-link feature). Newer exports
+        # already carry explicit empty-directory entries for these (see
+        # export_project_full), but this also repairs older/partial backups
+        # that don't, so the disk always mirrors the tree after import.
+        _create_local_folder_structure(read_index().get("tree"))
 
         # If the password just used to decrypt this file also unlocks the
         # newly-imported project (same password — see _write_dms_zip), unlock
@@ -6231,7 +6748,7 @@ def import_project():
 
         resp = jsonify({"ok": True, **inventory})
         if auto_unlock_cookie:
-            resp.set_cookie("dms_project_session", auto_unlock_cookie, httponly=True, samesite="Strict")
+            resp.set_cookie(_project_cookie_name(), auto_unlock_cookie, httponly=True, samesite="Strict")
         return resp
     finally:
         try:
@@ -6340,10 +6857,33 @@ def new_project():
     except OSError as e:
         return jsonify({"error": f"Cannot create folder: {e}"}), 400
 
-    cfg = load_config()
-    cfg["storage_path"] = str(target)
-    save_config(cfg)
+    set_storage_path(str(target))
     return jsonify({"ok": True, "storage_path": str(target)})
+
+
+@app.route("/api/spawn-instance", methods=["POST"])
+def spawn_instance():
+    """Open another project in a second, concurrently-running DMS instance.
+
+    Delegates to the launcher via _spawn_instance_fn (set in dms_launcher.py
+    at startup, mirroring how _tunnel_start_fn is injected for Remote
+    Upload) -- this process has no business managing other OS processes
+    itself. Unset when dms_server.py is run standalone (no launcher), e.g.
+    `python3 dms_server.py` from a terminal.
+    """
+    if _spawn_instance_fn is None:
+        return jsonify({"error": "Opening another project needs the DMS desktop app (not available when running the server directly)."}), 501
+
+    data = request.get_json(force=True) or {}
+    target_path = (data.get("path") or "").strip()
+    if not target_path:
+        return jsonify({"error": "path is required"}), 400
+
+    try:
+        result = _spawn_instance_fn(target_path)
+    except Exception as e:
+        return jsonify({"error": f"Could not open that project: {e}"}), 500
+    return jsonify({"ok": True, **result})
 
 
 # ---- Hierarchy import -----------------------------------------------------
@@ -6774,7 +7314,7 @@ def _run_deepface_worker(cmd: dict, timeout: int = 300) -> dict:
 
 # deepface install runs in a background thread, polled via /api/install-deepface/status,
 # rather than inside the POST request itself. Installing deepface + TensorFlow can take
-# well over 5 minutes on a slow connection — longer than waitress's channel_timeout (300s,
+# well over 5 minutes on a slow connection — longer than waitress's channel_timeout (1200s,
 # set in dms_launcher.py), which would silently kill the connection mid-install and surface
 # to the browser as a bare "Failed to fetch" with no useful error message.
 _DEEPFACE_INSTALL_LOCK = _Lock()
