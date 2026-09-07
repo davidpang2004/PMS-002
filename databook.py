@@ -181,6 +181,13 @@ def _doc_path(docs_dir: Path, doc_id: str) -> Path | None:
 _MAX_EMBED_DIM = 900   # px, longest edge fit within this box (~165x smaller than embedding full-res)
 _EMBED_JPEG_QUALITY = 85
 
+# Image extensions we can embed via Pillow (HEIC/HEIF need pillow-heif, which
+# _ensure_heif_support() registers). Used as a fallback when a document's mime
+# is missing or generic — see the dispatch in build_databook().
+_IMAGE_EXTS = {
+    "jpg", "jpeg", "png", "gif", "bmp", "tif", "tiff", "webp", "heic", "heif",
+}
+
 
 def _downscaled_jpeg_reader(img_path: Path) -> "ImageReader":
     """Open an image, downscale it to fit within _MAX_EMBED_DIM x _MAX_EMBED_DIM
@@ -532,7 +539,16 @@ def build_databook(
                 continue
 
             mime = (doc.get("mime") or "").lower()
-            if mime == "application/pdf":
+            # iPhone HEIC photos (and some other images) are frequently stored
+            # with an empty or generic mime ("application/octet-stream"), which
+            # used to drop them into the "Unsupported type" placeholder branch
+            # even though Pillow (+ pillow-heif) can render them fine. Fall back
+            # to the file extension — of the on-disk file or the document name —
+            # whenever the mime isn't already a decisive pdf/image value.
+            ext = (doc_path.suffix or Path(doc.get("name") or "").suffix).lower().lstrip(".")
+            is_pdf = mime == "application/pdf" or (not mime.startswith("image/") and ext == "pdf")
+            is_image = mime.startswith("image/") or (not is_pdf and ext in _IMAGE_EXTS)
+            if is_pdf:
                 try:
                     src = PdfReader(str(doc_path))
                     for p in src.pages:
@@ -546,14 +562,14 @@ def build_databook(
                     for p in ph_reader.pages:
                         writer.add_page(p)
                     ph_reader.close()
-            elif mime.startswith("image/"):
+            elif is_image:
                 img_pdf = _image_to_pdf_bytes(doc_path, doc["name"])
                 img_reader = PdfReader(io.BytesIO(img_pdf))
                 for p in img_reader.pages:
                     writer.add_page(p)
                 img_reader.close()
             else:
-                placeholder = _build_missing_doc_pdf(doc, error=f"Unsupported type: {mime}")
+                placeholder = _build_missing_doc_pdf(doc, error=f"Unsupported type: {mime or ext or 'unknown'}")
                 ph_reader = PdfReader(io.BytesIO(placeholder))
                 for p in ph_reader.pages:
                     writer.add_page(p)

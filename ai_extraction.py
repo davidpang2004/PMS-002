@@ -551,3 +551,99 @@ def polish_description_text(text: str, api_key: str, provider: str = "gemini",
     if not out:
         raise AIExtractionError("AI 未返回有效的结果。")
     return {"text": out, "model": model_used}
+
+
+_TYPO_CHECK_PROMPT = """\
+你是一位中文文字校对员。请仔细检查下面这段中文文本，只找出真正的错误，不要\
+挑剔文风、语气或个人写作习惯。需要检查的错误类型：
+1. 别字/错字（同音字、形近字混用，如"的地得"、"在再"、"以已"）
+2. 多字、漏字导致的错误
+3. 明显的语法或搭配错误
+4. 成语或固定用法使用错误
+5. 标点符号误用（成对符号未闭合或方向用反、明显缺失或多余的标点、导致歧义的中英文标点混用）
+
+如果只是全篇一致地用英文句号/逗号代替中文标点，这是常见的个人打字习惯，不要\
+当作错误列出。如果没有发现任何问题，也不要为了凑数而编造问题。
+
+只返回一个 JSON 对象，不要有任何其它文字、说明或代码块标记，格式如下：
+{{"issues": [{{"type": "别字|语法|成语|标点", "original": "原文中出现错误的\
+最小连续片段（几个字即可，需要能在原文中唯一定位到）", "corrected": "该片段\
+修正后的文字", "note": "一句话说明错误原因"}}]}}
+如果没有发现任何问题，返回 {{"issues": []}}。
+
+待检查文本：
+-----
+{text}
+-----
+"""
+
+
+def check_typos_cn(text: str, api_key: str, provider: str = "gemini") -> dict:
+    """Proofread a Chinese text block for typos, mis-used homophones,
+    idiom misuse and punctuation errors -- the same rubric as the
+    check-typos-cn Claude Code skill. That skill has Claude itself read and
+    judge the text directly inside a Claude Code session, with no API call
+    at all; DMS.app has no such session when it's running standalone on
+    someone else's computer, so this ports the same rubric into a normal
+    LLM API call instead, reusing whichever provider (Gemini/DeepSeek) the
+    user has already configured for the app's other AI features.
+
+    Each returned issue's "original" is a short, exact substring of `text`
+    (not a paraphrase) so the caller can locate and replace it directly --
+    same before/after shape the skill's own corrected-copy step uses.
+
+    Returns {"issues": [{"type", "original", "corrected", "note"}, ...],
+    "model": str}.
+    """
+    text = (text or "").strip()
+    if not text:
+        raise AIExtractionError("没有可检查的文字。")
+    if not api_key:
+        label = "DeepSeek" if provider == "deepseek" else "Gemini"
+        raise AIExtractionError(f"未配置 {label} API Key，请先在设置中添加。")
+
+    prompt = _TYPO_CHECK_PROMPT.format(text=text)
+
+    if provider == "deepseek":
+        out = _deepseek_chat([{"role": "user", "content": prompt}], api_key).strip()
+        if not out:
+            raise AIExtractionError("AI 未返回有效的结果。")
+        result = _extract_json_object(out)
+        issues = result.get("issues") if isinstance(result, dict) else None
+        if not isinstance(issues, list):
+            raise AIExtractionError("AI 返回的内容格式不正确。")
+        return {"issues": issues, "model": DEEPSEEK_DEFAULT_MODEL}
+
+    try:
+        from google import genai
+    except ImportError:
+        raise AIExtractionError(
+            "未安装 google-genai 库。请在运行此程序的 Python 中执行：pip install google-genai")
+
+    client = genai.Client(api_key=api_key)
+    candidates = [DEFAULT_MODEL] + [m for m in FALLBACK_MODELS if m != DEFAULT_MODEL]
+    response = None
+    last_error = None
+    model_used = None
+    for candidate in candidates:
+        try:
+            response = client.models.generate_content(model=candidate, contents=[prompt])
+            model_used = candidate
+            last_error = None
+            break
+        except Exception as e:
+            last_error = e
+            msg = str(e)
+            if "NOT_FOUND" in msg or "404" in msg or "no longer available" in msg:
+                continue
+            break
+
+    if last_error is not None:
+        raise AIExtractionError(f"调用 Gemini API 失败：{last_error}")
+
+    out = (getattr(response, "text", None) or "").strip()
+    result = _extract_json_object(out)
+    issues = result.get("issues") if isinstance(result, dict) else None
+    if not isinstance(issues, list):
+        raise AIExtractionError("AI 返回的内容格式不正确。")
+    return {"issues": issues, "model": model_used}

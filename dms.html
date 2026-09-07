@@ -16,6 +16,11 @@ Babel.registerPreset('react-classic', {
 <style>
   html, body, #root { height: 100%; margin: 0; }
   body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  @keyframes dms-indeterminate {
+    0%   { margin-left: -40%; width: 40%; }
+    50%  { margin-left: 60%; width: 40%; }
+    100% { margin-left: 100%; width: 40%; }
+  }
 </style>
 </head>
 <body class="bg-stone-50">
@@ -279,6 +284,22 @@ const CheckSquare = (p) => (
   </I>
 );
 const Square = (p) => <I {...p}><rect x="3" y="3" width="18" height="18" rx="2" ry="2" /></I>;
+const Maximize2 = (p) => (
+  <I {...p}>
+    <polyline points="15 3 21 3 21 9" />
+    <polyline points="9 21 3 21 3 15" />
+    <line x1="21" y1="3" x2="14" y2="10" />
+    <line x1="3" y1="21" x2="10" y2="14" />
+  </I>
+);
+const Minimize2 = (p) => (
+  <I {...p}>
+    <polyline points="4 14 10 14 10 20" />
+    <polyline points="20 10 14 10 14 4" />
+    <line x1="14" y1="10" x2="21" y2="3" />
+    <line x1="3" y1="21" x2="10" y2="14" />
+  </I>
+);
 const MinusSquare = (p) => (
   <I {...p}>
     <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
@@ -632,7 +653,8 @@ const StorageAdapter = {
     });
   },
 
-  // Documents: upload as multipart, retrieve as URL
+  // Documents: upload as multipart (or, above LARGE_UPLOAD_THRESHOLD, as a
+  // raw stream — see below), retrieve as URL
   async saveDocument(doc) {
     // New uploads pass the original File directly via doc.file, so we can
     // post it as-is — no base64 round trip, which used to blow past browser
@@ -640,17 +662,49 @@ const StorageAdapter = {
     // already-stored document (e.g. metadata edits) still come through as
     // doc.dataUrl pointing at the server URL, with no doc.file — those
     // fetch the existing bytes and re-post them, unchanged from before.
+    const blobOrFile = doc.file || await (await fetch(doc.dataUrl)).blob();
+
+    // Above this size, skip multipart/form-data entirely and post the raw
+    // bytes to /api/docs/upload-stream with metadata in the query string.
+    // Multipart forces the server (Werkzeug) to re-parse boundaries and
+    // copy the file part into its own second on-disk temp file before our
+    // handler ever sees it; a raw body has no boundaries to parse, so the
+    // handler reads straight off the same buffered request stream — one
+    // fewer full-size copy for the files this actually matters for (see
+    // post_doc_stream in dms_server.py). Small/ordinary uploads keep using
+    // the simpler, well-worn multipart path below.
+    const LARGE_UPLOAD_THRESHOLD = 200 * 1024 * 1024; // 200 MB
+    if (blobOrFile.size >= LARGE_UPLOAD_THRESHOLD) {
+      const params = new URLSearchParams();
+      params.set("doc_id", doc.id);
+      params.set("filename", doc.name);
+      const _nodeId = doc.originalNodeId || doc.nodeId;
+      if (_nodeId) params.set("node_id", _nodeId);
+      if (doc.routeMode) params.set("route_mode", doc.routeMode);
+      if (doc.photoYear) params.set("photo_year", doc.photoYear);
+      if (doc.photoMonth) params.set("photo_month", doc.photoMonth);
+      if (doc.photoLat != null) params.set("photo_lat", String(doc.photoLat));
+      if (doc.photoLon != null) params.set("photo_lon", String(doc.photoLon));
+      if (doc.photoBaseNodeId) params.set("photo_base_node_id", doc.photoBaseNodeId);
+      const res = await fetch(API_BASE + "/api/docs/upload-stream?" + params.toString(), {
+        method: "POST",
+        headers: { "Content-Type": "application/octet-stream" },
+        body: blobOrFile,
+      });
+      let resData = {};
+      try { resData = await res.json(); } catch {}
+      if (!res.ok) {
+        throw new Error(`Upload failed: HTTP ${res.status} ${resData.error || ""}`);
+      }
+      console.log(`[DMS] ✓ Uploaded (stream) ${doc.name} → ${resData.path || resData.filename}${resData.location ? ` [${resData.location}]` : ""}`);
+      return resData;
+    }
+
     // NOTE: do NOT use `new File(...)` here — our React `File` icon component
     // shadows the global File constructor in this scope. FormData accepts a
     // Blob/File plus filename argument, which works the same way.
     const form = new FormData();
-    if (doc.file) {
-      form.append("file", doc.file, doc.name);
-    } else {
-      const response = await fetch(doc.dataUrl);
-      const blob = await response.blob();
-      form.append("file", blob, doc.name);
-    }
+    form.append("file", blobOrFile, doc.name);
     form.append("doc_id", doc.id);
     const _nodeId = doc.originalNodeId || doc.nodeId;
     if (_nodeId) form.append("node_id", _nodeId);
@@ -830,6 +884,24 @@ const StorageAdapter = {
       throw new Error(detail || tOutsideReact(`AI 整理失败: HTTP ${res.status}`, `AI polish failed: HTTP ${res.status}`));
     }
     return res.json();   // { ok, text, provider, model }
+  },
+
+  // Proofread a Chinese text block (typos, mis-used homophones, punctuation,
+  // idiom misuse) via Gemini / DeepSeek. Same rubric as the check-typos-cn
+  // Claude Code skill, ported here so this works standalone in DMS.app on
+  // anyone's machine, using whichever AI provider they've already configured.
+  async checkTyposCN(text, { provider = "gemini" } = {}) {
+    const res = await fetch(API_BASE + "/api/check-typos-cn", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, provider }),
+    });
+    if (!res.ok) {
+      let detail = "";
+      try { detail = (await res.json()).error || ""; } catch {}
+      throw new Error(detail || tOutsideReact(`错别字检查失败: HTTP ${res.status}`, `Typo check failed: HTTP ${res.status}`));
+    }
+    return res.json();   // { ok, issues: [{type, original, corrected, note}], provider, model }
   },
 
   // Save a reviewed block of panel text (description / OCR output / AI answer)
@@ -1995,6 +2067,11 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
   const [polishError, setPolishError] = useState("");
   const [polishResult, setPolishResult] = useState(null);   // { text, before } once returned, awaiting accept/discard
 
+  // AI "check Chinese typos" (same rubric as the check-typos-cn skill)
+  const [typoChecking, setTypoChecking] = useState(false);
+  const [typoError, setTypoError] = useState("");
+  const [typoIssues, setTypoIssues] = useState(null);   // [{type, original, corrected, note}] once returned, or [] for "no issues"
+
   // Voice-to-text dictation for the description field (Web Speech API).
   const [voiceLang, setVoiceLang] = useState("zh-CN");
   const [listening, setListening] = useState(false);
@@ -2067,6 +2144,129 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
 
   const panelOpen = panelMode !== null;
 
+  // --- Resizable / draggable viewer window ---------------------------------
+  // The window used to be a fixed max-w-6xl / 90vh box: with the side panel
+  // (description, OCR text, Ask-AI, ...) open, the document preview and the
+  // panel were each squeezed too narrow to work in. Now the window can be
+  // dragged by its header, resized from any edge/corner, maximised, and the
+  // preview | panel split is itself draggable -- and the document can be
+  // popped out into its own OS window (see popOut) for a monitor of its own.
+  const VIEWER_MIN_W = 480, VIEWER_MIN_H = 360;
+  const winRef = useRef(null);
+  const winDragRef = useRef(null);
+  const splitRef = useRef(null);
+  const popOutRef = useRef(null);
+  const [winInteracting, setWinInteracting] = useState(null); // null|"move"|edge dir|"split"
+  const [maximized, setMaximized] = useState(false);
+  const [poppedOut, setPoppedOut] = useState(false);
+  const [popupBlocked, setPopupBlocked] = useState(false);
+  const [panelW, setPanelW] = useState(480);
+  const [winRect, setWinRect] = useState(() => {
+    const vw = typeof window !== "undefined" ? window.innerWidth : 1280;
+    const vh = typeof window !== "undefined" ? window.innerHeight : 800;
+    const w = Math.min(1500, Math.round(vw * 0.94));
+    const h = Math.round(vh * 0.92);
+    return { x: Math.round((vw - w) / 2), y: Math.round((vh - h) / 2), w, h };
+  });
+  // Re-render on browser-window resize so a maximised viewer keeps filling it.
+  const [, forceWinTick] = useState(0);
+  useEffect(() => {
+    const onR = () => forceWinTick((n) => n + 1);
+    window.addEventListener("resize", onR);
+    return () => window.removeEventListener("resize", onR);
+  }, []);
+  // Close a popped-out window when the viewer unmounts.
+  useEffect(() => () => { try { popOutRef.current && popOutRef.current.close(); } catch {} }, []);
+
+  const _vw = typeof window !== "undefined" ? window.innerWidth : winRect.w;
+  const _vh = typeof window !== "undefined" ? window.innerHeight : winRect.h;
+  const rect = maximized ? { x: 0, y: 0, w: _vw, h: _vh } : winRect;
+
+  const _clampRect = (r) => {
+    const w = Math.min(Math.max(VIEWER_MIN_W, r.w), _vw);
+    const h = Math.min(Math.max(VIEWER_MIN_H, r.h), _vh);
+    return {
+      w, h,
+      x: Math.min(Math.max(0, r.x), Math.max(0, _vw - w)),
+      y: Math.min(Math.max(0, r.y), Math.max(0, _vh - h)),
+    };
+  };
+  const _liveRect = () => {
+    if (!maximized) return winRect;
+    const b = winRef.current?.getBoundingClientRect();
+    return b ? { x: b.left, y: b.top, w: b.width, h: b.height } : winRect;
+  };
+  const _attach = (onMove) => {
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      winDragRef.current = null; splitRef.current = null;
+      setWinInteracting(null);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+  const onWinMoveStart = (e) => {
+    if (e.target.closest("button, a, input, textarea, select")) return;
+    e.preventDefault();
+    const base = _liveRect();
+    setMaximized(false); setWinRect(base);
+    winDragRef.current = { mode: "move", startX: e.clientX, startY: e.clientY, base };
+    setWinInteracting("move");
+    _attach((ev) => {
+      const d = winDragRef.current; if (!d) return;
+      setWinRect(_clampRect({ ...d.base, x: d.base.x + (ev.clientX - d.startX), y: d.base.y + (ev.clientY - d.startY) }));
+    });
+  };
+  const onWinResizeStart = (dir) => (e) => {
+    e.preventDefault(); e.stopPropagation();
+    const base = _liveRect();
+    setMaximized(false); setWinRect(base);
+    winDragRef.current = { mode: dir, startX: e.clientX, startY: e.clientY, base };
+    setWinInteracting(dir);
+    _attach((ev) => {
+      const d = winDragRef.current; if (!d) return;
+      const dx = ev.clientX - d.startX, dy = ev.clientY - d.startY;
+      let { x, y, w, h } = d.base;
+      if (dir.includes("e")) w = d.base.w + dx;
+      if (dir.includes("s")) h = d.base.h + dy;
+      if (dir.includes("w")) { w = d.base.w - dx; x = d.base.x + dx; }
+      if (dir.includes("n")) { h = d.base.h - dy; y = d.base.y + dy; }
+      if (w < VIEWER_MIN_W) { if (dir.includes("w")) x = d.base.x + (d.base.w - VIEWER_MIN_W); w = VIEWER_MIN_W; }
+      if (h < VIEWER_MIN_H) { if (dir.includes("n")) y = d.base.y + (d.base.h - VIEWER_MIN_H); h = VIEWER_MIN_H; }
+      setWinRect({ x, y, w, h });
+    });
+  };
+  const onSplitStart = (e) => {
+    e.preventDefault();
+    splitRef.current = { startX: e.clientX, base: panelW, maxW: rect.w - 360 };
+    setWinInteracting("split");
+    _attach((ev) => {
+      const d = splitRef.current; if (!d) return;
+      // Panel is docked right; dragging the splitter left widens it.
+      setPanelW(Math.max(300, Math.min(d.base + (d.startX - ev.clientX), d.maxW)));
+    });
+  };
+  const popOut = () => {
+    try {
+      const w = window.open(viewUrl, `dms_doc_${doc.id}`, "width=1100,height=850");
+      if (w) { popOutRef.current = w; try { w.focus(); } catch {} setPoppedOut(true); setPopupBlocked(false); }
+      else setPopupBlocked(true);
+    } catch { setPopupBlocked(true); }
+  };
+  const bringBack = () => {
+    try { popOutRef.current && popOutRef.current.close(); } catch {}
+    popOutRef.current = null;
+    setPoppedOut(false); setPopupBlocked(false);
+  };
+  const winInteractCursor = winInteracting === "move" ? "grabbing"
+    : winInteracting === "split" ? "ew-resize"
+    : winInteracting === "e" || winInteracting === "w" ? "ew-resize"
+    : winInteracting === "n" || winInteracting === "s" ? "ns-resize"
+    : winInteracting === "ne" || winInteracting === "sw" ? "nesw-resize"
+    : winInteracting === "nw" || winInteracting === "se" ? "nwse-resize"
+    : "default";
+
   // Global parameters (from the shared list) vs. this document's local adds.
   const globalKeys = useMemo(() => normalizeKeyParameters(keyParameters), [keyParameters]);
   const globalSet = useMemo(() => new Set(globalKeys.map((k) => k.toLowerCase())), [globalKeys]);
@@ -2090,6 +2290,10 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
     setCopied(false); setSaved(false);
     setImgLoadError(false);
     setDescription(doc.description || ""); setDescSaved(false);
+    // Close any popped-out window from the previous document.
+    try { popOutRef.current && popOutRef.current.close(); } catch {}
+    popOutRef.current = null;
+    setPoppedOut(false); setPopupBlocked(false);
     setPolishResult(null); setPolishError(""); setPolishing(false);
     setVoiceInterim(""); setVoiceError(""); setListening(false);
     // Load this document's locally-added parameters; select NONE by default
@@ -2183,6 +2387,47 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
     setDescription(polishResult.text);
     setDescSaved(false);
     setPolishResult(null);
+  };
+
+  // --- AI "check Chinese typos" for the description ---------------------------
+  const runTypoCheck = async () => {
+    const text = description.trim();
+    if (!text || typoChecking || !aiPolishReady) return;
+    setTypoChecking(true); setTypoError(""); setTypoIssues(null);
+    try {
+      const r = await StorageAdapter.checkTyposCN(text, { provider: polishProvider });
+      setTypoIssues(Array.isArray(r.issues) ? r.issues : []);
+    } catch (e) {
+      setTypoError(e.message || String(e));
+    } finally {
+      setTypoChecking(false);
+    }
+  };
+  // Replace the first occurrence of one issue's erroring text with its fix,
+  // then drop that issue from the list. If the exact snippet the AI quoted
+  // can no longer be found (e.g. the text changed since the check ran, or an
+  // earlier fix already touched this span), leave the description alone --
+  // the issue stays listed so the user can fix it by hand instead.
+  const applyTypoFix = (issue) => {
+    if (!issue || !description.includes(issue.original)) return;
+    setDescription((prev) => prev.replace(issue.original, issue.corrected));
+    setDescSaved(false);
+    setTypoIssues((prev) => (prev || []).filter((i) => i !== issue));
+  };
+  const applyAllTypoFixes = () => {
+    let next = description;
+    const applied = [];
+    for (const issue of typoIssues || []) {
+      if (next.includes(issue.original)) {
+        next = next.replace(issue.original, issue.corrected);
+        applied.push(issue);
+      }
+    }
+    if (applied.length) {
+      setDescription(next);
+      setDescSaved(false);
+      setTypoIssues((prev) => (prev || []).filter((i) => !applied.includes(i)));
+    }
   };
 
   // Save a block of side-panel text as its own new .txt document, filed into
@@ -2496,14 +2741,37 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
 
   return (
     <div
-      className="fixed inset-0 bg-stone-900/80 z-50 flex items-center justify-center p-4"
+      className="fixed inset-0 bg-stone-900/80 z-50"
+      style={winInteracting ? { cursor: winInteractCursor } : undefined}
       onClick={onClose}
     >
       <div
-        className="bg-white w-full max-w-6xl h-[90vh] flex flex-col rounded shadow-2xl"
+        ref={winRef}
+        className={"absolute bg-white flex flex-col shadow-2xl overflow-hidden " + (maximized ? "" : "rounded")}
+        style={{ left: rect.x, top: rect.y, width: rect.w, height: rect.h }}
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex items-center justify-between px-4 py-3 border-b border-stone-200">
+        {/* Resize handles (edges + corners); hidden while maximised */}
+        {!maximized && (
+          <>
+            <div onMouseDown={onWinResizeStart("n")}  className="absolute top-0 inset-x-2 h-1.5 cursor-ns-resize z-30" />
+            <div onMouseDown={onWinResizeStart("s")}  className="absolute bottom-0 inset-x-2 h-1.5 cursor-ns-resize z-30" />
+            <div onMouseDown={onWinResizeStart("w")}  className="absolute left-0 inset-y-2 w-1.5 cursor-ew-resize z-30" />
+            <div onMouseDown={onWinResizeStart("e")}  className="absolute right-0 inset-y-2 w-1.5 cursor-ew-resize z-30" />
+            <div onMouseDown={onWinResizeStart("nw")} className="absolute top-0 left-0 w-3 h-3 cursor-nwse-resize z-30" />
+            <div onMouseDown={onWinResizeStart("ne")} className="absolute top-0 right-0 w-3 h-3 cursor-nesw-resize z-30" />
+            <div onMouseDown={onWinResizeStart("sw")} className="absolute bottom-0 left-0 w-3 h-3 cursor-nesw-resize z-30" />
+            <div onMouseDown={onWinResizeStart("se")} className="absolute bottom-0 right-0 w-3.5 h-3.5 cursor-nwse-resize z-30" />
+          </>
+        )}
+        {/* Transparent shield so an iframe/img can't swallow the drag gesture */}
+        {winInteracting && (
+          <div className="absolute inset-0 z-40" style={{ cursor: winInteractCursor }} />
+        )}
+        <div
+          className="flex items-center justify-between px-4 py-3 border-b border-stone-200 cursor-move select-none shrink-0"
+          onMouseDown={onWinMoveStart}
+        >
           <div className="min-w-0">
             <div className="text-base font-medium text-stone-900 truncate">{doc.name}</div>
             <div className="text-[13px] text-stone-700 font-mono">{doc.id}</div>
@@ -2615,6 +2883,25 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
               <Download size={13} /> {t("下载", "Download")}
             </a>
             <button
+              onClick={poppedOut ? bringBack : popOut}
+              title={poppedOut
+                ? t("把文档收回本窗口", "Bring the document back into this window")
+                : t("在独立窗口中打开文档（可拖到另一个显示器）", "Open the document in its own window (drag it to another monitor)")}
+              className={"text-sm px-3 py-1.5 rounded flex items-center gap-1.5 border " +
+                (poppedOut
+                  ? "border-amber-400 text-amber-800 bg-amber-50 hover:bg-amber-100"
+                  : "border-stone-300 text-stone-700 hover:bg-stone-100")}
+            >
+              <ExternalLink size={13} /> {poppedOut ? t("收回文档", "Bring back") : t("弹出文档", "Pop out")}
+            </button>
+            <button
+              onClick={() => setMaximized((m) => !m)}
+              title={maximized ? t("还原窗口大小", "Restore window size") : t("最大化窗口", "Maximise window")}
+              className="text-sm px-2 py-1.5 border border-stone-300 text-stone-700 hover:bg-stone-100 rounded flex items-center"
+            >
+              {maximized ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
+            </button>
+            <button
               onClick={onClose}
               className="text-sm px-3 py-1.5 border border-stone-300 text-stone-700 hover:bg-stone-100 rounded flex items-center gap-1"
             >
@@ -2623,8 +2910,29 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
           </div>
         </div>
 
+        {popupBlocked && (
+          <div className="px-4 py-2 bg-amber-50 border-b border-amber-200 text-[13px] text-amber-800 flex items-center gap-2 shrink-0">
+            {t("浏览器拦截了弹出窗口。", "Your browser blocked the pop-up window.")}
+            <a href={viewUrl} target="_blank" rel="noopener noreferrer" className="underline font-medium">
+              {t("在新标签页打开文档", "Open the document in a new tab")}
+            </a>
+            <button onClick={() => setPopupBlocked(false)} className="ml-auto text-amber-700 hover:text-amber-900"><X size={13} /></button>
+          </div>
+        )}
+
         <div className="flex-1 min-h-0 flex">
           {/* Preview pane */}
+          {poppedOut ? (
+            !panelOpen && (
+              <div className="flex-1 min-h-0 flex flex-col items-center justify-center gap-3 bg-stone-100 text-stone-600 text-sm p-6 text-center">
+                <ExternalLink size={40} className="text-stone-400" />
+                <div>{t("文档已在独立窗口中打开。", "The document is open in its own window.")}</div>
+                <button onClick={bringBack} className="px-3 py-1.5 border border-stone-300 rounded hover:bg-white flex items-center gap-1.5">
+                  <Minimize2 size={13} /> {t("收回本窗口", "Bring it back here")}
+                </button>
+              </div>
+            )
+          ) : (
           <div className={"min-h-0 overflow-auto bg-stone-100 " + (panelOpen ? "flex-1 border-r border-stone-200" : "flex-1")}>
             {imgLoadError ? (
               <div className="h-full flex flex-col items-center justify-center text-stone-700 gap-3 p-6">
@@ -2677,10 +2985,26 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
               </div>
             )}
           </div>
+          )}
+
+          {/* Draggable splitter between the preview and the side panel */}
+          {panelOpen && !poppedOut && (
+            <div
+              onMouseDown={onSplitStart}
+              title={t("拖动调整两侧宽度", "Drag to resize the two sides")}
+              className={"w-2.5 shrink-0 cursor-ew-resize flex items-center justify-center group " +
+                (winInteracting === "split" ? "bg-sky-400" : "bg-stone-200 hover:bg-sky-300")}
+            >
+              <div className="w-0.5 h-8 rounded bg-stone-400 group-hover:bg-white" />
+            </div>
+          )}
 
           {/* Description / caption panel */}
           {panelMode === "desc" && (
-            <div className="w-[40%] max-w-md min-h-0 flex flex-col bg-white">
+            <div
+              className={"min-h-0 flex flex-col bg-white " + (poppedOut ? "flex-1" : "shrink-0")}
+              style={poppedOut ? undefined : { width: panelW }}
+            >
               <div className="flex items-center justify-between px-3 py-2 border-b border-stone-200 bg-stone-50">
                 <div className="flex items-center gap-1.5 text-sm font-medium text-stone-700">
                   <Edit2 size={13} /> {t("描述", "Description")}
@@ -2770,11 +3094,26 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
                   </button>
                 )}
                 {aiPolishReady && (
+                  <button
+                    onClick={runTypoCheck}
+                    disabled={typoChecking || !description.trim()}
+                    title={t("用 AI 检查上面的描述有没有错别字、标点或成语误用", "Use AI to check the description above for typos, punctuation and idiom misuse")}
+                    className="text-[12px] px-2 py-1 border border-purple-300 text-purple-800 bg-white hover:bg-purple-50 rounded flex items-center gap-1 disabled:opacity-40"
+                  >
+                    {typoChecking
+                      ? (<><Loader size={11} className="animate-spin" /> {t("检查中…", "Checking…")}</>)
+                      : (<><ListChecks size={11} /> {t("检查错别字", "Check typos")}</>)}
+                  </button>
+                )}
+                {aiPolishReady && (
                   <span className="text-[11px] text-stone-500 shrink-0">{polishProvider === "deepseek" ? "DeepSeek" : "Gemini"}</span>
                 )}
               </div>
               {polishError && (
                 <div className="px-3 py-1 text-[12px] text-red-600 bg-red-50 border-b border-red-100">{polishError}</div>
+              )}
+              {typoError && (
+                <div className="px-3 py-1 text-[12px] text-red-600 bg-red-50 border-b border-red-100">{typoError}</div>
               )}
 
               <div className="flex-1 min-h-0 overflow-auto p-3">
@@ -2812,6 +3151,57 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
                       {t("原文保留，应用后仍需点“保存”", "Your original is kept — remember to Save after applying")}
                     </span>
                   </div>
+                </div>
+              )}
+
+              {typoIssues && (
+                <div className="border-t border-purple-200 bg-purple-50 px-3 py-2 flex flex-col gap-1.5 max-h-[45%] overflow-auto">
+                  <div className="text-[12px] font-medium text-purple-800 flex items-center gap-1">
+                    <ListChecks size={12} /> {t("错别字检查结果", "Typo check result")}
+                  </div>
+                  {typoIssues.length === 0 ? (
+                    <div className="text-[13px] text-stone-700">{t("未发现问题 ✅", "No issues found ✅")}</div>
+                  ) : (
+                    <>
+                      {typoIssues.map((issue, i) => (
+                        <div key={i} className="text-[13px] bg-white border border-purple-200 rounded p-2 flex flex-col gap-1">
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-[11px] px-1.5 py-0.5 rounded bg-purple-100 text-purple-800 shrink-0">
+                              {issue.type || t("问题", "Issue")}
+                            </span>
+                            <span className="text-stone-800 line-through decoration-red-400">{issue.original}</span>
+                            <span className="text-stone-400">→</span>
+                            <span className="text-emerald-700 font-medium">{issue.corrected}</span>
+                          </div>
+                          {issue.note && <div className="text-[12px] text-stone-500">{issue.note}</div>}
+                          <button
+                            onClick={() => applyTypoFix(issue)}
+                            disabled={!description.includes(issue.original)}
+                            className="self-start text-[11px] px-2 py-0.5 bg-purple-600 text-white rounded hover:bg-purple-700 disabled:opacity-40"
+                          >
+                            {t("应用此项", "Apply this")}
+                          </button>
+                        </div>
+                      ))}
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <button
+                          onClick={applyAllTypoFixes}
+                          className="text-[12px] px-2.5 py-1 bg-purple-600 text-white rounded hover:bg-purple-700"
+                        >
+                          {t("全部应用", "Apply all")}
+                        </button>
+                        <button
+                          onClick={() => setTypoIssues(null)}
+                          className="text-[12px] px-2.5 py-1 border border-stone-300 text-stone-700 rounded hover:bg-white"
+                        >
+                          {t("关闭", "Close")}
+                        </button>
+                        <span className="text-[11px] text-stone-500 ml-auto">
+                          {t("原文保留，应用后仍需点“保存”", "Your original is kept — remember to Save after applying")}
+                        </span>
+                      </div>
+                    </>
+                  )}
                 </div>
               )}
 
@@ -2859,7 +3249,10 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
 
           {/* OCR result panel */}
           {panelMode === "text" && (
-            <div className="w-[40%] max-w-md min-h-0 flex flex-col bg-white">
+            <div
+              className={"min-h-0 flex flex-col bg-white " + (poppedOut ? "flex-1" : "shrink-0")}
+              style={poppedOut ? undefined : { width: panelW }}
+            >
               <div className="flex items-center justify-between px-3 py-2 border-b border-stone-200 bg-stone-50">
                 <div className="flex items-center gap-1.5 text-sm font-medium text-stone-700">
                   <ScanText size={13} /> {t("提取的文字", "Extracted text")}
@@ -2975,7 +3368,10 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
 
           {/* Key-parameter extraction panel */}
           {panelMode === "keys" && (
-            <div className="w-[44%] max-w-lg min-h-0 flex flex-col bg-white">
+            <div
+              className={"min-h-0 flex flex-col bg-white " + (poppedOut ? "flex-1" : "shrink-0")}
+              style={poppedOut ? undefined : { width: panelW }}
+            >
               <div className="flex items-center justify-between px-3 py-2 border-b border-stone-200 bg-stone-50">
                 <div className="flex items-center gap-1.5 text-sm font-medium text-stone-700">
                   <ListChecks size={13} /> {t("关键参数提取", "Key parameter extraction")}
@@ -3257,7 +3653,10 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
 
           {/* Ask-AI panel: free-form Q&A about this document, filed to a running log */}
           {panelMode === "ask" && (
-            <div className="w-[40%] max-w-lg min-h-0 flex flex-col bg-white">
+            <div
+              className={"min-h-0 flex flex-col bg-white " + (poppedOut ? "flex-1" : "shrink-0")}
+              style={poppedOut ? undefined : { width: panelW }}
+            >
               <div className="flex items-center justify-between px-3 py-2 border-b border-stone-200 bg-stone-50">
                 <div className="flex items-center gap-1.5 text-sm font-medium text-stone-700">
                   <Sparkles size={13} className="text-purple-600" /> {t("就本文档提问 AI", "Ask AI about this document")}
@@ -10141,10 +10540,94 @@ const PeoplePanel = ({ onFilterPerson, filteredPersonId, tree }) => {
   );
 };
 
+/* Downloads a response body as a Blob while reporting bytes-received
+ * progress (used by the .dms export buttons below — full/selected backups
+ * can be large enough that a bare spinner isn't very reassuring). Falls
+ * back to a single onProgress(0,0) call if the browser lacks streaming
+ * response bodies. Throws the same {error} message the old plain
+ * res.blob() call sites did on a non-OK response. */
+async function fetchBlobWithProgress(url, options, onProgress) {
+  const res = await fetch(url, options);
+  if (!res.ok) {
+    let msg = `HTTP ${res.status}`;
+    try { msg = (await res.json()).error || msg; } catch {}
+    throw new Error(msg);
+  }
+  const cd = res.headers.get("Content-Disposition") || "";
+  const total = parseInt(res.headers.get("Content-Length") || "0", 10) || 0;
+  if (!res.body || !res.body.getReader) {
+    const blob = await res.blob();
+    onProgress?.(blob.size, blob.size);
+    return { blob, cd };
+  }
+  const reader = res.body.getReader();
+  const chunks = [];
+  let received = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    received += value.length;
+    onProgress?.(received, total);
+  }
+  return { blob: new Blob(chunks), cd };
+}
+
+/* Uploads a FormData body via XHR (fetch has no upload-progress event),
+ * reporting bytes-sent progress — used by the .dms import flows, since a
+ * full backup upload can take a while on a slow connection. Resolves with
+ * {status, contentType, text} — deliberately raw rather than pre-parsed, so
+ * each call site can keep its own status-code/content-type handling (the
+ * import dialogs special-case 413 and HTML error pages). */
+function uploadFormWithProgress(url, form, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", url);
+    xhr.upload.onprogress = (e) => onProgress?.(e.loaded, e.lengthComputable ? e.total : 0);
+    xhr.onload = () => resolve({
+      status: xhr.status,
+      contentType: xhr.getResponseHeader("content-type") || "",
+      text: xhr.responseText,
+    });
+    xhr.onerror = () => reject(new Error("Network error"));
+    xhr.send(form);
+  });
+}
+
+// Inline progress row for the export/import dialogs — a spinner (matching
+// this file's usual busy convention) plus a bar that's determinate once we
+// know a byte total (download Content-Length / upload progress event) and
+// an indeterminate sweep before/otherwise (e.g. while the server is still
+// zipping files server-side, before any bytes have streamed back).
+const ExportImportProgress = ({ progress }) => {
+  if (!progress) return null;
+  const { label, pct } = progress;
+  return (
+    <div className="px-3 py-2 bg-amber-50 border-y border-amber-200 flex items-center gap-2">
+      <Loader size={13} className="animate-spin text-amber-700 shrink-0" />
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center justify-between text-[12px] text-amber-800">
+          <span className="truncate">{label}</span>
+          {pct != null && <span className="font-mono ml-2 shrink-0">{Math.round(pct)}%</span>}
+        </div>
+        <div className="h-1 w-full bg-amber-200 rounded overflow-hidden mt-1">
+          <div
+            className="h-full bg-amber-600 rounded"
+            style={pct != null
+              ? { width: `${Math.max(2, pct)}%`, transition: "width 150ms linear" }
+              : { animation: "dms-indeterminate 1.1s ease-in-out infinite" }}
+          />
+        </div>
+      </div>
+    </div>
+  );
+};
+
 const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onOpenHierarchyImport, onOpenZipImport, onTriggerImport, onOpenEmailSettings, onOpenAISettings, tree }) => {
   const { t } = useLang();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
+  const [opProgress, setOpProgress] = useState(null); // { label, pct: number|null } while an export/import is running
   const [importDialog, setImportDialog] = useState(null); // { file, mode, target }
   const [newDialog, setNewDialog] = useState(null);       // { target }
   const [newFolderBrowserOpen, setNewFolderBrowserOpen] = useState(false);
@@ -10180,6 +10663,7 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
   const doExport = async () => {
     setError(null);
     setBusy(true);
+    setOpProgress({ label: t("正在导出…", "Exporting…"), pct: null });
     try {
       const res = await fetch("/api/project/export", { method: "POST" });
       if (!res.ok) {
@@ -10195,21 +10679,18 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
       setError(e.message);
     } finally {
       setBusy(false);
+      setOpProgress(null);
     }
   };
 
   const doExportCSV = async () => {
     setError(null);
     setBusy(true);
+    setOpProgress({ label: t("正在导出…", "Exporting…"), pct: null });
     try {
-      const res = await fetch("/api/export-csv");
-      if (!res.ok) {
-        let msg = `HTTP ${res.status}`;
-        try { msg = (await res.json()).error || msg; } catch {}
-        throw new Error(msg);
-      }
-      const blob = await res.blob();
-      const cd = res.headers.get("Content-Disposition") || "";
+      const { blob, cd } = await fetchBlobWithProgress("/api/export-csv", {}, (received, total) => {
+        setOpProgress({ label: t("正在下载…", "Downloading…"), pct: total ? (received / total) * 100 : null });
+      });
       const m = cd.match(/filename="?([^"]+)"?/);
       const filename = m ? m[1] : "metadata.csv";
       const url = URL.createObjectURL(blob);
@@ -10225,21 +10706,21 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
       setError(e.message);
     } finally {
       setBusy(false);
+      setOpProgress(null);
     }
   };
 
   const doExportFull = async () => {
     setError(null);
     setBusy(true);
+    // Zipping every document happens server-side before any bytes come
+    // back, so progress starts indeterminate ("preparing") and only turns
+    // into a real percentage once the response starts streaming.
+    setOpProgress({ label: t("正在打包文件…", "Preparing backup…"), pct: null });
     try {
-      const res = await fetch("/api/project/export-full", { method: "POST" });
-      if (!res.ok) {
-        let msg = `HTTP ${res.status}`;
-        try { msg = (await res.json()).error || msg; } catch {}
-        throw new Error(msg);
-      }
-      const blob = await res.blob();
-      const cd = res.headers.get("Content-Disposition") || "";
+      const { blob, cd } = await fetchBlobWithProgress("/api/project/export-full", { method: "POST" }, (received, total) => {
+        setOpProgress({ label: t("正在下载…", "Downloading…"), pct: total ? (received / total) * 100 : null });
+      });
       const m = cd.match(/filename[^;=\n]*=["']?([^"'\n]+)["']?/);
       const filename = m ? m[1] : "dms-full-backup.dms";
       const url = URL.createObjectURL(blob);
@@ -10252,6 +10733,7 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
       setError(e.message);
     } finally {
       setBusy(false);
+      setOpProgress(null);
     }
   };
 
@@ -10259,19 +10741,15 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
     if (!nodeIds.length) return;
     setError(null);
     setBusy(true);
+    setOpProgress({ label: t("正在打包文件…", "Preparing backup…"), pct: null });
     try {
-      const res = await fetch("/api/project/export-selected", {
+      const { blob, cd } = await fetchBlobWithProgress("/api/project/export-selected", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ node_ids: nodeIds }),
+      }, (received, total) => {
+        setOpProgress({ label: t("正在下载…", "Downloading…"), pct: total ? (received / total) * 100 : null });
       });
-      if (!res.ok) {
-        let msg = `HTTP ${res.status}`;
-        try { msg = (await res.json()).error || msg; } catch {}
-        throw new Error(msg);
-      }
-      const blob = await res.blob();
-      const cd = res.headers.get("Content-Disposition") || "";
       const m = cd.match(/filename[^;=\n]*=["']?([^"'\n]+)["']?/);
       const filename = m ? m[1] : "dms-selected.dms";
       const url = URL.createObjectURL(blob);
@@ -10286,6 +10764,7 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
       setError(e.message);
     } finally {
       setBusy(false);
+      setOpProgress(null);
     }
   };
 
@@ -10302,18 +10781,28 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
     if (!importDialog) return;
     setError(null);
     setBusy(true);
+    setOpProgress({ label: t("正在上传…", "Uploading…"), pct: 0 });
     try {
       const form = new FormData();
       form.append("file", importDialog.file);
       form.append("target_path", importDialog.target);
       form.append("mode", importDialog.mode);
-      const res = await fetch("/api/project/import", { method: "POST", body: form });
-      if (!res.ok) {
-        let msg = `HTTP ${res.status}`;
-        try { msg = (await res.json()).error || msg; } catch {}
+      // XHR (not fetch) so we get upload-progress events; once the upload
+      // itself hits 100% the server still has to unzip/decrypt/write files,
+      // which has no progress signal of its own, so switch to indeterminate.
+      const resp = await uploadFormWithProgress("/api/project/import", form, (loaded, total) => {
+        if (total && loaded < total) {
+          setOpProgress({ label: t("正在上传…", "Uploading…"), pct: (loaded / total) * 100 });
+        } else {
+          setOpProgress({ label: t("正在处理…", "Processing…"), pct: null });
+        }
+      });
+      if (resp.status < 200 || resp.status >= 300) {
+        let msg = `HTTP ${resp.status}`;
+        try { msg = JSON.parse(resp.text).error || msg; } catch {}
         throw new Error(msg);
       }
-      const data = await res.json();
+      const data = JSON.parse(resp.text);
       setImportDialog(null);
       onProjectChanged(data.imported_to);
       onClose();
@@ -10321,6 +10810,7 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
       setError(e.message);
     } finally {
       setBusy(false);
+      setOpProgress(null);
     }
   };
 
@@ -10520,6 +11010,7 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
           onClick={(e) => e.stopPropagation()}
           className="absolute right-0 top-full mt-1 w-72 bg-white border border-stone-300 rounded shadow-lg py-1 text-base z-30"
         >
+          <ExportImportProgress progress={opProgress} />
           {/* ── Export ── */}
           <div className="px-3 pt-2 pb-0.5 text-[12px] font-semibold uppercase tracking-wider text-stone-600">{t("导出 Export", "Export")}</div>
           <div className="px-3 pb-1 text-[12px] text-stone-600">
@@ -10881,6 +11372,7 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
               )}
 
               {error && <div className="text-sm text-red-700 bg-red-50 border border-red-200 rounded p-2 mb-3">{error}</div>}
+              {opProgress && <div className="mb-3 -mx-1"><ExportImportProgress progress={opProgress} /></div>}
               <div className="flex gap-2 justify-end">
                 <button onClick={() => { setExportSelDialog(false); setError(null); }} disabled={busy} className="px-4 py-1.5 text-sm border border-stone-300 hover:bg-stone-100 rounded disabled:opacity-60">{t("取消", "Cancel")}</button>
                 <button
@@ -10935,6 +11427,8 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
                 {error}
               </div>
             )}
+
+            {opProgress && <div className="mb-3 -mx-1"><ExportImportProgress progress={opProgress} /></div>}
 
             <div className="flex gap-2 justify-end">
               <button
@@ -11976,6 +12470,7 @@ function DMS({ storagePath, onChangeFolder }) {
   // the path picker until inspect-dms succeeds with the right password.
   const [dmsImportBusy, setDmsImportBusy] = useState(false);
   const [dmsImportError, setDmsImportError] = useState(null);
+  const [dmsImportProgress, setDmsImportProgress] = useState(null); // { label, pct: number|null }
 
   // Calls inspect-dms with the given password (may be ""); on success shows
   // the normal path-selection dialog, on a wrong/missing password shows the
@@ -12038,15 +12533,26 @@ function DMS({ storagePath, onChangeFolder }) {
 
     setDmsImportBusy(true);
     setDmsImportError(null);
+    setDmsImportProgress({ label: t("正在上传…", "Uploading…"), pct: 0 });
     try {
       const form = new FormData();
       form.append("file", file);
       form.append("target_path", targetPath.trim());
       if (password) form.append("password", password);
-      const res = await fetch("/api/project/import", { method: "POST", body: form });
-      if (res.status === 413) { setDmsImportError(t("文件过大，服务器拒绝接收。请检查服务器配置。", "The file is too large and the server refused it. Please check the server configuration.")); return; }
-      if (!res.ok && res.headers.get("content-type")?.includes("text/html")) { setDmsImportError(t(`服务器错误 (${res.status})，请检查终端日志。`, `Server error (${res.status}) — please check the terminal log.`)); return; }
-      const data = await res.json();
+      // XHR (not fetch) so we get upload-progress events; once the upload
+      // itself hits 100% the server still has to unzip/decrypt/write files
+      // with no progress signal of its own, so switch to indeterminate.
+      const resp = await uploadFormWithProgress("/api/project/import", form, (loaded, total) => {
+        if (total && loaded < total) {
+          setDmsImportProgress({ label: t("正在上传…", "Uploading…"), pct: (loaded / total) * 100 });
+        } else {
+          setDmsImportProgress({ label: t("正在处理…", "Processing…"), pct: null });
+        }
+      });
+      if (resp.status === 413) { setDmsImportError(t("文件过大，服务器拒绝接收。请检查服务器配置。", "The file is too large and the server refused it. Please check the server configuration.")); return; }
+      const ok = resp.status >= 200 && resp.status < 300;
+      if (!ok && resp.contentType.includes("text/html")) { setDmsImportError(t(`服务器错误 (${resp.status})，请检查终端日志。`, `Server error (${resp.status}) — please check the terminal log.`)); return; }
+      const data = JSON.parse(resp.text);
       if (data.ok) {
         setDmsImportDialog(null);
         try {
@@ -12060,6 +12566,7 @@ function DMS({ storagePath, onChangeFolder }) {
       setDmsImportError(err.message || t("导入失败。", "Import failed."));
     } finally {
       setDmsImportBusy(false);
+      setDmsImportProgress(null);
     }
   };
 
@@ -15798,6 +16305,8 @@ function DMS({ storagePath, onChangeFolder }) {
                 {dmsImportError}
               </div>
             )}
+
+            {dmsImportProgress && <div className="mb-3 -mx-1"><ExportImportProgress progress={dmsImportProgress} /></div>}
 
             <div className="flex gap-2 justify-end">
               <button

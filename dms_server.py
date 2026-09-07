@@ -3352,6 +3352,47 @@ def rename_doc_file(doc_id):
     return jsonify({"ok": True, "filename": dest.name})
 
 
+def _route_upload_out_dir(docs_dir, tree, node_id, is_photo, valid_date, route_mode,
+                           photo_year, photo_month, photo_base_node_id):
+    """Shared by post_doc and post_doc_stream: where a newly-uploaded file's
+    bytes should land, given its (already-resolved) photo routing info."""
+    if is_photo and valid_date and route_mode != "current-folder":
+        node_parts = _get_node_path_parts(tree, node_id) if tree and node_id else []
+        date_parts = [_safe_folder_name(photo_year), _safe_folder_name(photo_month)]
+        if len(node_parts) >= 2 and node_parts[-2:] == date_parts:
+            out_dir = docs_dir.joinpath(*node_parts)
+            out_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            out_dir = _photo_year_month_dir(
+                docs_dir, tree, photo_year, photo_month,
+                base_node_id=photo_base_node_id or node_id,
+            )
+    elif node_id:
+        out_dir = _get_node_docs_dir(node_id, tree) or docs_dir
+    else:
+        out_dir = docs_dir
+    return out_dir
+
+
+def _scan_uploaded_doc_date(out_path, orig_name):
+    """Shared by post_doc and post_doc_stream: scan a just-saved document's
+    own text for a date (see the longer comment at its post_doc call site).
+    Best-effort -- any failure here must never fail the upload itself."""
+    detected_date, detected_date_raw, detected_date_confidence = None, None, None
+    try:
+        import pdf_extraction
+        if out_path.suffix.lower() == ".pdf" or out_path.suffix.lower() in pdf_extraction.IMAGE_EXTS:
+            date_text, _date_info = pdf_extraction.extract_text_from_file(out_path, max_pages=1)
+            if date_text:
+                date_guess = pdf_extraction.find_document_date(date_text)
+                detected_date = date_guess.get("date")
+                detected_date_raw = date_guess.get("raw")
+                detected_date_confidence = date_guess.get("confidence")
+    except Exception as e:
+        print(f"[DMS] Date scan failed for {orig_name!r} (non-fatal): {e}")
+    return detected_date, detected_date_raw, detected_date_confidence
+
+
 @app.route("/api/docs", methods=["POST"])
 def post_doc():
     """Upload a document. Expects multipart form: file=<binary>, doc_id=<DOC-ID>."""
@@ -3418,50 +3459,35 @@ def post_doc():
         f"valid={_valid_date} route={route_mode!r} node={node_id!r} base={photo_base_node_id!r}"
     )
     tree = idx.get("tree")
-    if is_photo and _valid_date and route_mode != "current-folder":
-        node_parts = _get_node_path_parts(tree, node_id) if tree and node_id else []
-        date_parts = [_safe_folder_name(photo_year), _safe_folder_name(photo_month)]
-        if len(node_parts) >= 2 and node_parts[-2:] == date_parts:
-            out_dir = docs_dir.joinpath(*node_parts)
-            out_dir.mkdir(parents=True, exist_ok=True)
-        else:
-            out_dir = _photo_year_month_dir(
-                docs_dir, tree, photo_year, photo_month,
-                base_node_id=photo_base_node_id or node_id,
-            )
-    elif node_id:
-        out_dir = _get_node_docs_dir(node_id, tree) or docs_dir
-    else:
-        out_dir = docs_dir
+    out_dir = _route_upload_out_dir(
+        docs_dir, tree, node_id, is_photo, _valid_date, route_mode,
+        photo_year, photo_month, photo_base_node_id,
+    )
 
     out_path = out_dir / f"{doc_id}__{safe_name}"
     if file_data is not None:
         out_path.write_bytes(file_data)
     else:
         # Stream straight from the upload (Werkzeug's own spooled temp file)
-        # to the destination in fixed-size chunks -- bounded memory use no
-        # matter how large the file is.
-        f.save(out_path, buffer_size=4 * 1024 * 1024)
+        # to a .part file in fixed-size chunks -- bounded memory use no
+        # matter how large the file is -- then rename into place, so a
+        # client disconnect mid-transfer never leaves a truncated file
+        # sitting under the document's real name.
+        tmp_path = out_path.with_name(out_path.name + ".part")
+        try:
+            f.save(tmp_path, buffer_size=4 * 1024 * 1024)
+            tmp_path.replace(out_path)
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise
 
     # Scan the document's own text for a date (for the "parameter vs. time"
     # plot feature) so the client can propose it as the document's date right
     # away, without a separate round trip. Only the first page is read (a
     # document's own date is almost always on its cover/header, and this
     # keeps the cost bounded — full extraction, run on demand elsewhere in
-    # the app, reads up to 50 pages and can be much slower). Best-effort:
-    # any failure here must never fail the upload itself.
-    detected_date, detected_date_raw, detected_date_confidence = None, None, None
-    try:
-        import pdf_extraction
-        if out_path.suffix.lower() == ".pdf" or out_path.suffix.lower() in pdf_extraction.IMAGE_EXTS:
-            date_text, _date_info = pdf_extraction.extract_text_from_file(out_path, max_pages=1)
-            if date_text:
-                date_guess = pdf_extraction.find_document_date(date_text)
-                detected_date = date_guess.get("date")
-                detected_date_raw = date_guess.get("raw")
-                detected_date_confidence = date_guess.get("confidence")
-    except Exception as e:
-        print(f"[DMS] Date scan failed for {orig_name!r} (non-fatal): {e}")
+    # the app, reads up to 50 pages and can be much slower).
+    detected_date, detected_date_raw, detected_date_confidence = _scan_uploaded_doc_date(out_path, orig_name)
 
     location = None
     gps_lat, gps_lon = None, None
@@ -3487,6 +3513,105 @@ def post_doc():
                     print(f"[DMS] GPS location (server fallback): {location}")
             except Exception:
                 pass
+
+    return jsonify({"ok": True, "filename": out_path.name, "size": out_path.stat().st_size,
+                    "path": str(out_path), "location": location,
+                    "lat": gps_lat, "lon": gps_lon,
+                    "detectedDate": detected_date, "detectedDateRaw": detected_date_raw,
+                    "detectedDateConfidence": detected_date_confidence})
+
+
+@app.route("/api/docs/upload-stream", methods=["POST"])
+def post_doc_stream():
+    """Large-file upload variant of POST /api/docs.
+
+    /api/docs takes a multipart/form-data body, which Werkzeug parses by
+    re-copying the file part into its *own* on-disk temp file before our
+    handler ever sees it -- on top of waitress's own full-request-body
+    buffering underneath that. For a multi-GB video that's a second full
+    read+write pass that a plain filesystem copy never pays for (see the
+    Tier-1 fix above post_doc for the first pass we already removed).
+    Here the file is instead the *entire raw request body* (Content-Type:
+    application/octet-stream), with everything else passed as query
+    params. With no multipart boundaries to parse, request.stream is just
+    the same underlying buffered stream Werkzeug/waitress already produced
+    for the request -- one hop, not two. The client (dms.html) only uses
+    this path above a size threshold; ordinary uploads still go through
+    the simpler /api/docs.
+
+    Deliberately does NOT do the photo EXIF-date/GPS scan post_doc does for
+    images -- this endpoint only ever carries files above that size
+    threshold, and a photo is never that large.
+    """
+    docs_dir = get_docs_dir()
+    if not docs_dir:
+        return jsonify({"error": "Storage path not configured"}), 503
+
+    doc_id = (request.args.get("doc_id") or "").strip()
+    if not doc_id:
+        return jsonify({"error": "Missing 'doc_id'"}), 400
+    if "/" in doc_id or "\\" in doc_id or ".." in doc_id:
+        return jsonify({"error": "Invalid doc_id"}), 400
+
+    node_id = (request.args.get("node_id") or "").strip() or None
+    orig_name = (request.args.get("filename") or "").strip() or "upload"
+
+    idx = read_index()
+    if not _reserve_doc_slots(idx, 1):
+        return jsonify({
+            "error": f"Document upload limit reached ({_get_max_documents()} total).",
+            "code": "upload_limit_reached",
+        }), 403
+    write_index(idx)
+
+    mime = mimetypes.guess_type(orig_name)[0] or "application/octet-stream"
+    ext = ext_for(mime, orig_name)
+    safe_name = _safe_filename_part(orig_name)
+    if not Path(safe_name).suffix:
+        safe_name = f"{safe_name}.{ext}"
+
+    route_mode = (request.args.get("route_mode") or "year-month").strip() or "year-month"
+    photo_year = (request.args.get("photo_year") or "").strip() or None
+    photo_month = (request.args.get("photo_month") or "").strip() or None
+    photo_base_node_id = (request.args.get("photo_base_node_id") or "").strip() or None
+    photo_lat = (request.args.get("photo_lat") or "").strip() or None
+    photo_lon = (request.args.get("photo_lon") or "").strip() or None
+
+    is_photo = _is_photo_file(ext, mime)
+    _valid_date = _valid_photo_year_month(photo_year, photo_month)
+
+    print(
+        f"[DMS] upload (stream): {orig_name!r} mime={mime!r} photo={photo_year}/{photo_month} "
+        f"valid={_valid_date} route={route_mode!r} node={node_id!r} base={photo_base_node_id!r}"
+    )
+    tree = idx.get("tree")
+    out_dir = _route_upload_out_dir(
+        docs_dir, tree, node_id, is_photo, _valid_date, route_mode,
+        photo_year, photo_month, photo_base_node_id,
+    )
+
+    out_path = out_dir / f"{doc_id}__{safe_name}"
+    tmp_path = out_path.with_name(out_path.name + ".part")
+    try:
+        with open(tmp_path, "wb") as out_fh:
+            shutil.copyfileobj(request.stream, out_fh, 4 * 1024 * 1024)
+        tmp_path.replace(out_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+    detected_date, detected_date_raw, detected_date_confidence = _scan_uploaded_doc_date(out_path, orig_name)
+
+    location = None
+    gps_lat, gps_lon = None, None
+    if photo_lat and photo_lon:
+        try:
+            gps_lat, gps_lon = float(photo_lat), float(photo_lon)
+            location = _reverse_geocode(gps_lat, gps_lon)
+            if location:
+                print(f"[DMS] GPS location: {location}")
+        except (ValueError, Exception):
+            pass
 
     return jsonify({"ok": True, "filename": out_path.name, "size": out_path.stat().st_size,
                     "path": str(out_path), "location": location,
@@ -4792,10 +4917,42 @@ def delete_doc(doc_id):
     return jsonify({"ok": True, "deleted": [m.name for m in matches]})
 
 
+def _unblock_downloaded_file(path: str) -> None:
+    """Clear the "this file came from another computer" mark so the OS opens it
+    editable instead of read-only.
+
+    Files that were downloaded, emailed, or copied from another machine before
+    being imported into the DMS carry a provenance flag that survives the copy
+    into storage:
+      • macOS  — the ``com.apple.quarantine`` extended attribute, which makes
+        Gatekeeper show a blocking "are you sure you want to open it?" prompt
+        (and, with LibreOffice, silently swallows the open entirely).
+      • Windows — the ``Zone.Identifier`` NTFS alternate data stream ("Mark of
+        the Web"), which makes Excel/Word open the file in read-only Protected
+        View until the user clicks "Enable Editing".
+
+    Either way the round-trip "open from DMS → edit → save back" breaks. Since
+    the user is explicitly asking us to open their own document out of their own
+    document store, clear the mark first. Best-effort: never raises.
+    """
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(
+                ["xattr", "-d", "com.apple.quarantine", path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+            )
+        elif sys.platform == "win32":
+            try:
+                os.remove(path + ":Zone.Identifier")
+            except FileNotFoundError:
+                pass  # no mark present — nothing to do
+    except Exception as e:
+        print(f"[DMS] could not unblock {path}: {e}")
+
+
 @app.route("/api/docs/<doc_id>/open", methods=["POST"])
 def open_doc_native(doc_id):
     """Open the document with the OS default application (Preview, etc.)."""
-    import subprocess, sys as _sys
     docs_dir = get_docs_dir()
     if not docs_dir:
         return jsonify({"error": "Storage path not configured"}), 503
@@ -4807,9 +4964,10 @@ def open_doc_native(doc_id):
         abort(404)
 
     file_path = str(matches[0])
-    if _sys.platform == "darwin":
+    _unblock_downloaded_file(file_path)
+    if sys.platform == "darwin":
         subprocess.Popen(["open", file_path])
-    elif _sys.platform == "win32":
+    elif sys.platform == "win32":
         subprocess.Popen(["start", "", file_path], shell=True)
     else:
         subprocess.Popen(["xdg-open", file_path])
@@ -5316,6 +5474,58 @@ def polish_text():
     return jsonify({
         "ok": True,
         "text": result["text"],
+        "provider": provider,
+        "model": result.get("model"),
+    })
+
+
+@app.route("/api/check-typos-cn", methods=["POST"])
+def check_typos_cn_route():
+    """Proofread a block of Chinese text (e.g. a document's Description) for
+    typos, mis-used homophones, idiom misuse and punctuation errors, via
+    Gemini or DeepSeek -- same opt-in keys as /api/ai-settings.
+
+    This is the same rubric as the check-typos-cn Claude Code skill, ported
+    into a standalone app feature: DMS.app runs on other people's computers
+    with no Claude Code session available to do the proofreading itself, so
+    here an LLM API call does it instead, via whichever provider the user
+    has already configured.
+
+    Body: { "text": str, "provider": "gemini"|"deepseek" (default "gemini") }
+    Returns { ok, issues: [{type, original, corrected, note}], provider, model }.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "没有可检查的文字。"}), 400
+    if len(text) > 20000:
+        return jsonify({"error": "文字过长，请分段检查（上限约 20000 字符）。"}), 400
+
+    provider = (data.get("provider") or "gemini").strip().lower()
+    if provider not in ("gemini", "deepseek"):
+        return jsonify({"error": "Unknown provider"}), 400
+
+    cfg = load_config()
+    enc = cfg.get(_ai_key_field(provider), "")
+    label = "DeepSeek" if provider == "deepseek" else "Gemini"
+    if not enc:
+        return jsonify({"error": f"未配置 {label} API Key，请先在设置中添加。"}), 400
+    try:
+        api_key = decrypt_secret(enc)
+    except Exception:
+        return jsonify({"error": "无法读取已保存的 API Key，请重新设置。"}), 400
+
+    try:
+        import ai_extraction
+        result = ai_extraction.check_typos_cn(text, api_key, provider=provider)
+    except ai_extraction.AIExtractionError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({
+        "ok": True,
+        "issues": result["issues"],
         "provider": provider,
         "model": result.get("model"),
     })
