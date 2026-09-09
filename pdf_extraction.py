@@ -712,28 +712,44 @@ def extract_text_from_file(file_path: Path, max_pages: int = 50,
     }
 
 
-def render_pages_for_ai(file_path: Path, max_pages: int = 3) -> list[bytes]:
-    """Render a document's pages to PNG image bytes for a multimodal AI model.
+# iPhone photos (HEIC/HEIF) need pillow-heif registered before Pillow can
+# open them; other image formats Pillow handles natively.
+_HEIC_EXTS = {".heic", ".heif"}
+
+
+def render_pages_for_ai(file_path: Path, max_pages: int = 3,
+                        max_dim: int = 1600) -> list[bytes]:
+    """Render a document's pages to image bytes for a multimodal AI model.
 
     Unlike the OCR pipeline (which turns pages into text via Tesseract), this
-    keeps the page as an image so a vision-capable model can read it directly.
-    Returns up to max_pages PNG byte-strings, or [] if the file type isn't a
-    PDF/image or no PDF rasterizer is available.
+    keeps the page as an image so a vision-capable model can read it directly
+    -- e.g. a phone photo with no text layer at all. Returns up to max_pages
+    byte-strings (JPEG for photos, PNG for rasterized PDF pages), or [] if the
+    file type isn't a PDF/image or no PDF rasterizer is available. Large images
+    are downscaled so max(width, height) <= max_dim to keep the request small.
     """
     ext = file_path.suffix.lower()
 
-    if ext in IMAGE_EXTS:
+    if ext in IMAGE_EXTS or ext in _HEIC_EXTS:
         try:
             from PIL import Image, ImageOps
         except ImportError:
             return []
+        if ext in _HEIC_EXTS:
+            try:
+                import pillow_heif
+                pillow_heif.register_heif_opener()
+            except Exception:
+                return []  # HEIC support not installed -- nothing we can do
         try:
             with Image.open(str(file_path)) as im:
                 im = ImageOps.exif_transpose(im)
                 if im.mode not in ("RGB", "L"):
                     im = im.convert("RGB")
+                if max(im.size) > max_dim:
+                    im.thumbnail((max_dim, max_dim))
                 buf = io.BytesIO()
-                im.save(buf, format="PNG")
+                im.save(buf, format="JPEG", quality=85)
                 return [buf.getvalue()]
         except Exception:
             return []

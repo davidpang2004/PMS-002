@@ -86,7 +86,6 @@ def extract_keys_with_gemini(image_bytes_list: list[bytes], keys: list[str],
 
     try:
         from google import genai
-        from google.genai import types
     except ImportError:
         raise AIExtractionError(
             "未安装 google-genai 库。请在运行此程序的 Python 中执行：pip install google-genai")
@@ -106,7 +105,7 @@ def extract_keys_with_gemini(image_bytes_list: list[bytes], keys: list[str],
 
     contents = [prompt]
     for img_bytes in image_bytes_list:
-        contents.append(types.Part.from_bytes(data=img_bytes, mime_type="image/png"))
+        contents.append(_image_part(img_bytes))
 
     client = genai.Client(api_key=api_key)
     candidates = [model] + [m for m in FALLBACK_MODELS if m != model]
@@ -236,6 +235,87 @@ def answer_question_with_gemini(question: str, snippets: list[dict],
     for candidate in candidates:
         try:
             response = client.models.generate_content(model=candidate, contents=[prompt])
+            last_error = None
+            break
+        except Exception as e:
+            last_error = e
+            msg = str(e)
+            if "NOT_FOUND" in msg or "404" in msg or "no longer available" in msg:
+                continue
+            break
+
+    if last_error is not None:
+        raise AIExtractionError(f"调用 Gemini API 失败：{last_error}")
+
+    raw = getattr(response, "text", None) or ""
+    return _parse_cross_doc_answer(raw)
+
+
+def _image_part(img_bytes: bytes):
+    """Wrap raw image bytes as a genai Part, sniffing PNG vs JPEG from the
+    magic bytes so the declared mime type matches the actual data."""
+    from google.genai import types
+    if img_bytes[:3] == b"\xff\xd8\xff":
+        mime = "image/jpeg"
+    elif img_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+        mime = "image/png"
+    else:
+        mime = "image/png"
+    return types.Part.from_bytes(data=img_bytes, mime_type=mime)
+
+
+def answer_question_with_gemini_multimodal(question: str, doc_items: list[dict],
+                                           api_key: str, model: str = DEFAULT_MODEL) -> dict:
+    """Like answer_question_with_gemini, but each document may also carry page
+    images so a vision model can read photos / scans that have no text layer.
+
+    doc_items: [{"doc_id": str, "name": str, "text": str,
+                 "images": [bytes, ...]}]  -- images optional per item.
+
+    Returns {"answer": str, "cited_doc_ids": [str, ...]} -- same contract as
+    the text-only variant.
+    """
+    snippet_view = [
+        {"doc_id": d.get("doc_id", ""), "name": d.get("name", ""), "text": d.get("text", "")}
+        for d in doc_items
+    ]
+    question = _check_cross_doc_inputs(question, snippet_view, api_key, "Gemini")
+
+    try:
+        from google import genai
+    except ImportError:
+        raise AIExtractionError(
+            "未安装 google-genai 库。请在运行此程序的 Python 中执行：pip install google-genai")
+
+    contents: list = [
+        "You are answering a question using ONLY the documents provided below "
+        "-- do not use outside knowledge. Each document is given as a heading "
+        "(its name and ID), then any extracted text, then any page images of "
+        "that document. Read the images directly when the text is missing or "
+        "insufficient.\n\n"
+        "If the answer isn't in any of the documents, say so plainly instead "
+        "of guessing.\n\n"
+        f"Question: {question}"
+    ]
+    for d in doc_items:
+        text = (d.get("text") or "").strip() or "(no extracted text)"
+        contents.append(f"\n\n### {d.get('name', '')} (ID: {d.get('doc_id', '')})\n{text}")
+        for img in (d.get("images") or []):
+            contents.append(_image_part(img))
+    contents.append(
+        "\n\nRespond with ONLY a single JSON object of the form "
+        '{"answer": "<your answer, in the same language as the question>", '
+        '"cited_doc_ids": ["<ID of each document you actually used>", ...]}. '
+        "No explanation, no markdown code fences, just the JSON object."
+    )
+
+    client = genai.Client(api_key=api_key)
+    candidates = [model] + [m for m in FALLBACK_MODELS if m != model]
+    response = None
+    last_error = None
+    for candidate in candidates:
+        try:
+            response = client.models.generate_content(model=candidate, contents=contents)
             last_error = None
             break
         except Exception as e:

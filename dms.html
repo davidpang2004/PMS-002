@@ -922,18 +922,44 @@ const StorageAdapter = {
 
   // Cross-document Q&A (Gemini or DeepSeek, opt-in) -- reasons over many
   // documents' existing text/metadata at once instead of exact-keyword matching.
-  async askAI(question, scopeNodeId = null, provider = "gemini") {
+  async askAI(question, scopeNodeId = null, provider = "gemini", opts = {}) {
+    // opts: { docIds: [str], archive: bool, nodeId: str } -- folder-level
+    // "Ask AI" passes an explicit document selection (and optionally files
+    // the Q&A into a running log PDF inside that folder).
+    const body = { question, scope_node_id: scopeNodeId, provider };
+    if (Array.isArray(opts.docIds)) body.doc_ids = opts.docIds;
+    if (opts.archive) body.archive = true;
+    if (opts.nodeId) body.node_id = opts.nodeId;
+    if (opts.vision === false) body.vision = false;
     const res = await fetch(API_BASE + "/api/ask-ai", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question, scope_node_id: scopeNodeId, provider }),
+      body: JSON.stringify(body),
     });
     if (!res.ok) {
       let detail = "";
       try { detail = (await res.json()).error || ""; } catch {}
       throw new Error(detail || tOutsideReact(`AI 问答失败: HTTP ${res.status}`, `AI Q&A failed: HTTP ${res.status}`));
     }
-    return res.json();   // { ok, answer, citations:[{docId,name}], coverage:{withText,total} }
+    return res.json();   // { ok, answer, citations:[{docId,name}], coverage, trimmed, log_doc_id, log_name }
+  },
+
+  // Folder-level "Ask AI" -- option 2: build one PDF (request page + the
+  // selected documents' pages) for handing to an external AI tool. Returns
+  // { blob, savedPath }.
+  async folderAiPdf({ nodeId, request, selection }) {
+    const res = await fetch(API_BASE + "/api/folder-ai-pdf", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ node_id: nodeId, request, selection }),
+    });
+    if (!res.ok) {
+      let detail = "";
+      try { detail = (await res.json()).error || ""; } catch {}
+      throw new Error(detail || tOutsideReact(`生成 PDF 失败: HTTP ${res.status}`, `PDF generation failed: HTTP ${res.status}`));
+    }
+    const savedHeader = res.headers.get("X-Databook-Saved-Path");
+    return { blob: await res.blob(), savedPath: savedHeader ? decodeURIComponent(savedHeader) : null };
   },
 
   // Fit + comment on a parameter-vs-time series (Gemini, opt-in) -- used by
@@ -1909,7 +1935,7 @@ const TreeNode = ({
 const ContextMenu = ({
   x, y, isRoot, nodeName, isPhotoRoot, isDateFolder,
   onClose, onRename, onAddChild, onUpload, onDelete,
-  onSetPhotoRoot, onClearPhotoRoot,
+  onSetPhotoRoot, onClearPhotoRoot, onAskAI,
 }) => {
   const { t } = useLang();
   useEffect(() => {
@@ -1940,6 +1966,17 @@ const ContextMenu = ({
       >
         <Upload size={13} /> {t("上传文档", "Upload document")}
       </button>
+      {onAskAI && (
+        <>
+          <div className="border-t border-stone-200 my-1" />
+          <button
+            onClick={() => { onAskAI(); onClose(); }}
+            className="w-full text-left px-3 py-1.5 hover:bg-purple-50 flex items-center gap-2 text-purple-700"
+          >
+            <Sparkles size={13} /> {t("问 AI", "Ask AI")}
+          </button>
+        </>
+      )}
       <div className="border-t border-stone-200 my-1" />
       <button
         onClick={() => { onRename(); onClose(); }}
@@ -5756,6 +5793,507 @@ const FolderBrowserModal = ({ startPath, onSelect, onClose }) => {
         </div>
       </div>
     </div>
+  );
+};
+
+/* =============================================================================
+ * UI: FOLDER ASK-AI DIALOG — "Ask AI" at folder level. Pick which documents
+ * in the folder (and its subfolders) to feed the AI, then either:
+ *   1) type a request and get an answer now (optionally filed to a running
+ *      "<folder> - AI Q&A.pdf" log inside the folder), or
+ *   2) build one PDF (request page + the selected documents) to hand to an
+ *      external tool like ChatGPT.
+ * =============================================================================
+ */
+const ASKAI_DIALOG_MIN_W = 420;
+const ASKAI_DIALOG_MIN_H = 360;
+const FolderAskAIDialog = ({ open, node, tree, docIndex, onClose, onOpenDoc, onOpenAISettings, onDocsChanged }) => {
+  const { t } = useLang();
+  const docsById = useMemo(() => new Map((docIndex || []).map((d) => [d.id, d])), [docIndex]);
+
+  // --- Draggable / resizable floating window (same pattern as FolderPlotDialog).
+  // Position/size persist across close/reopen for the session.
+  const [pos, setPos] = useState({ x: null, y: null });
+  const [size, setSize] = useState(() => ({
+    w: typeof window !== "undefined" ? Math.min(720, window.innerWidth - 48) : 720,
+    h: typeof window !== "undefined" ? Math.min(680, window.innerHeight - 48) : 680,
+  }));
+  const [interacting, setInteracting] = useState(null); // null | "move" | "x" | "y" | "xy"
+  const dragRef = useRef(null);
+  const rawPos = pos.x != null ? pos : {
+    x: (typeof window !== "undefined" ? window.innerWidth - size.w : 0) / 2,
+    y: (typeof window !== "undefined" ? window.innerHeight - size.h : 0) / 2,
+  };
+  const curPos = typeof window !== "undefined" ? {
+    x: Math.min(Math.max(rawPos.x, -(size.w - 120)), window.innerWidth - 120),
+    y: Math.min(Math.max(rawPos.y, 0), Math.max(0, window.innerHeight - 60)),
+  } : rawPos;
+
+  const onDragStart = (e) => {
+    e.preventDefault();
+    dragRef.current = { startX: e.clientX, startY: e.clientY, origX: curPos.x, origY: curPos.y };
+    setInteracting("move");
+    const onMove = (ev) => {
+      const d = dragRef.current; if (!d) return;
+      setPos({ x: d.origX + (ev.clientX - d.startX), y: d.origY + (ev.clientY - d.startY) });
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      dragRef.current = null; setInteracting(null);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
+  const onResizeStart = (axis) => (e) => {
+    e.preventDefault(); e.stopPropagation();
+    dragRef.current = { startX: e.clientX, startY: e.clientY, origW: size.w, origH: size.h };
+    setInteracting(axis);
+    const onMove = (ev) => {
+      const d = dragRef.current; if (!d) return;
+      const dx = ev.clientX - d.startX, dy = ev.clientY - d.startY;
+      const maxW = typeof window !== "undefined" ? window.innerWidth : 9999;
+      const maxH = typeof window !== "undefined" ? window.innerHeight : 9999;
+      setSize({
+        w: axis !== "y" ? Math.min(maxW, Math.max(ASKAI_DIALOG_MIN_W, d.origW + dx)) : size.w,
+        h: axis !== "x" ? Math.min(maxH, Math.max(ASKAI_DIALOG_MIN_H, d.origH + dy)) : size.h,
+      });
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      dragRef.current = null; setInteracting(null);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
+  // --- Voice-to-text dictation for the request field (Web Speech API,
+  // Chinese + English -- same approach as the document viewer's description).
+  const [voiceLang, setVoiceLang] = useState("zh-CN");
+  const [listening, setListening] = useState(false);
+  const [voiceInterim, setVoiceInterim] = useState("");
+  const [voiceError, setVoiceError] = useState("");
+  const recognitionRef = useRef(null);
+  const SpeechRecognitionCtor = typeof window !== "undefined"
+    ? (window.SpeechRecognition || window.webkitSpeechRecognition) : null;
+  const voiceSupported = !!SpeechRecognitionCtor;
+
+  const stopListening = () => { try { recognitionRef.current && recognitionRef.current.stop(); } catch {} };
+  const startListening = (lang) => {
+    if (!SpeechRecognitionCtor) return;
+    stopListening();
+    const recognition = new SpeechRecognitionCtor();
+    recognition.lang = lang;
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.onresult = (event) => {
+      let finalChunk = "", interim = "";
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const r = event.results[i];
+        if (r.isFinal) finalChunk += r[0].transcript; else interim += r[0].transcript;
+      }
+      if (finalChunk) {
+        setRequest((prev) => {
+          const needsSpace = prev && !/[\s\n]$/.test(prev);
+          return prev + (needsSpace ? " " : "") + finalChunk.trim();
+        });
+      }
+      setVoiceInterim(interim);
+    };
+    recognition.onerror = (event) => {
+      setVoiceError(
+        event.error === "not-allowed" ? t("麦克风权限被拒绝，请在浏览器设置中允许访问麦克风", "Microphone access denied — allow microphone access in your browser settings")
+        : event.error === "no-speech" ? t("未检测到语音，请再试一次", "No speech detected, please try again")
+        : t(`语音识别出错：${event.error}`, `Speech recognition error: ${event.error}`)
+      );
+      setListening(false); setVoiceInterim("");
+    };
+    recognition.onend = () => { setListening(false); setVoiceInterim(""); };
+    recognitionRef.current = recognition;
+    setVoiceError(""); setVoiceInterim("");
+    try { recognition.start(); setListening(true); } catch { setListening(false); }
+  };
+  const toggleListening = () => { if (listening) { stopListening(); return; } startListening(voiceLang); };
+  useEffect(() => () => stopListening(), []);
+  useEffect(() => { if (!open) stopListening(); }, [open]);
+
+  // Ordered [{ nodeId, nodeName, depth, docs:[entry] }] for this folder + subtree.
+  const sections = useMemo(() => {
+    if (!node) return [];
+    const out = [];
+    const walk = (n, depth) => {
+      const docs = (n.documents || [])
+        .map((r) => docsById.get(r.id))
+        .filter(Boolean);
+      if (docs.length) out.push({ nodeId: n.id, nodeName: n.name, depth, docs });
+      (n.children || []).forEach((c) => walk(c, depth + 1));
+    };
+    walk(node, 0);
+    return out;
+  }, [node, docsById]);
+
+  // Selection: Set of "nodeId::docId" keys. Reset to "all" whenever the
+  // dialog opens on a folder or the folder's contents change.
+  const allKeys = useMemo(() => {
+    const s = new Set();
+    for (const sec of sections) for (const d of sec.docs) s.add(sec.nodeId + "::" + d.id);
+    return s;
+  }, [sections]);
+  const [selected, setSelected] = useState(new Set());
+  const [request, setRequest] = useState("");
+  const [archive, setArchive] = useState(true);
+  const [vision, setVision] = useState(true); // Gemini: also send page images
+  const [aiSettings, setAiSettings] = useState({ configured: false });
+  const [aiSettingsDS, setAiSettingsDS] = useState({ configured: false });
+  const [provider, setProvider] = useState("gemini");
+  const [asking, setAsking] = useState(false);
+  const [building, setBuilding] = useState(false);
+  const [answer, setAnswer] = useState(null); // { answer, citations, coverage, trimmed, log_name }
+  const [err, setErr] = useState("");
+  const [savedPath, setSavedPath] = useState(null);
+
+  useEffect(() => {
+    if (!open) return;
+    setSelected(new Set(allKeys));
+    setAnswer(null); setErr(""); setSavedPath(null);
+    StorageAdapter.getAISettings("gemini").then(setAiSettings).catch(() => {});
+    StorageAdapter.getAISettings("deepseek").then(setAiSettingsDS).catch(() => {});
+  }, [open, node?.id]);
+
+  useEffect(() => {
+    if (provider === "gemini" && !aiSettings.configured && aiSettingsDS.configured) setProvider("deepseek");
+    else if (provider === "deepseek" && !aiSettingsDS.configured && aiSettings.configured) setProvider("gemini");
+  }, [aiSettings.configured, aiSettingsDS.configured]);
+
+  if (!open || !node) return null;
+
+  const anyConfigured = aiSettings.configured || aiSettingsDS.configured;
+  const toggle = (key) => setSelected((prev) => {
+    const n = new Set(prev);
+    n.has(key) ? n.delete(key) : n.add(key);
+    return n;
+  });
+  const toggleSection = (sec, on) => setSelected((prev) => {
+    const n = new Set(prev);
+    for (const d of sec.docs) { const k = sec.nodeId + "::" + d.id; on ? n.add(k) : n.delete(k); }
+    return n;
+  });
+  const selectAll = () => setSelected(new Set(allKeys));
+  const selectNone = () => setSelected(new Set());
+
+  const selectedDocIds = [];
+  const seenDoc = new Set();
+  const selectionPayload = [];
+  for (const sec of sections) {
+    const ids = sec.docs.map((d) => d.id).filter((id) => selected.has(sec.nodeId + "::" + id));
+    if (ids.length) selectionPayload.push({ nodeId: sec.nodeId, docIds: ids });
+    for (const id of ids) if (!seenDoc.has(id)) { seenDoc.add(id); selectedDocIds.push(id); }
+  }
+  const totalDocs = allKeys.size;
+  const canAct = selectedDocIds.length > 0 && request.trim().length > 0;
+
+  const notEmbeddable = [];
+  for (const id of selectedDocIds) {
+    const d = docsById.get(id);
+    const mime = (d?.mime || "").toLowerCase();
+    const ext = (d?.name || "").toLowerCase().split(".").pop();
+    const ok = mime === "application/pdf" || mime.startsWith("image/") ||
+      ["pdf", "png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "heic", "heif"].includes(ext);
+    if (!ok) notEmbeddable.push(d?.name || id);
+  }
+
+  const runAsk = async () => {
+    if (!canAct || asking) return;
+    setAsking(true); setErr(""); setAnswer(null); setSavedPath(null);
+    try {
+      const data = await StorageAdapter.askAI(request.trim(), null, provider, {
+        docIds: selectedDocIds,
+        archive,
+        nodeId: node.id,
+        vision: provider === "gemini" ? vision : false,
+      });
+      setAnswer(data);
+      if (data.log_name && onDocsChanged) onDocsChanged();
+    } catch (e) {
+      setErr(e.message || String(e));
+    } finally {
+      setAsking(false);
+    }
+  };
+
+  const runBuild = async () => {
+    if (selectedDocIds.length === 0 || !request.trim() || building) return;
+    setBuilding(true); setErr(""); setAnswer(null); setSavedPath(null);
+    try {
+      const { blob, savedPath: sp } = await StorageAdapter.folderAiPdf({
+        nodeId: node.id,
+        request: request.trim(),
+        selection: selectionPayload,
+      });
+      setSavedPath(sp);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = (node.name || "Ask AI") + " - Ask AI.pdf";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setErr(e.message || String(e));
+    } finally {
+      setBuilding(false);
+    }
+  };
+
+  const busy = asking || building;
+  const docListMaxH = Math.max(150, size.h - 430);
+
+  return (
+    <>
+      <div className="fixed inset-0 bg-stone-900/50 z-40" onClick={() => !busy && onClose()} />
+      <div
+        className="fixed z-50 bg-white rounded-lg shadow-2xl flex flex-col overflow-hidden"
+        style={{ left: curPos.x, top: curPos.y, width: size.w, height: size.h }}
+      >
+        <div
+          className="px-4 py-3 border-b border-stone-200 flex items-center justify-between shrink-0 cursor-move select-none bg-stone-50"
+          onMouseDown={onDragStart}
+        >
+          <h2 className="text-base font-semibold text-stone-900 flex items-center gap-1.5 min-w-0">
+            <Sparkles size={15} className="text-purple-600 shrink-0" />
+            <span className="truncate">{t("对文件夹提问 AI", "Ask AI about this folder")}
+            <span className="text-stone-500 font-normal"> · {node.name}</span></span>
+          </h2>
+          <button
+            onClick={() => !busy && onClose()}
+            onMouseDown={(e) => e.stopPropagation()}
+            className="text-stone-500 hover:text-stone-800 shrink-0"
+          ><X size={16} /></button>
+        </div>
+
+        <div className="flex-1 min-h-0 overflow-auto px-5 py-3 space-y-3">
+          {/* Document picker */}
+          <div>
+            <div className="flex items-center justify-between mb-1">
+              <div className="text-[13px] font-medium text-stone-700">
+                {t(`选择要提供给 AI 的文档（${selectedDocIds.length}/${totalDocs}）`,
+                   `Documents to feed the AI (${selectedDocIds.length}/${totalDocs})`)}
+              </div>
+              <div className="flex gap-2 text-[12px]">
+                <button onClick={selectAll} className="text-purple-700 hover:underline">{t("全选", "All")}</button>
+                <button onClick={selectNone} className="text-stone-500 hover:underline">{t("全不选", "None")}</button>
+              </div>
+            </div>
+            <div className="border border-stone-200 rounded overflow-auto divide-y divide-stone-100" style={{ maxHeight: docListMaxH }}>
+              {sections.length === 0 && (
+                <div className="px-3 py-4 text-[13px] text-stone-500">{t("此文件夹内没有文档。", "This folder has no documents.")}</div>
+              )}
+              {sections.map((sec) => {
+                const secKeys = sec.docs.map((d) => sec.nodeId + "::" + d.id);
+                const on = secKeys.filter((k) => selected.has(k)).length;
+                const state = on === 0 ? "none" : on === secKeys.length ? "all" : "some";
+                return (
+                  <div key={sec.nodeId}>
+                    {(sec.depth > 0 || sections.length > 1) && (
+                      <button
+                        onClick={() => toggleSection(sec, state !== "all")}
+                        className="w-full flex items-center gap-1.5 px-2 py-1 bg-stone-50 hover:bg-stone-100 text-[12px] text-stone-600"
+                        style={{ paddingLeft: 8 + sec.depth * 12 }}
+                      >
+                        {state === "all" ? <CheckSquare size={12} className="text-purple-600" />
+                          : state === "some" ? <MinusSquare size={12} className="text-purple-600" />
+                          : <Square size={12} className="text-stone-400" />}
+                        <Folder size={12} className="text-amber-500" />
+                        <span className="truncate">{sec.nodeName}</span>
+                      </button>
+                    )}
+                    {sec.docs.map((d) => {
+                      const key = sec.nodeId + "::" + d.id;
+                      const mime = (d.mime || "").toLowerCase();
+                      const Icon = mime.startsWith("image/") ? ImageIcon : FileText;
+                      return (
+                        <label
+                          key={key}
+                          className="flex items-center gap-2 px-2 py-1 hover:bg-purple-50/50 cursor-pointer text-[13px]"
+                          style={{ paddingLeft: 22 + sec.depth * 12 }}
+                        >
+                          <input type="checkbox" checked={selected.has(key)} onChange={() => toggle(key)} className="accent-purple-600" />
+                          <Icon size={13} className="text-stone-400 shrink-0" />
+                          <span className="truncate flex-1">{d.name}</span>
+                          {!(d.ocrText || d.description || Object.keys(d.metadata || {}).length) && (
+                            <span className="text-[11px] text-amber-600 shrink-0">{t("无文字", "no text")}</span>
+                          )}
+                        </label>
+                      );
+                    })}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Request text + voice input */}
+          <div>
+            <div className="flex items-center justify-between mb-1 gap-2 flex-wrap">
+              <div className="text-[13px] font-medium text-stone-700">{t("你的请求 / 问题", "Your request / question")}</div>
+              {voiceSupported ? (
+                <div className="flex items-center gap-1.5">
+                  <div className="flex rounded overflow-hidden border border-stone-300 text-[11px] shrink-0">
+                    <button
+                      onClick={() => setVoiceLang("zh-CN")} disabled={listening}
+                      title={t("识别语言：中文", "Recognition language: Chinese")}
+                      className={"px-1.5 py-0.5 " + (voiceLang === "zh-CN" ? "bg-stone-700 text-white" : "bg-white text-stone-700 hover:bg-stone-100")}
+                    >中文</button>
+                    <button
+                      onClick={() => setVoiceLang("en-US")} disabled={listening}
+                      title="Recognition language: English"
+                      className={"px-1.5 py-0.5 border-l border-stone-300 " + (voiceLang === "en-US" ? "bg-stone-700 text-white" : "bg-white text-stone-700 hover:bg-stone-100")}
+                    >EN</button>
+                  </div>
+                  <button
+                    onClick={toggleListening}
+                    title={listening ? t("停止语音输入", "Stop voice input") : t("开始语音输入，识别结果自动追加到请求中", "Start voice input — recognized text is appended to the request")}
+                    className={"text-[12px] px-2 py-0.5 rounded flex items-center gap-1 border shrink-0 " +
+                      (listening ? "border-red-400 text-red-700 bg-red-50 animate-pulse" : "border-stone-300 text-stone-700 hover:bg-stone-100")}
+                  >
+                    {listening ? <MicOff size={12} /> : <Mic size={12} />}
+                    {listening ? t("正在聆听…", "Listening…") : t("语音输入", "Voice")}
+                  </button>
+                </div>
+              ) : (
+                <span className="text-[11px] text-stone-500">{t("此浏览器不支持语音输入（推荐 Chrome / Edge）", "Voice input needs Chrome / Edge")}</span>
+              )}
+            </div>
+            <textarea
+              value={request}
+              onChange={(e) => setRequest(e.target.value)}
+              rows={4}
+              placeholder={t("例如：请对比这些报告中的关键参数，指出异常项。", "e.g. Compare the key parameters across these reports and flag anything out of spec.")}
+              className="w-full text-[13px] px-2.5 py-2 border border-stone-300 rounded focus:outline-none focus:border-purple-500 resize-y"
+            />
+            {voiceInterim && <div className="text-[12px] text-stone-500 italic mt-0.5 truncate">{voiceInterim}</div>}
+            {voiceError && <div className="text-[12px] text-red-600 mt-0.5">{voiceError}</div>}
+          </div>
+
+          {err && <div className="text-[13px] text-red-600 whitespace-pre-wrap bg-red-50 border border-red-100 rounded px-2 py-1.5">{err}</div>}
+
+          {answer && (
+            <div className="space-y-2 border border-stone-200 rounded p-3 bg-stone-50/60">
+              <div className="text-[13px] text-stone-800 whitespace-pre-wrap">{answer.answer}</div>
+              {!!answer.trimmed && (
+                <div className="text-[12px] text-amber-700">
+                  {t(`所选文档较多，仅使用了相关性最高的一部分（省略 ${answer.trimmed} 份）。`,
+                     `Selection was large — only the most relevant subset was used (${answer.trimmed} omitted).`)}
+                </div>
+              )}
+              {answer.coverage && (
+                <div className="text-[12px] text-stone-500">
+                  {answer.visionUsed
+                    ? t(`AI 已查看 ${answer.imagesUsed} 张页面/照片图像，并参考了文字/元数据`,
+                        `AI viewed ${answer.imagesUsed} page/photo image(s), plus text/metadata`)
+                    : t(`已参考 ${answer.coverage.withText}/${answer.coverage.total} 份有文字内容的文档`,
+                        `Used ${answer.coverage.withText}/${answer.coverage.total} documents with readable text`)}
+                </div>
+              )}
+              {answer.citations && answer.citations.length > 0 && (
+                <div className="flex flex-wrap gap-1.5">
+                  {answer.citations.map((c) => (
+                    <button
+                      key={c.docId}
+                      onClick={() => { onOpenDoc(c.docId); onClose(); }}
+                      className="text-[12px] px-1.5 py-0.5 rounded border border-purple-200 text-purple-700 bg-white hover:bg-purple-50"
+                    >{c.name || c.docId}</button>
+                  ))}
+                </div>
+              )}
+              {answer.log_name && (
+                <div className="text-[12px] text-green-700">{t("已存档到：", "Filed to: ")}<span className="font-mono">{answer.log_name}</span></div>
+              )}
+            </div>
+          )}
+
+          {savedPath && !answer && (
+            <div className="text-[12px] text-green-700">{t("PDF 已下载，并保存副本到：", "PDF downloaded; a copy was saved to: ")}<span className="font-mono break-all">{savedPath}</span></div>
+          )}
+        </div>
+
+        <div className="px-5 py-3 border-t border-stone-200 shrink-0 space-y-2">
+          {!anyConfigured && (
+            <div className="text-[12px] text-stone-600 bg-purple-50 border border-purple-100 rounded px-2 py-1.5 flex items-center gap-1.5">
+              <Sparkles size={11} className="text-purple-600 shrink-0" />
+              {t("“直接问 AI”需要先配置 Gemini 或 DeepSeek 的 API Key（“生成 PDF”无需 Key）。",
+                 "\"Ask AI now\" needs a Gemini or DeepSeek API Key first (\"Build PDF\" does not).")}
+              {onOpenAISettings && (
+                <button onClick={onOpenAISettings} className="text-purple-700 hover:underline font-medium shrink-0">{t("去配置", "Configure")}</button>
+              )}
+            </div>
+          )}
+          {notEmbeddable.length > 0 && (
+            <div className="text-[12px] text-amber-700">
+              {t(`“生成 PDF”时，${notEmbeddable.length} 份非 PDF/图片文档（如 Word/Excel）将只显示占位页。`,
+                 `In the built PDF, ${notEmbeddable.length} non-PDF/image document(s) (Word/Excel etc.) will appear as placeholder pages only.`)}
+            </div>
+          )}
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <div className="flex items-center gap-3 text-[12px] text-stone-600 flex-wrap">
+              {anyConfigured && (
+                <>
+                  <span>{t("模型：", "Model:")}</span>
+                  <label className={"flex items-center gap-1 " + (aiSettings.configured ? "cursor-pointer" : "text-stone-400")}>
+                    <input type="radio" name="folderAskProvider" checked={provider === "gemini"} disabled={!aiSettings.configured} onChange={() => setProvider("gemini")} className="accent-purple-600" />
+                    Gemini
+                  </label>
+                  <label className={"flex items-center gap-1 " + (aiSettingsDS.configured ? "cursor-pointer" : "text-stone-400")}>
+                    <input type="radio" name="folderAskProvider" checked={provider === "deepseek"} disabled={!aiSettingsDS.configured} onChange={() => setProvider("deepseek")} className="accent-purple-600" />
+                    DeepSeek
+                  </label>
+                </>
+              )}
+              <label className={"flex items-center gap-1 " + (provider === "gemini" ? "cursor-pointer" : "text-stone-400 cursor-not-allowed")}>
+                <input type="checkbox" checked={vision && provider === "gemini"} disabled={provider !== "gemini"} onChange={(e) => setVision(e.target.checked)} className="accent-purple-600" />
+                {t("让 AI 查看照片/扫描件（仅 Gemini，较慢）", "Let AI see photos/scans (Gemini only, slower)")}
+              </label>
+              <label className="flex items-center gap-1 cursor-pointer">
+                <input type="checkbox" checked={archive} onChange={(e) => setArchive(e.target.checked)} className="accent-purple-600" />
+                {t("存档答案到文件夹内的 Q&A 记录", "Archive answer to a folder Q&A log")}
+              </label>
+            </div>
+            <div className="flex items-center gap-2 ml-auto">
+              <button
+                onClick={runBuild}
+                disabled={selectedDocIds.length === 0 || !request.trim() || busy}
+                className="text-sm px-3 py-1.5 rounded border border-stone-300 text-stone-700 bg-white hover:bg-stone-50 flex items-center gap-1.5 disabled:opacity-40"
+              >
+                {building ? <Loader size={13} className="animate-spin" /> : <Download size={13} />}
+                {t("生成 PDF（供 ChatGPT 等）", "Build PDF (for ChatGPT etc.)")}
+              </button>
+              <button
+                onClick={runAsk}
+                disabled={!canAct || busy || !anyConfigured}
+                className="text-sm px-3 py-1.5 rounded bg-purple-600 hover:bg-purple-700 text-white flex items-center gap-1.5 disabled:opacity-40"
+              >
+                {asking ? <Loader size={13} className="animate-spin" /> : <Sparkles size={13} />}
+                {t("直接问 AI", "Ask AI now")}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* resize handles — right edge, bottom edge, bottom-right corner */}
+        <div onMouseDown={onResizeStart("x")} className="absolute top-0 right-0 w-1.5 h-full cursor-ew-resize z-30" />
+        <div onMouseDown={onResizeStart("y")} className="absolute bottom-0 left-0 w-full h-1.5 cursor-ns-resize z-30" />
+        <div onMouseDown={onResizeStart("xy")} className="absolute bottom-0 right-0 w-4 h-4 cursor-nwse-resize z-30" />
+        {interacting && (
+          <div
+            className="fixed inset-0 z-[55]"
+            style={{ cursor: interacting === "move" ? "move" : interacting === "x" ? "ew-resize" : interacting === "y" ? "ns-resize" : "nwse-resize" }}
+          />
+        )}
+      </div>
+    </>
   );
 };
 
@@ -12621,6 +13159,7 @@ function DMS({ storagePath, onChangeFolder }) {
   const [textTreeMeta, setTextTreeMeta] = useState(false);   // include SN + doc counts
   const [textTreeCopied, setTextTreeCopied] = useState(false);
   const [showPlotDialog, setShowPlotDialog] = useState(false); // parameter-vs-time chart
+  const [showAskAIDialog, setShowAskAIDialog] = useState(false); // folder-level "Ask AI"
   const [verifyDatesQueue, setVerifyDatesQueue] = useState(null); // docs with an auto-detected date to confirm after upload
   // { duplicates, allFiles, targetNodeId, mirror? }. `mirror` is only set
   // for the "upload as sources" flow — { tree, fileNodeId } — where each
@@ -14913,6 +15452,14 @@ function DMS({ storagePath, onChangeFolder }) {
                   >
                     <TrendingUp size={11} /> {t("趋势图", "Plot")}
                   </button>
+                  <button
+                    onClick={() => setShowAskAIDialog(true)}
+                    disabled={!selectedNode}
+                    className="text-[13px] px-2 py-1 border border-purple-300 text-purple-800 hover:bg-purple-50 rounded flex items-center gap-1 disabled:opacity-40"
+                    title={t("选择该文件夹中的文档，向 AI 提问，或生成一份可供 ChatGPT 等使用的 PDF", "Pick documents in this folder and ask AI, or build a PDF for tools like ChatGPT")}
+                  >
+                    <Sparkles size={11} /> {t("问 AI", "Ask AI")}
+                  </button>
                 </div>
                 <div className="px-3 py-1.5 text-[12px] text-stone-700 border-b border-stone-100 bg-stone-50/50">
                   {t("悬停节点显示快捷操作 · 双击重命名 · 右键打开菜单", "Hover a node for quick actions · double-click to rename · right-click to open the menu")}
@@ -15633,6 +16180,22 @@ function DMS({ storagePath, onChangeFolder }) {
         }}
       />
 
+      <FolderAskAIDialog
+        open={showAskAIDialog}
+        node={selectedNode}
+        tree={tree}
+        docIndex={docIndex}
+        onClose={() => setShowAskAIDialog(false)}
+        onOpenDoc={openDoc}
+        onOpenAISettings={() => setShowAISettings(true)}
+        onDocsChanged={async () => {
+          const { tree: freshTree } = await StorageAdapter.getTree();
+          if (freshTree) setTree(freshTree);
+          const idx = await StorageAdapter.listDocumentIndex();
+          setDocIndex(idx);
+        }}
+      />
+
       <VerifyDatesDialog
         open={!!verifyDatesQueue}
         items={verifyDatesQueue || []}
@@ -15747,6 +16310,10 @@ function DMS({ storagePath, onChangeFolder }) {
             onClearPhotoRoot={async () => {
               await StorageAdapter.savePhotoRootNodeId("");
               setPhotoRootNodeId("");
+            }}
+            onAskAI={() => {
+              setSelectedId(contextMenu.nodeId);
+              setShowAskAIDialog(true);
             }}
           />
         );

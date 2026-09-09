@@ -5231,6 +5231,14 @@ _ASK_AI_MAX_CANDIDATES = 40          # docs whose text actually goes in the prom
 _ASK_AI_MAX_AUTO_EXTRACT = 15        # of those, at most this many get on-demand OCR
 _ASK_AI_SNIPPET_CHARS = 4000         # per-doc text truncation before assembly
 _ASK_AI_BUDGET_CHARS = 120_000       # total prompt text budget before pre-filtering
+_ASK_AI_MAX_VISION_DOCS = 6          # docs whose page images go to the vision model
+_ASK_AI_VISION_PAGES_PER_DOC = 2     # page images sent per document in vision mode
+
+# Extensions render_pages_for_ai can turn into an image the vision model reads.
+_ASK_AI_VISION_EXTS = {
+    ".pdf", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".gif", ".webp",
+    ".heic", ".heif",
+}
 
 
 def _doc_snippet_text(entry: dict) -> str:
@@ -5238,6 +5246,10 @@ def _doc_snippet_text(entry: dict) -> str:
     same fields SearchPanel already matches against client-side, so a
     question can be answered from metadata alone even without OCR text."""
     parts = [entry.get("sn") or "", entry.get("description") or ""]
+    if entry.get("docDate"):
+        parts.append(f"Date: {entry['docDate']}")
+    if entry.get("lat") is not None and entry.get("lon") is not None:
+        parts.append(f"GPS: {entry['lat']}, {entry['lon']}")
     for k, v in (entry.get("metadata") or {}).items():
         if isinstance(v, dict):
             parts.append(f"{k}: {v.get('design', '')} {v.get('actual', '')}")
@@ -5245,6 +5257,73 @@ def _doc_snippet_text(entry: dict) -> str:
             parts.append(f"{k}: {v}")
     parts.append(entry.get("ocrText") or "")
     return "\n".join(p for p in parts if p).strip()
+
+
+def _append_qa_log(idx: dict, node: dict, target_node_id: str, base_name: str,
+                   new_row: dict, docs_dir) -> tuple:
+    """Find-or-create a running AI Q&A log PDF filed as a real document
+    inside `node`, append one {timestamp, model, question, answer} row, and
+    rebuild the whole PDF from the accumulated history (aiQaLog on the log
+    document's docIndex entry is the source of truth -- PDF isn't
+    append-friendly). Persists the index. Returns (log_doc_id, log_name),
+    or (None, None) when there is no folder to file into.
+
+    Shared by /api/docs/<id>/ask (per-document log, base_name = doc name)
+    and /api/ask-ai (per-folder log, base_name = folder name).
+    """
+    if node is None:
+        return None, None
+    try:
+        import databook
+    except ImportError as e:
+        raise RuntimeError(
+            "Databook/PDF libraries not installed. Run:\n"
+            "    pip3 install pypdf reportlab Pillow\n"
+            "Then restart the server.\n\nDetail: " + str(e))
+
+    doc_index = idx.setdefault("docIndex", [])
+    tree = idx.get("tree")
+    base_stem = base_name.rsplit(".", 1)[0] if "." in base_name else base_name
+    log_display_name = f"{base_stem} - AI Q&A.pdf"
+    by_id = {d["id"]: d for d in doc_index}
+
+    existing_log_entry = None
+    for ref in (node.get("documents") or []):
+        d = by_id.get(ref.get("id"))
+        if d and (d.get("name") or "").lower() == log_display_name.lower():
+            existing_log_entry = d
+            break
+
+    qa_entries = list((existing_log_entry or {}).get("aiQaLog") or []) + [new_row]
+    pdf_bytes = databook.build_qa_log_pdf(base_name, qa_entries)
+
+    out_dir = _get_node_docs_dir(target_node_id, tree) or docs_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if existing_log_entry:
+        log_doc_id = existing_log_entry["id"]
+        matches = list(docs_dir.rglob(f"{log_doc_id}__*")) or list(docs_dir.rglob(f"{log_doc_id}*"))
+        log_path = matches[0] if matches else out_dir / f"{log_doc_id}__{_safe_filename_part(log_display_name)}"
+    else:
+        log_doc_id = "DOC-" + datetime.now().strftime("%Y%m%d") + "-" + secrets.token_hex(4).upper()
+        log_path = out_dir / f"{log_doc_id}__{_safe_filename_part(log_display_name)}"
+
+    log_path.write_bytes(pdf_bytes)
+    size = len(pdf_bytes)
+
+    if existing_log_entry:
+        existing_log_entry["size"] = size
+        existing_log_entry["uploadedAt"] = datetime.utcnow().isoformat() + "Z"
+        existing_log_entry["aiQaLog"] = qa_entries
+    else:
+        doc_index.append({
+            "id": log_doc_id, "name": log_display_name, "mime": "application/pdf",
+            "size": size, "uploadedAt": datetime.utcnow().isoformat() + "Z",
+            "originalNodeId": target_node_id, "metadata": {}, "aiQaLog": qa_entries,
+        })
+        node.setdefault("documents", []).append({"id": log_doc_id})
+    write_index(idx)
+    return log_doc_id, log_display_name
 
 
 @app.route("/api/ask-ai", methods=["POST"])
@@ -5255,9 +5334,13 @@ def ask_ai():
     text/metadata at once and cites which ones it used.
 
     Body (JSON): { "question": str, "scope_node_id": str|null,
+    "doc_ids": [str]|null (explicit selection -- folder-level Ask AI),
+    "vision": bool (default true; Gemini only -- also send page images so
+    photos/scans with no text can be read), "archive": bool, "node_id": str,
     "provider": "gemini"|"deepseek" (default "gemini") }
     Returns { ok, answer, provider, citations: [{docId, name}],
-    coverage: {withText, total} }.
+    coverage: {withText, total}, visionUsed, imagesUsed, trimmed,
+    log_doc_id, log_name }.
     """
     docs_dir = get_docs_dir()
     if not docs_dir:
@@ -5268,6 +5351,17 @@ def ask_ai():
     if not question:
         return jsonify({"error": "Provide a non-empty 'question'"}), 400
     scope_node_id = data.get("scope_node_id")
+    # Optional explicit document selection (folder-level "Ask AI" -- the user
+    # ticks specific documents rather than relying on the keyword pre-filter).
+    explicit_doc_ids = data.get("doc_ids")
+    if explicit_doc_ids is not None and not isinstance(explicit_doc_ids, list):
+        return jsonify({"error": "'doc_ids' must be a list"}), 400
+    archive = bool(data.get("archive"))
+    archive_node_id = data.get("node_id") or scope_node_id or ""
+    archive_node_id = archive_node_id.strip() if isinstance(archive_node_id, str) else ""
+    # When True (and provider is Gemini), also send page images of the picked
+    # documents so a vision model can read photos/scans that have no text.
+    want_vision = data.get("vision", True)
     provider = (data.get("provider") or "gemini").strip().lower()
     if provider not in ("gemini", "deepseek"):
         return jsonify({"error": "Unknown provider"}), 400
@@ -5286,7 +5380,9 @@ def ask_ai():
     doc_index = idx.get("docIndex") or []
     docs_by_id = {d["id"]: d for d in doc_index if d.get("id")}
 
-    if scope_node_id:
+    if explicit_doc_ids is not None:
+        candidate_ids = [str(i) for i in explicit_doc_ids]
+    elif scope_node_id:
         scope_node = _find_node_by_id(idx.get("tree"), scope_node_id)
         candidate_ids = [i for i in _collect_doc_ids_under(scope_node)] if scope_node else []
     else:
@@ -5295,6 +5391,13 @@ def ask_ai():
 
     if not candidates:
         return jsonify({"error": "此范围内没有文档可供检索。"}), 400
+
+    # When the caller picked documents explicitly, keep their selection order
+    # and only trim if it blows the prompt budget (reported back as `trimmed`).
+    selection_trimmed = 0
+    if explicit_doc_ids is not None and len(candidates) > _ASK_AI_MAX_CANDIDATES:
+        selection_trimmed = len(candidates) - _ASK_AI_MAX_CANDIDATES
+        candidates = candidates[:_ASK_AI_MAX_CANDIDATES]
 
     # Pre-filter to a manageable set by simple keyword overlap with the
     # question — only kicks in for large projects; small ones just use
@@ -5345,13 +5448,54 @@ def ask_ai():
     ]
     with_text = sum(1 for s in snippets if s["text"])
 
+    # Vision mode (Gemini only): render page images for the picked documents so
+    # the model can read photos / scans directly, not just their text/metadata.
+    images_by_doc = {}
+    vision_used = False
+    if want_vision and provider == "gemini":
+        try:
+            import pdf_extraction
+        except Exception:
+            pdf_extraction = None
+        if pdf_extraction is not None:
+            vision_budget = _ASK_AI_MAX_VISION_DOCS
+            for entry in candidates:
+                if vision_budget <= 0:
+                    break
+                name = (entry.get("name") or "")
+                on_disk = list(docs_dir.rglob(f"{entry['id']}__*")) or list(docs_dir.rglob(f"{entry['id']}*"))
+                if not on_disk:
+                    continue
+                ext = (on_disk[0].suffix or ("." + name.rsplit(".", 1)[-1] if "." in name else "")).lower()
+                if ext not in _ASK_AI_VISION_EXTS:
+                    continue
+                try:
+                    imgs = pdf_extraction.render_pages_for_ai(
+                        on_disk[0], max_pages=_ASK_AI_VISION_PAGES_PER_DOC)
+                except Exception:
+                    imgs = []
+                if imgs:
+                    images_by_doc[entry["id"]] = imgs
+                    vision_budget -= 1
+            vision_used = bool(images_by_doc)
+
+    images_used = sum(len(v) for v in images_by_doc.values())
+
     try:
         import ai_extraction
-        answer_fn = (
-            ai_extraction.answer_question_with_deepseek if provider == "deepseek"
-            else ai_extraction.answer_question_with_gemini
-        )
-        result = answer_fn(question, snippets, api_key)
+        if vision_used:
+            doc_items = [
+                {**s, "images": images_by_doc.get(s["doc_id"], [])}
+                for s in snippets
+            ]
+            result = ai_extraction.answer_question_with_gemini_multimodal(
+                question, doc_items, api_key)
+        else:
+            answer_fn = (
+                ai_extraction.answer_question_with_deepseek if provider == "deepseek"
+                else ai_extraction.answer_question_with_gemini
+            )
+            result = answer_fn(question, snippets, api_key)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -5362,12 +5506,37 @@ def ask_ai():
         if cid in candidate_id_set
     ]
 
+    # Optionally file the Q&A into a running log PDF kept inside the folder
+    # (same "<name> - AI Q&A.pdf" pattern as the per-document Ask AI).
+    log_doc_id, log_name = None, None
+    if archive and archive_node_id:
+        node = _find_node_by_id(idx.get("tree"), archive_node_id)
+        if node is not None:
+            model_used = result.get("model") or provider
+            new_row = {
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "model": model_used,
+                "question": question,
+                "answer": result["answer"],
+            }
+            try:
+                log_doc_id, log_name = _append_qa_log(
+                    idx, node, archive_node_id, node.get("name") or archive_node_id,
+                    new_row, docs_dir)
+            except RuntimeError as e:
+                return jsonify({"error": str(e)}), 500
+
     return jsonify({
         "ok": True,
         "answer": result["answer"],
         "provider": provider,
         "citations": citations,
         "coverage": {"withText": with_text, "total": len(candidates)},
+        "trimmed": selection_trimmed,
+        "visionUsed": vision_used,
+        "imagesUsed": images_used,
+        "log_doc_id": log_doc_id,
+        "log_name": log_name,
     })
 
 
@@ -5670,69 +5839,20 @@ def post_doc_ask(doc_id):
     model_used = result.get("model") or provider
 
     # Append to a per-document running Q&A log, saved as a real PDF file in
-    # the same on-disk folder as the source document (find-or-create, same
-    # per-folder pattern as plot_snapshot's Excel history). PDF isn't
-    # append-friendly, so the entry list itself is kept as JSON on the log
-    # document's docIndex entry (aiQaLog) and the PDF is fully regenerated
-    # from that list on every question -- see databook.build_qa_log_pdf.
-    log_doc_id, log_name = None, None
+    # the same on-disk folder as the source document (find-or-create). See
+    # _append_qa_log -- the same helper backs the folder-level /api/ask-ai.
     tree = idx.get("tree")
     target_node_id = node_id or entry.get("originalNodeId") or ""
     node = _find_node_by_id(tree, target_node_id) if tree else None
-    if node is not None:
-        try:
-            import databook
-        except ImportError as e:
-            return jsonify({
-                "error": ("Databook/PDF libraries not installed. Run:\n"
-                          "    pip3 install pypdf reportlab Pillow\n"
-                          "Then restart the server.\n\nDetail: " + str(e))
-            }), 500
-
-        base_name = entry.get("name") or doc_id
-        base_stem = base_name.rsplit(".", 1)[0] if "." in base_name else base_name
-        log_display_name = f"{base_stem} - AI Q&A.pdf"
-        by_id = {d["id"]: d for d in doc_index}
-
-        existing_log_entry = None
-        for ref in (node.get("documents") or []):
-            d = by_id.get(ref.get("id"))
-            if d and (d.get("name") or "").lower() == log_display_name.lower():
-                existing_log_entry = d
-                break
-
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-        new_row = {"timestamp": timestamp, "model": model_used, "question": question, "answer": answer}
-        qa_entries = list((existing_log_entry or {}).get("aiQaLog") or []) + [new_row]
-        pdf_bytes = databook.build_qa_log_pdf(base_name, qa_entries)
-
-        out_dir = _get_node_docs_dir(target_node_id, tree) or docs_dir
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        if existing_log_entry:
-            log_doc_id = existing_log_entry["id"]
-            matches = list(docs_dir.rglob(f"{log_doc_id}__*")) or list(docs_dir.rglob(f"{log_doc_id}*"))
-            log_path = matches[0] if matches else out_dir / f"{log_doc_id}__{_safe_filename_part(log_display_name)}"
-        else:
-            log_doc_id = "DOC-" + datetime.now().strftime("%Y%m%d") + "-" + secrets.token_hex(4).upper()
-            log_path = out_dir / f"{log_doc_id}__{_safe_filename_part(log_display_name)}"
-
-        log_path.write_bytes(pdf_bytes)
-        size = len(pdf_bytes)
-
-        if existing_log_entry:
-            existing_log_entry["size"] = size
-            existing_log_entry["uploadedAt"] = datetime.utcnow().isoformat() + "Z"
-            existing_log_entry["aiQaLog"] = qa_entries
-        else:
-            doc_index.append({
-                "id": log_doc_id, "name": log_display_name, "mime": "application/pdf",
-                "size": size, "uploadedAt": datetime.utcnow().isoformat() + "Z",
-                "originalNodeId": target_node_id, "metadata": {}, "aiQaLog": qa_entries,
-            })
-            node.setdefault("documents", []).append({"id": log_doc_id})
-        log_name = log_display_name
-        write_index(idx)
+    new_row = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "model": model_used, "question": question, "answer": answer,
+    }
+    try:
+        log_doc_id, log_name = _append_qa_log(
+            idx, node, target_node_id, entry.get("name") or doc_id, new_row, docs_dir)
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 500
 
     return jsonify({
         "ok": True,
@@ -6108,6 +6228,107 @@ def post_databook():
         n = 2
         while save_path.exists():
             save_path = databook_dir / f"{base_name}_{n}.pdf"
+            n += 1
+        save_path.write_bytes(pdf_bytes)
+        headers["X-Databook-Saved-Path"] = _pct_encode(str(save_path), safe="")
+    except Exception:
+        import traceback
+        traceback.print_exc()
+
+    return Response(pdf_bytes, mimetype="application/pdf", headers=headers)
+
+
+@app.route("/api/folder-ai-pdf", methods=["POST"])
+def post_folder_ai_pdf():
+    """Folder-level "Ask AI" -- option 2: build a single PDF whose first page
+    is the user's free-form request, followed by the selected documents'
+    pages, so the whole thing can be uploaded to an external tool (ChatGPT,
+    Claude, ...) as one file. No AI key needed -- this is pure PDF assembly.
+
+    Body (JSON): {
+      "node_id": "NODE-...",              # the folder the request is about
+      "request": "instruction / question text",
+      "selection": [ {nodeId, docIds:[...]}, ... ]   # same shape as /api/databook
+    }
+
+    Non-PDF / non-image documents (Word, Excel, ...) become a one-line
+    "not embedded" placeholder page -- same behavior as /api/databook.
+
+    A copy is saved under <root>/databook/ ; its path comes back in the
+    X-Databook-Saved-Path header. Response: PDF binary stream.
+    """
+    if not get_storage_root():
+        return jsonify({"error": "Storage path not configured"}), 503
+
+    data = request.get_json(force=True, silent=True) or {}
+    node_id = (data.get("node_id") or "").strip()
+    req_text = (data.get("request") or "").strip()
+    selection = data.get("selection") or []
+    if not req_text:
+        return jsonify({"error": "Provide a non-empty 'request'"}), 400
+    if not selection:
+        return jsonify({"error": "No documents selected"}), 400
+
+    docs_dir = get_docs_dir()
+    idx = read_index()
+    tree = idx.get("tree")
+    doc_index = idx.get("docIndex", [])
+    docs_by_id = {d["id"]: d for d in doc_index}
+
+    node = _find_node_by_id(tree, node_id) if node_id else None
+    folder_name = (node.get("name") if node else "") or ""
+
+    # Ordered list of the selected documents (tree/selection order), de-duped.
+    # Pass the full docIndex entries so build_ask_ai_pdf can caption each photo
+    # with the date/location/notes DMS already has on it.
+    ordered_docs, seen = [], set()
+    for sec in selection:
+        for did in (sec.get("docIds") or []):
+            d = docs_by_id.get(did)
+            if d and did not in seen:
+                seen.add(did)
+                ordered_docs.append(d)
+    if not ordered_docs:
+        return jsonify({"error": "No documents selected"}), 400
+
+    try:
+        from databook import build_ask_ai_pdf
+        pdf_bytes = build_ask_ai_pdf(req_text, folder_name, ordered_docs, docs_dir)
+    except ImportError as e:
+        return jsonify({
+            "error": ("Databook libraries not installed. Run:\n"
+                      "    pip3 install pypdf reportlab Pillow\n"
+                      "Then restart the server.\n\nDetail: " + str(e))
+        }), 500
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": f"PDF generation failed: {e}"}), 500
+
+    from urllib.parse import quote as _pct_encode
+    date_str = datetime.now().strftime("%Y_%m_%d")
+    safe_folder = "".join(c if (c.isalnum() or c in "-_") else "_" for c in folder_name)[:40] or "folder"
+    out_stem = f"AskAI_{safe_folder}_{date_str}"
+    utf8_filename = _pct_encode(f"{folder_name or 'Ask AI'} - Ask AI.pdf", safe="")
+    ascii_name = "".join(c if (c.isascii() and (c.isalnum() or c in "-_ ")) else "_" for c in out_stem)[:60].strip()
+
+    headers = {
+        "Content-Disposition": (
+            f'attachment; filename="{ascii_name or "AskAI"}.pdf"; '
+            f"filename*=UTF-8''{utf8_filename}"
+        ),
+        "Content-Length": str(len(pdf_bytes)),
+    }
+    try:
+        root = get_storage_root()
+        databook_dir = root / "databook"
+        databook_dir.mkdir(parents=True, exist_ok=True)
+        save_path = databook_dir / f"{out_stem}.pdf"
+        n = 2
+        while save_path.exists():
+            save_path = databook_dir / f"{out_stem}_{n}.pdf"
             n += 1
         save_path.write_bytes(pdf_bytes)
         headers["X-Databook-Saved-Path"] = _pct_encode(str(save_path), safe="")

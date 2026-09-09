@@ -189,9 +189,9 @@ _IMAGE_EXTS = {
 }
 
 
-def _downscaled_jpeg_reader(img_path: Path) -> "ImageReader":
-    """Open an image, downscale it to fit within _MAX_EMBED_DIM x _MAX_EMBED_DIM
-    (no upscaling — small images pass through unchanged), and return an
+def _downscaled_jpeg_reader(img_path: Path, max_dim: int = _MAX_EMBED_DIM) -> "ImageReader":
+    """Open an image, downscale it to fit within max_dim x max_dim (no
+    upscaling — small images pass through unchanged), and return an
     ImageReader wrapping a re-encoded JPEG. reportlab embeds an already-JPEG
     source as-is (no further re-compression), so this is what actually keeps
     the output PDF small — resizing alone wouldn't help if reportlab still
@@ -199,7 +199,7 @@ def _downscaled_jpeg_reader(img_path: Path) -> "ImageReader":
     with Image.open(img_path) as im:
         im = im.convert("RGB")
         iw, ih = im.size
-        scale = min(1.0, _MAX_EMBED_DIM / max(iw, ih))
+        scale = min(1.0, max_dim / max(iw, ih))
         if scale < 1.0:
             im = im.resize((max(1, round(iw * scale)), max(1, round(ih * scale))), Image.LANCZOS)
         buf = io.BytesIO()
@@ -208,8 +208,18 @@ def _downscaled_jpeg_reader(img_path: Path) -> "ImageReader":
         return ImageReader(buf)
 
 
-def _image_to_pdf_bytes(img_path: Path, caption: str) -> bytes:
-    """Convert an image into a single-page PDF using reportlab, preserving aspect."""
+def _image_to_pdf_bytes(img_path: Path, caption: str, strict: bool = False,
+                        max_dim: int = _MAX_EMBED_DIM,
+                        meta_lines: "list[str] | None" = None) -> bytes:
+    """Convert an image into a single-page PDF using reportlab, preserving aspect.
+
+    When strict is True, a render failure raises instead of producing a page
+    with a "[Could not render image]" note -- callers that want to fall back
+    to a different rendering path (see build_ask_ai_pdf) pass strict=True.
+    max_dim caps the embedded pixels' longest edge (higher = more legible
+    detail, larger file). meta_lines, if given, are printed as small grey
+    lines under the caption (date taken, GPS/place, description, ...).
+    """
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=letter)
 
@@ -218,13 +228,20 @@ def _image_to_pdf_bytes(img_path: Path, caption: str) -> bytes:
     c.setFillColor(black)
     c.drawString(MARGIN, PAGE_H - MARGIN, caption[:90])
 
-    # Compute fit area below caption
-    top_y = PAGE_H - MARGIN - 24
+    header_h = 24
+    for i, line in enumerate(meta_lines or []):
+        c.setFont(_FONT, 8.5)
+        c.setFillColor(SUBTLE)
+        c.drawString(MARGIN, PAGE_H - MARGIN - 12 - i * 11, str(line)[:120])
+        header_h = 24 + (i + 1) * 11
+
+    # Compute fit area below the caption + metadata block
+    top_y = PAGE_H - MARGIN - header_h
     avail_w = PAGE_W - 2 * MARGIN
     avail_h = top_y - MARGIN
 
     try:
-        reader = _downscaled_jpeg_reader(img_path)
+        reader = _downscaled_jpeg_reader(img_path, max_dim=max_dim)
         iw, ih = reader.getSize()
         scale = min(avail_w / iw, avail_h / ih)
         draw_w = iw * scale
@@ -236,6 +253,8 @@ def _image_to_pdf_bytes(img_path: Path, caption: str) -> bytes:
             preserveAspectRatio=True, anchor="c",
         )
     except Exception as e:
+        if strict:
+            raise
         c.setFont(_FONT, 10)
         c.setFillColor(SUBTLE)
         c.drawString(MARGIN, PAGE_H / 2, f"[Could not render image: {e}]")
@@ -688,6 +707,207 @@ def build_qa_log_pdf(doc_name: str, entries: list[dict]) -> bytes:
 
     doc.build(story)
     return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Folder-level "Ask AI" — request cover page (see /api/folder-ai-pdf in
+# dms_server.py). A single page carrying the user's free-form request,
+# prepended to the merged selected documents so the whole PDF can be handed
+# to an external tool (ChatGPT, Claude, ...) as one file.
+# ---------------------------------------------------------------------------
+def build_prompt_cover_pdf(request_text: str, folder_name: str = "",
+                           doc_count: int = 0) -> bytes:
+    """Render the request page that leads a folder-level Ask-AI PDF.
+
+    request_text: the user's instruction/question, shown verbatim.
+    folder_name:  shown as a small subheading for context.
+    doc_count:    how many document pages follow -- shown as a one-line note
+                  so the reader knows to keep scrolling for the images
+                  themselves (no filename list -- the pages carry the images).
+    """
+    _init_fonts()
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=letter,
+        leftMargin=MARGIN, rightMargin=MARGIN,
+        topMargin=MARGIN, bottomMargin=MARGIN,
+        title="Request",
+    )
+
+    styles = getSampleStyleSheet()
+    h_kicker = ParagraphStyle(
+        "PCKicker", parent=styles["Normal"],
+        fontName=_FONT_BOLD, fontSize=9, leading=12, textColor=SUBTLE, spaceAfter=2,
+    )
+    h_title = ParagraphStyle(
+        "PCTitle", parent=styles["Normal"],
+        fontName=_FONT_BOLD, fontSize=17, leading=22, textColor=black, spaceAfter=14,
+    )
+    p_body = ParagraphStyle(
+        "PCBody", parent=styles["Normal"],
+        fontName=_FONT, fontSize=11.5, leading=17, textColor=black, spaceAfter=8,
+    )
+    h_meta = ParagraphStyle(
+        "PCMeta", parent=styles["Normal"],
+        fontName=_FONT, fontSize=9, leading=13, textColor=SUBTLE, spaceAfter=3,
+    )
+
+    def _para_text(s: str) -> str:
+        return _escape(s).replace("\n", "<br/>")
+
+    story: list = [Paragraph("REQUEST / 请求", h_kicker)]
+    story.append(Paragraph(_escape(folder_name) if folder_name else "Ask AI", h_title))
+    story.append(Paragraph(_para_text(request_text or "(no request text)"), p_body))
+
+    if doc_count:
+        story.append(Spacer(1, 0.35 * inch))
+        story.append(HRFlowable(width="100%", thickness=0.5, color=BORDER, spaceAfter=8))
+        story.append(Paragraph(
+            f"The {doc_count} document(s) referenced by this request follow on "
+            f"the next pages. / 本请求涉及的 {doc_count} 份文档见后续页面。",
+            h_meta))
+
+    doc.build(story)
+    return buf.getvalue()
+
+
+def _exif_datetime_original(img_path: Path) -> str:
+    """Return the photo's 'date taken' from EXIF (YYYY-MM-DD HH:MM:SS), or ""."""
+    try:
+        with Image.open(str(img_path)) as im:
+            exif = im.getexif()
+            if not exif:
+                return ""
+            # 36867 DateTimeOriginal (in the Exif sub-IFD), 306 DateTime (root)
+            val = ""
+            try:
+                sub = exif.get_ifd(0x8769)
+                val = sub.get(36867) or sub.get(36868) or ""
+            except Exception:
+                pass
+            val = val or exif.get(306) or ""
+            val = str(val).strip()
+            if len(val) >= 10 and val[4] == ":" and val[7] == ":":
+                return val[:10].replace(":", "-") + val[10:]
+            return val
+    except Exception:
+        return ""
+
+
+def _photo_meta_lines(entry: dict, img_path: Path) -> list:
+    """Small caption block for an image page: date taken, location, and any
+    description / SN / key parameters DMS has on the document."""
+    lines: list = []
+
+    taken = _exif_datetime_original(img_path) or (entry.get("docDate") or "")
+    if taken:
+        lines.append(f"Date taken / 拍摄日期: {taken}")
+
+    meta = entry.get("metadata") or {}
+    place = ""
+    loc = meta.get("Location")
+    if isinstance(loc, dict):
+        place = (loc.get("actual") or loc.get("design") or "").strip()
+    elif isinstance(loc, str):
+        place = loc.strip()
+    lat, lon = entry.get("lat"), entry.get("lon")
+    loc_bits = [b for b in [place, (f"{lat:.5f}, {lon:.5f}" if lat is not None and lon is not None else "")] if b]
+    if loc_bits:
+        lines.append("Location / 位置: " + "  ".join(loc_bits))
+
+    if (entry.get("sn") or "").strip():
+        lines.append(f"SN: {entry['sn'].strip()}")
+    if (entry.get("description") or "").strip():
+        lines.append("Note: " + " ".join(entry["description"].split()))
+
+    for k, v in meta.items():
+        if k == "Location":
+            continue
+        if isinstance(v, dict):
+            v = (v.get("actual") or v.get("design") or "")
+        v = str(v).strip()
+        if v:
+            lines.append(f"{k}: {v}")
+
+    return lines[:8]
+
+
+def build_ask_ai_pdf(request_text: str, folder_name: str,
+                     docs: list[dict], docs_dir: "Path") -> bytes:
+    """Assemble the folder-level Ask-AI PDF: a request cover page, then the
+    actual content of each selected document.
+
+    docs: ordered list of docIndex entries (id/name/mime plus whatever
+          metadata DMS has -- docDate, lat/lon, metadata.Location,
+          description, sn, ...). PDFs are merged page-for-page; images
+          (JPG/PNG/HEIC/...) are rendered onto their own page, captioned
+          with date taken / location / notes, so ChatGPT/Claude gets that
+          context too; anything else gets a one-line placeholder page.
+
+    Unlike build_databook this does its own image handling via Pillow (with
+    HEIC registered), so a phone photo always lands as a visible picture,
+    never a "[could not render]" line.
+    """
+    _init_fonts()
+    _ensure_heif_support()
+
+    writer = PdfWriter()
+
+    cover = build_prompt_cover_pdf(request_text, folder_name, doc_count=len(docs))
+    cr = PdfReader(io.BytesIO(cover))
+    for p in cr.pages:
+        writer.add_page(p)
+    cr.close()
+
+    for d in docs:
+        path = _doc_path(docs_dir, d["id"])
+        name = d.get("name") or d["id"]
+        if path is None or not path.exists():
+            ph = PdfReader(io.BytesIO(_build_missing_doc_pdf(d)))
+            for p in ph.pages:
+                writer.add_page(p)
+            ph.close()
+            continue
+
+        ext = (path.suffix or Path(name).suffix).lower().lstrip(".")
+        mime = (d.get("mime") or "").lower()
+        is_pdf = mime == "application/pdf" or (not mime.startswith("image/") and ext == "pdf")
+
+        if is_pdf:
+            try:
+                src = PdfReader(str(path))
+                for p in src.pages:
+                    writer.add_page(_normalize_to_portrait(p))
+                src.close()
+                continue
+            except Exception:
+                pass  # fall through to placeholder
+
+        # Treat everything else Pillow can open as an image (covers HEIC, and
+        # phone photos stored with an empty/generic mime). Embed at a higher
+        # resolution than a bulk databook would -- this PDF exists to be read
+        # by another AI, so photo detail/legibility matters more than size.
+        try:
+            img_pdf = _image_to_pdf_bytes(
+                path, name, strict=True, max_dim=1600,
+                meta_lines=_photo_meta_lines(d, path))
+            ir = PdfReader(io.BytesIO(img_pdf))
+            for p in ir.pages:
+                writer.add_page(p)
+            ir.close()
+            continue
+        except Exception:
+            pass
+
+        ph = PdfReader(io.BytesIO(_build_missing_doc_pdf(
+            d, error=f"Unsupported type: {mime or ext or 'unknown'}")))
+        for p in ph.pages:
+            writer.add_page(p)
+        ph.close()
+
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
 
 
 def _build_missing_doc_pdf(doc: dict, error: str = "File not found on disk") -> bytes:
