@@ -313,11 +313,33 @@ const Layers = (p) => (
     <polyline points="2 12 12 17 22 12" />
   </I>
 );
+const LayoutGrid = (p) => (
+  <I {...p}>
+    <rect x="3" y="3" width="7" height="7" rx="1" />
+    <rect x="14" y="3" width="7" height="7" rx="1" />
+    <rect x="3" y="14" width="7" height="7" rx="1" />
+    <rect x="14" y="14" width="7" height="7" rx="1" />
+  </I>
+);
+const ListView = (p) => (
+  <I {...p}>
+    <line x1="8" y1="6" x2="21" y2="6" /><line x1="8" y1="12" x2="21" y2="12" /><line x1="8" y1="18" x2="21" y2="18" />
+    <line x1="3" y1="6" x2="3.01" y2="6" /><line x1="3" y1="12" x2="3.01" y2="12" /><line x1="3" y1="18" x2="3.01" y2="18" />
+  </I>
+);
 const ScanText = (p) => (
   <I {...p}>
     <path d="M3 7V5a2 2 0 0 1 2-2h2" /><path d="M17 3h2a2 2 0 0 1 2 2v2" />
     <path d="M21 17v2a2 2 0 0 1-2 2h-2" /><path d="M7 21H5a2 2 0 0 1-2-2v-2" />
     <line x1="7" y1="9" x2="17" y2="9" /><line x1="7" y1="13" x2="15" y2="13" />
+  </I>
+);
+const BarcodeIcon = (p) => (
+  <I {...p}>
+    <path d="M3 7V5a2 2 0 0 1 2-2h2" /><path d="M17 3h2a2 2 0 0 1 2 2v2" />
+    <path d="M21 17v2a2 2 0 0 1-2 2h-2" /><path d="M7 21H5a2 2 0 0 1-2-2v-2" />
+    <line x1="8" y1="7" x2="8" y2="15" /><line x1="11" y1="7" x2="11" y2="15" />
+    <line x1="14" y1="7" x2="14" y2="15" /><line x1="17" y1="7" x2="17" y2="15" />
   </I>
 );
 const Copy = (p) => (
@@ -564,6 +586,81 @@ const readPhotoDate = async (file) => {
     }
   } catch {}
   return fallback();
+};
+
+// Videos have no EXIF, but the ISO-BMFF container family (MP4, MOV, M4V,
+// 3GP/3G2 -- i.e. essentially every phone camera's output) embeds its own
+// recording timestamp in the "mvhd" box inside "moov". Reading that directly
+// is more reliable than the file's modified/added date, which drifts when a
+// video is copied through iCloud, AirDrop, a cloud drive, etc. Falls back to
+// file.lastModified for any other container (avi, mkv, webm, wmv, flv, ...)
+// -- those use unrelated metadata schemes this doesn't attempt to parse -- or
+// if the mvhd box can't be found/parsed.
+const readVideoDate = async (file) => {
+  const fallback = () => {
+    const d = new Date(file.lastModified);
+    return { year: String(d.getFullYear()), month: String(d.getMonth() + 1).padStart(2, "0"), lat: null, lon: null };
+  };
+  const _ext = file.name.split(".").pop().toLowerCase();
+  const _isIsoBmff = file.type === "video/mp4" || file.type === "video/quicktime" ||
+    ["mp4", "mov", "m4v", "3gp", "3g2"].includes(_ext);
+  if (!_isIsoBmff) return fallback();
+  try {
+    // Read one box's header (size + fourcc type) at `offset`, without
+    // touching the box's body -- "mdat" (the actual video data) can be
+    // gigabytes, so only its 8-16 byte header is ever read here.
+    const readBoxHeader = async (offset) => {
+      if (offset + 8 > file.size) return null;
+      const buf = await file.slice(offset, offset + 16).arrayBuffer();
+      if (buf.byteLength < 8) return null;
+      const v = new DataView(buf);
+      let size = v.getUint32(0);
+      const type = String.fromCharCode(v.getUint8(4), v.getUint8(5), v.getUint8(6), v.getUint8(7));
+      let headerSize = 8;
+      if (size === 1) {
+        // size===1 means the real (64-bit) size follows as an 8-byte
+        // "largesize" field -- used once a box (usually mdat) exceeds 4GB.
+        if (buf.byteLength < 16) return null;
+        size = Number(v.getBigUint64(8));
+        headerSize = 16;
+      } else if (size === 0) {
+        size = file.size - offset; // box extends to end of file (usually a trailing mdat)
+      }
+      if (size < headerSize) return null;
+      return { type, offset, size, headerSize };
+    };
+    // Walk sibling boxes in [start, end) looking for one named targetType.
+    const findChild = async (start, end, targetType) => {
+      let pos = start;
+      let guard = 0;
+      while (pos < end && guard++ < 10000) {
+        const box = await readBoxHeader(pos);
+        if (!box) return null;
+        if (box.type === targetType) return box;
+        pos += box.size;
+      }
+      return null;
+    };
+    const moov = await findChild(0, file.size, "moov");
+    if (!moov) return fallback();
+    const mvhd = await findChild(moov.offset + moov.headerSize, moov.offset + moov.size, "mvhd");
+    if (!mvhd) return fallback();
+    const buf = await file.slice(mvhd.offset + mvhd.headerSize, mvhd.offset + mvhd.headerSize + 20).arrayBuffer();
+    if (buf.byteLength < 8) return fallback();
+    const v = new DataView(buf);
+    const version = v.getUint8(0); // full-box header: version(1) + flags(3)
+    const creationTime = version === 1 ? Number(v.getBigUint64(4)) : v.getUint32(4);
+    // mvhd stores seconds since 1904-01-01 UTC -- 2082844800 is the gap to
+    // the 1970 Unix epoch. A creation_time of 0 (never set by the recorder)
+    // or something absurdly far off isn't trustworthy -- fall back instead.
+    const unixSeconds = creationTime - 2082844800;
+    if (!creationTime || unixSeconds < 0 || unixSeconds > Date.now() / 1000 + 86400) return fallback();
+    const d = new Date(unixSeconds * 1000);
+    return { year: String(d.getFullYear()), month: String(d.getMonth() + 1).padStart(2, "0"), lat: null, lon: null };
+  } catch (e) {
+    console.warn("[DMS] mvhd parse failed, falling back to file date:", e);
+    return fallback();
+  }
 };
 
 const StorageAdapter = {
@@ -920,6 +1017,71 @@ const StorageAdapter = {
     return res.json();   // { ok, doc_id, name, size, node_id }
   },
 
+  // Folder/component-level counterparts of saveTextAsDoc above -- save a
+  // node's Description field as a .txt or PDF document filed into that same
+  // folder. `reuse: true` (the default the UI passes on repeat saves)
+  // overwrites the previously saved file in place instead of creating a
+  // new one each time.
+  async saveNodeDescriptionText(nodeId, { text, title = "", reuse = false } = {}) {
+    const res = await fetch(API_BASE + "/api/nodes/" + nodeId + "/save-description-text", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, title, reuse }),
+    });
+    if (!res.ok) {
+      let detail = "";
+      try { detail = (await res.json()).error || ""; } catch {}
+      throw new Error(detail || tOutsideReact(`保存为新文档失败: HTTP ${res.status}`, `Save as new document failed: HTTP ${res.status}`));
+    }
+    return res.json();   // { ok, doc_id, name, size, node_id, updated }
+  },
+  async saveNodeDescriptionPdf(nodeId, { text, title = "", reuse = true } = {}) {
+    const res = await fetch(API_BASE + "/api/nodes/" + nodeId + "/save-description-pdf", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, title, reuse }),
+    });
+    if (!res.ok) {
+      let detail = "";
+      try { detail = (await res.json()).error || ""; } catch {}
+      throw new Error(detail || tOutsideReact(`生成 PDF 失败: HTTP ${res.status}`, `PDF generation failed: HTTP ${res.status}`));
+    }
+    return res.json();   // { ok, doc_id, name, size, node_id, updated }
+  },
+
+  // Transcribe an uploaded voice-recording file (.m4a, .mp3, .wav, ...) to
+  // text via Gemini -- the "upload a recording" alternative to live
+  // microphone dictation in the Description panel. Always Gemini: DeepSeek
+  // has no audio-input API.
+  async transcribeAudio(file) {
+    const form = new FormData();
+    form.append("file", file, file.name || "recording");
+    const res = await fetch(API_BASE + "/api/transcribe-audio", {
+      method: "POST",
+      body: form,
+    });
+    if (!res.ok) {
+      let detail = "";
+      try { detail = (await res.json()).error || ""; } catch {}
+      throw new Error(detail || tOutsideReact(`录音转文字失败: HTTP ${res.status}`, `Audio transcription failed: HTTP ${res.status}`));
+    }
+    return res.json();   // { ok, text, provider, model }
+  },
+
+  // Decode any barcode(s)/QR code in a document's image -- offline, no AI
+  // key needed (zbar via pyzbar). See runScanBarcode in DocumentViewer.
+  async scanBarcode(docId) {
+    const res = await fetch(API_BASE + "/api/docs/" + docId + "/scan-barcode", {
+      method: "POST",
+    });
+    if (!res.ok) {
+      let detail = "";
+      try { detail = (await res.json()).error || ""; } catch {}
+      throw new Error(detail || tOutsideReact(`条码识别失败: HTTP ${res.status}`, `Barcode scan failed: HTTP ${res.status}`));
+    }
+    return res.json();   // { ok, doc_id, results: [{type, data}], count }
+  },
+
   // Cross-document Q&A (Gemini or DeepSeek, opt-in) -- reasons over many
   // documents' existing text/metadata at once instead of exact-keyword matching.
   async askAI(question, scopeNodeId = null, provider = "gemini", opts = {}) {
@@ -1005,6 +1167,27 @@ const StorageAdapter = {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text, dedupe_names: dedupeNames, target_node_id: targetNodeId }),
+    });
+  },
+
+  // Near-duplicate photo check -- threshold is 0..1 (e.g. 0.95 for "95%
+  // similar"), a caller-supplied value, not a fixed constant on the server.
+  async findNearDuplicates(docIds, threshold) {
+    return this._json("/api/photos/near-duplicates", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ docIds, threshold }),
+    });
+  },
+
+  // lang picks which language the created "疑似重复照片/组N" (or "Suspected
+  // duplicates"/"Group N") folder names come out in -- the server has no
+  // notion of the UI's language on its own, so the caller passes it.
+  async markNearDuplicates(groups, lang) {
+    return this._json("/api/photos/near-duplicates/mark", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ groups, lang }),
     });
   },
 };
@@ -2066,7 +2249,7 @@ const DEFAULT_MAP_PROVIDER = "amap";
  * UI: DOCUMENT VIEWER
  * =============================================================================
  */
-const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyParameter, onSaveLocalParams, onSaveParams, onSaveDescription, onSaveTextAsDoc, derivedDocs = [], onOpenAISettings, nodeId }) => {
+const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyParameter, onSaveLocalParams, onSaveParams, onSaveDescription, onSaveTextAsDoc, derivedDocs = [], onOpenAISettings, nodeId, onPrevDoc, onNextDoc }) => {
   const { t } = useLang();
   const isImage = doc?.mime?.startsWith("image/");
   const isPdf = doc?.mime === "application/pdf";
@@ -2090,6 +2273,10 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
   const [ocrInfo, setOcrInfo] = useState(null);
   const [ocrHint, setOcrHint] = useState("");
   const [ocrError, setOcrError] = useState("");
+  // Barcode/QR decode (offline, zbar via pyzbar) -- see runScanBarcode below.
+  const [barcodeScanning, setBarcodeScanning] = useState(false);
+  const [barcodeError, setBarcodeError] = useState("");
+  const [barcodeResult, setBarcodeResult] = useState(null);   // { results: [{type, data}], saved }
   // Side panel: null (closed) | "text" (OCR text) | "keys" (key-param extract) | "desc" (description) | "ask" (AI Q&A)
   const [panelMode, setPanelMode] = useState(null);
   const [copied, setCopied] = useState(false);
@@ -2119,6 +2306,12 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
     ? (window.SpeechRecognition || window.webkitSpeechRecognition)
     : null;
   const voiceSupported = !!SpeechRecognitionCtor;
+
+  // Upload-a-recording alternative to live mic dictation (.m4a/.mp3/.wav/...,
+  // transcribed server-side via Gemini) -- see runTranscribeAudioFile below.
+  const [transcribing, setTranscribing] = useState(false);
+  const [transcribeError, setTranscribeError] = useState("");
+  const audioFileInputRef = useRef(null);
 
   // Preferred online map provider for "view on map" (persisted across docs/sessions —
   // Google Maps is often unreachable in mainland China, so this is user-switchable).
@@ -2323,6 +2516,7 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
     if (!doc) return;
     setOcrText(doc.ocrText || "");
     setOcrInfo(null); setOcrHint(""); setOcrError("");
+    setBarcodeScanning(false); setBarcodeError(""); setBarcodeResult(null);
     setPanelMode(doc.ocrText ? "text" : null);
     setCopied(false); setSaved(false);
     setImgLoadError(false);
@@ -2341,6 +2535,7 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
     setKeyRows(null); setKeyError(""); setKeyHint(""); setKeyDiag(null); setParamsSaved(false);
     setAskQuestion(""); setAskRunning(false); setAskError(""); setAskAnswer(null); setAskLogName("");
     setSavingNewDoc(false); setNewDocMsg(null);
+    setTranscribing(false); setTranscribeError("");
     // Stop any dictation still running from the previously-open document.
     return () => { try { recognitionRef.current && recognitionRef.current.stop(); } catch {} };
   }, [doc?.id]);
@@ -2362,6 +2557,23 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
       .catch(() => { if (alive) setImgLoadError(true); });
     return () => { alive = false; };
   }, [doc?.id]);
+
+  // Left/Right arrow keys walk to the previous/next document in the folder,
+  // same as the on-screen chevron buttons -- but not while the user is
+  // typing in a text field (description, Ask AI, key-param inputs, ...) or
+  // while the document is popped out into its own window.
+  useEffect(() => {
+    if (!doc || poppedOut) return;
+    const onKey = (e) => {
+      if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+      const tag = e.target?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || e.target?.isContentEditable) return;
+      if (e.key === "ArrowLeft" && onPrevDoc) { e.preventDefault(); onPrevDoc(); }
+      else if (e.key === "ArrowRight" && onNextDoc) { e.preventDefault(); onNextDoc(); }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [doc?.id, poppedOut, onPrevDoc, onNextDoc]);
 
   if (!doc) return null;
 
@@ -2400,6 +2612,42 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
     await onSaveDescription(doc.id, description);
     setDescSaved(true);
     setTimeout(() => setDescSaved(false), 1800);
+  };
+
+  // Decode any barcode(s)/QR code in the image (offline, zbar via pyzbar --
+  // see /api/docs/<id>/scan-barcode) and save the value(s) straight into the
+  // document's metadata, the same field a manually-added key parameter would
+  // use, so it shows up in the existing metadata editor. Date and GPS
+  // location are already captured automatically from EXIF at upload time
+  // for every photo -- this only adds what EXIF can't give you: the code's
+  // actual encoded value.
+  const runScanBarcode = async () => {
+    if (barcodeScanning) return;
+    setBarcodeScanning(true); setBarcodeError(""); setBarcodeResult(null);
+    try {
+      const r = await StorageAdapter.scanBarcode(doc.id);
+      const results = r.results || [];
+      if (!results.length) {
+        setBarcodeError(t("未在图片中识别到条码，请确认条码清晰、无遮挡。", "No barcode found in the image — make sure it's in focus and not obscured."));
+        return;
+      }
+      let saved = false;
+      if (onSaveParams) {
+        const nextMeta = { ...(doc.metadata || {}) };
+        // More than one code on the same photo gets its own field (Barcode,
+        // Barcode2, ...) instead of the later one overwriting the first.
+        results.forEach((res, i) => {
+          nextMeta[i === 0 ? "Barcode" : `Barcode${i + 1}`] = { design: "", actual: res.data };
+        });
+        await onSaveParams(doc.id, nextMeta);
+        saved = true;
+      }
+      setBarcodeResult({ results, saved });
+    } catch (e) {
+      setBarcodeError(e.message || String(e));
+    } finally {
+      setBarcodeScanning(false);
+    }
   };
 
   // --- AI "organize & polish" the description --------------------------------
@@ -2588,6 +2836,34 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
   const toggleListening = () => {
     if (listening) { stopListening(); return; }
     startListening(voiceLang);
+  };
+
+  // Upload-a-recording alternative to the mic: pick a file, send it to
+  // Gemini for transcription, append the result into the description the
+  // same way a finished chunk of live dictation does.
+  const runTranscribeAudioFile = async (file) => {
+    if (!file || transcribing) return;
+    setTranscribing(true); setTranscribeError("");
+    try {
+      const r = await StorageAdapter.transcribeAudio(file);
+      const text = (r.text || "").trim();
+      if (text) {
+        setDescription((prev) => {
+          const needsSpace = prev && !/[\s\n]$/.test(prev);
+          return prev + (needsSpace ? " " : "") + text;
+        });
+        setDescSaved(false);
+      }
+    } catch (e) {
+      setTranscribeError(e.message || String(e));
+    } finally {
+      setTranscribing(false);
+    }
+  };
+  const handleAudioFileChange = (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = "";   // allow picking the same file again next time
+    if (file) runTranscribeAudioFile(file);
   };
 
   // --- Key-parameter extraction ---------------------------------------------
@@ -2894,6 +3170,21 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
                 <ListChecks size={13} /> {t("提取关键参数", "Extract key parameters")}
               </button>
             )}
+            {ocrEligible && ocrStatus?.barcode_scan_available && (
+              <button
+                onClick={runScanBarcode}
+                disabled={barcodeScanning}
+                title={t("识别图片中的条码/二维码，解码结果存为文档的 Barcode 参数（日期、位置已自动从照片信息中提取）", "Decode any barcode/QR code in the image and save it as the document's Barcode parameter (date and location are already captured automatically from the photo's own info)")}
+                className={"text-sm px-3 py-1.5 rounded flex items-center gap-1.5 border " +
+                  (barcodeScanning
+                    ? "border-stone-200 text-stone-600 cursor-wait"
+                    : "border-teal-300 text-teal-800 bg-teal-50 hover:bg-teal-100")}
+              >
+                {barcodeScanning
+                  ? (<><Loader size={13} className="animate-spin" /> {t("识别中…", "Scanning…")}</>)
+                  : (<><BarcodeIcon size={13} /> {t("扫描条码", "Scan barcode")}</>)}
+              </button>
+            )}
             <button
               onClick={() => setPanelMode(panelMode === "ask" ? null : "ask")}
               title={t("就本文档提问，AI 会读取文档内容作答，问答会存档在同一文件夹", "Ask a question about this document — the AI reads its content and the Q&A is filed in the same folder")}
@@ -2957,6 +3248,31 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
           </div>
         )}
 
+        {barcodeError && (
+          <div className="px-4 py-2 bg-red-50 border-b border-red-100 text-[13px] text-red-700 flex items-center gap-2 shrink-0">
+            {barcodeError}
+            <button onClick={() => setBarcodeError("")} className="ml-auto text-red-600 hover:text-red-800"><X size={13} /></button>
+          </div>
+        )}
+        {barcodeResult && (
+          <div className="px-4 py-2 bg-teal-50 border-b border-teal-100 text-[13px] text-teal-800 flex items-start gap-2 shrink-0">
+            <BarcodeIcon size={14} className="mt-0.5 shrink-0" />
+            <div className="min-w-0">
+              {barcodeResult.results.map((r, i) => (
+                <div key={i} className="font-mono break-all">
+                  {r.type}: {r.data}
+                </div>
+              ))}
+              <div className="text-[12px] text-teal-700 mt-0.5">
+                {barcodeResult.saved
+                  ? t("已存为文档参数（Barcode），可在下方“元数据”中查看/编辑", "Saved as the document's parameter (Barcode) — view/edit it under Metadata below")
+                  : t("已识别，但未能保存到文档参数", "Decoded, but couldn't be saved to the document's parameters")}
+              </div>
+            </div>
+            <button onClick={() => setBarcodeResult(null)} className="ml-auto text-teal-600 hover:text-teal-800 shrink-0"><X size={13} /></button>
+          </div>
+        )}
+
         <div className="flex-1 min-h-0 flex">
           {/* Preview pane */}
           {poppedOut ? (
@@ -2970,7 +3286,8 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
               </div>
             )
           ) : (
-          <div className={"min-h-0 overflow-auto bg-stone-100 " + (panelOpen ? "flex-1 border-r border-stone-200" : "flex-1")}>
+          <div className={"min-h-0 relative " + (panelOpen ? "flex-1 border-r border-stone-200" : "flex-1")}>
+          <div className="absolute inset-0 overflow-auto bg-stone-100">
             {imgLoadError ? (
               <div className="h-full flex flex-col items-center justify-center text-stone-700 gap-3 p-6">
                 <File size={52} className="text-stone-600" />
@@ -3021,6 +3338,28 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
                 </a>
               </div>
             )}
+          </div>
+          {/* Prev/Next document navigation -- walks the same folder list
+              shown in the main panel, in on-screen order. Arrow keys do
+              the same thing (see the keydown effect above). */}
+          {onPrevDoc && (
+            <button
+              onClick={onPrevDoc}
+              title={t("上一个文档（← 方向键）", "Previous document (← arrow key)")}
+              className="absolute left-2 top-1/2 -translate-y-1/2 z-20 p-2 rounded-full bg-stone-900/40 text-white hover:bg-stone-900/70"
+            >
+              <ChevronLeft size={22} />
+            </button>
+          )}
+          {onNextDoc && (
+            <button
+              onClick={onNextDoc}
+              title={t("下一个文档（→ 方向键）", "Next document (→ arrow key)")}
+              className="absolute right-2 top-1/2 -translate-y-1/2 z-20 p-2 rounded-full bg-stone-900/40 text-white hover:bg-stone-900/70"
+            >
+              <ChevronRight size={22} />
+            </button>
+          )}
           </div>
           )}
 
@@ -3094,9 +3433,34 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
                 ) : (
                   <span className="text-[12px] text-stone-600">{t("当前浏览器不支持语音输入（推荐使用 Chrome / Edge）", "This browser doesn't support voice input (Chrome / Edge recommended)")}</span>
                 )}
+                <input
+                  ref={audioFileInputRef}
+                  type="file"
+                  accept="audio/*,.m4a,.caf,.aac,.amr,.3gp"
+                  className="hidden"
+                  onChange={handleAudioFileChange}
+                />
+                {aiSettings.configured ? (
+                  <button
+                    onClick={() => audioFileInputRef.current && audioFileInputRef.current.click()}
+                    disabled={transcribing}
+                    title={t("上传一段录音文件（如 .m4a），由 AI 转写为文字并追加到描述中", "Upload a recording file (e.g. .m4a) — AI transcribes it to text and appends it to the description")}
+                    className="text-sm px-2 py-1 rounded flex items-center gap-1 border border-stone-300 text-stone-700 hover:bg-stone-100 shrink-0 disabled:opacity-50"
+                  >
+                    {transcribing ? <Loader size={12} className="animate-spin" /> : <Upload size={12} />}
+                    {transcribing ? t("转写中…", "Transcribing…") : t("上传录音转文字", "Upload recording")}
+                  </button>
+                ) : onOpenAISettings && (
+                  <button onClick={onOpenAISettings} className="text-[12px] text-purple-700 hover:underline shrink-0">
+                    {t("配置 AI 以支持录音转文字（Gemini）", "Set up AI to transcribe recordings (Gemini)")}
+                  </button>
+                )}
               </div>
               {voiceError && (
                 <div className="px-3 py-1 text-[12px] text-red-600 bg-red-50 border-b border-red-100">{voiceError}</div>
+              )}
+              {transcribeError && (
+                <div className="px-3 py-1 text-[12px] text-red-600 bg-red-50 border-b border-red-100">{transcribeError}</div>
               )}
 
               {/* AI: organize & polish the description (Gemini / DeepSeek, opt-in) */}
@@ -5943,6 +6307,12 @@ const FolderAskAIDialog = ({ open, node, tree, docIndex, onClose, onOpenDoc, onO
   }, [sections]);
   const [selected, setSelected] = useState(new Set());
   const [request, setRequest] = useState("");
+  // AI "polish wording" for the request/question box (same polish-text API
+  // and accept/discard flow as the document description editor; Gemini by
+  // default, falling back to DeepSeek when only that one is configured).
+  const [polishingReq, setPolishingReq] = useState(false);
+  const [polishReqError, setPolishReqError] = useState("");
+  const [polishReqResult, setPolishReqResult] = useState(null); // text once returned, awaiting accept/discard
   const [archive, setArchive] = useState(true);
   const [vision, setVision] = useState(true); // Gemini: also send page images
   const [aiSettings, setAiSettings] = useState({ configured: false });
@@ -5958,6 +6328,7 @@ const FolderAskAIDialog = ({ open, node, tree, docIndex, onClose, onOpenDoc, onO
     if (!open) return;
     setSelected(new Set(allKeys));
     setAnswer(null); setErr(""); setSavedPath(null);
+    setPolishReqResult(null); setPolishReqError(""); setPolishingReq(false);
     StorageAdapter.getAISettings("gemini").then(setAiSettings).catch(() => {});
     StorageAdapter.getAISettings("deepseek").then(setAiSettingsDS).catch(() => {});
   }, [open, node?.id]);
@@ -6046,6 +6417,28 @@ const FolderAskAIDialog = ({ open, node, tree, docIndex, onClose, onOpenDoc, onO
     } finally {
       setBuilding(false);
     }
+  };
+
+  // Gemini by default; only fall back to DeepSeek if Gemini isn't configured
+  // (same rule as the document description's "AI cleanup").
+  const polishReqProvider = aiSettings.configured ? "gemini" : "deepseek";
+  const runPolishRequest = async () => {
+    const text = request.trim();
+    if (!text || polishingReq || !anyConfigured) return;
+    setPolishingReq(true); setPolishReqError(""); setPolishReqResult(null);
+    try {
+      const r = await StorageAdapter.polishText(text, { provider: polishReqProvider, style: "polish" });
+      setPolishReqResult((r.text || "").trim());
+    } catch (e) {
+      setPolishReqError(e.message || String(e));
+    } finally {
+      setPolishingReq(false);
+    }
+  };
+  const acceptPolishRequest = () => {
+    if (!polishReqResult) return;
+    setRequest(polishReqResult);
+    setPolishReqResult(null);
   };
 
   const busy = asking || building;
@@ -6139,33 +6532,51 @@ const FolderAskAIDialog = ({ open, node, tree, docIndex, onClose, onOpenDoc, onO
           <div>
             <div className="flex items-center justify-between mb-1 gap-2 flex-wrap">
               <div className="text-[13px] font-medium text-stone-700">{t("你的请求 / 问题", "Your request / question")}</div>
-              {voiceSupported ? (
-                <div className="flex items-center gap-1.5">
-                  <div className="flex rounded overflow-hidden border border-stone-300 text-[11px] shrink-0">
-                    <button
-                      onClick={() => setVoiceLang("zh-CN")} disabled={listening}
-                      title={t("识别语言：中文", "Recognition language: Chinese")}
-                      className={"px-1.5 py-0.5 " + (voiceLang === "zh-CN" ? "bg-stone-700 text-white" : "bg-white text-stone-700 hover:bg-stone-100")}
-                    >中文</button>
-                    <button
-                      onClick={() => setVoiceLang("en-US")} disabled={listening}
-                      title="Recognition language: English"
-                      className={"px-1.5 py-0.5 border-l border-stone-300 " + (voiceLang === "en-US" ? "bg-stone-700 text-white" : "bg-white text-stone-700 hover:bg-stone-100")}
-                    >EN</button>
-                  </div>
+              <div className="flex items-center gap-1.5 flex-wrap">
+                {anyConfigured ? (
                   <button
-                    onClick={toggleListening}
-                    title={listening ? t("停止语音输入", "Stop voice input") : t("开始语音输入，识别结果自动追加到请求中", "Start voice input — recognized text is appended to the request")}
-                    className={"text-[12px] px-2 py-0.5 rounded flex items-center gap-1 border shrink-0 " +
-                      (listening ? "border-red-400 text-red-700 bg-red-50 animate-pulse" : "border-stone-300 text-stone-700 hover:bg-stone-100")}
+                    onClick={runPolishRequest}
+                    disabled={polishingReq || !request.trim()}
+                    title={t("用 AI 润色上面的请求/问题，结果需确认后才会替换原文", "Use AI to polish the wording above — you confirm before it replaces your text")}
+                    className="text-[12px] px-2 py-0.5 border border-purple-300 text-purple-800 bg-white hover:bg-purple-50 rounded flex items-center gap-1 disabled:opacity-40 shrink-0"
                   >
-                    {listening ? <MicOff size={12} /> : <Mic size={12} />}
-                    {listening ? t("正在聆听…", "Listening…") : t("语音输入", "Voice")}
+                    {polishingReq
+                      ? (<><Loader size={11} className="animate-spin" /> {t("润色中…", "Polishing…")}</>)
+                      : (<><Sparkles size={11} /> {t("AI 润色", "AI polish")}</>)}
                   </button>
-                </div>
-              ) : (
-                <span className="text-[11px] text-stone-500">{t("此浏览器不支持语音输入（推荐 Chrome / Edge）", "Voice input needs Chrome / Edge")}</span>
-              )}
+                ) : onOpenAISettings && (
+                  <button onClick={onOpenAISettings} className="text-[12px] text-purple-700 hover:underline shrink-0">
+                    {t("配置 AI（Gemini）以启用润色", "Set up AI (Gemini) to enable polish")}
+                  </button>
+                )}
+                {voiceSupported ? (
+                  <div className="flex items-center gap-1.5">
+                    <div className="flex rounded overflow-hidden border border-stone-300 text-[11px] shrink-0">
+                      <button
+                        onClick={() => setVoiceLang("zh-CN")} disabled={listening}
+                        title={t("识别语言：中文", "Recognition language: Chinese")}
+                        className={"px-1.5 py-0.5 " + (voiceLang === "zh-CN" ? "bg-stone-700 text-white" : "bg-white text-stone-700 hover:bg-stone-100")}
+                      >中文</button>
+                      <button
+                        onClick={() => setVoiceLang("en-US")} disabled={listening}
+                        title="Recognition language: English"
+                        className={"px-1.5 py-0.5 border-l border-stone-300 " + (voiceLang === "en-US" ? "bg-stone-700 text-white" : "bg-white text-stone-700 hover:bg-stone-100")}
+                      >EN</button>
+                    </div>
+                    <button
+                      onClick={toggleListening}
+                      title={listening ? t("停止语音输入", "Stop voice input") : t("开始语音输入，识别结果自动追加到请求中", "Start voice input — recognized text is appended to the request")}
+                      className={"text-[12px] px-2 py-0.5 rounded flex items-center gap-1 border shrink-0 " +
+                        (listening ? "border-red-400 text-red-700 bg-red-50 animate-pulse" : "border-stone-300 text-stone-700 hover:bg-stone-100")}
+                    >
+                      {listening ? <MicOff size={12} /> : <Mic size={12} />}
+                      {listening ? t("正在聆听…", "Listening…") : t("语音输入", "Voice")}
+                    </button>
+                  </div>
+                ) : (
+                  <span className="text-[11px] text-stone-500">{t("此浏览器不支持语音输入（推荐 Chrome / Edge）", "Voice input needs Chrome / Edge")}</span>
+                )}
+              </div>
             </div>
             <textarea
               value={request}
@@ -6176,6 +6587,31 @@ const FolderAskAIDialog = ({ open, node, tree, docIndex, onClose, onOpenDoc, onO
             />
             {voiceInterim && <div className="text-[12px] text-stone-500 italic mt-0.5 truncate">{voiceInterim}</div>}
             {voiceError && <div className="text-[12px] text-red-600 mt-0.5">{voiceError}</div>}
+            {polishReqError && <div className="text-[12px] text-red-600 mt-0.5">{polishReqError}</div>}
+            {polishReqResult && (
+              <div className="mt-1.5 border border-purple-200 bg-purple-50 rounded p-2 flex flex-col gap-1.5">
+                <div className="text-[12px] font-medium text-purple-800 flex items-center gap-1">
+                  <Sparkles size={12} /> {t("AI 润色结果", "AI polish result")}
+                </div>
+                <div className="text-[13px] text-stone-800 whitespace-pre-wrap bg-white border border-purple-200 rounded p-2">
+                  {polishReqResult}
+                </div>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <button
+                    onClick={acceptPolishRequest}
+                    className="text-[12px] px-2.5 py-1 bg-purple-600 text-white rounded hover:bg-purple-700"
+                  >
+                    {t("应用（替换上方文本）", "Apply (replace text above)")}
+                  </button>
+                  <button
+                    onClick={() => setPolishReqResult(null)}
+                    className="text-[12px] px-2.5 py-1 border border-stone-300 text-stone-700 rounded hover:bg-white"
+                  >
+                    {t("放弃", "Discard")}
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
 
           {err && <div className="text-[13px] text-red-600 whitespace-pre-wrap bg-red-50 border border-red-100 rounded px-2 py-1.5">{err}</div>}
@@ -8933,6 +9369,11 @@ const DocumentCard = ({
   // at this card's call site -- so it tracks "the document I'm focused on"
   // generally, not just active edits.
   isLastWorked = false, onMarkWorked,
+  // Near-duplicate "best copy" recommendation -- see the matching prop on
+  // DocumentGridTile above for where this comes from. Always shown small
+  // here regardless of the check dialog's size toggle: this card's icon
+  // slot is a fixed 40x40, with no room for the larger badge.
+  isRecommended = false,
 }) => {
   const { t, lang } = useLang();
   // Always start collapsed — even documents that already have parameters
@@ -9087,6 +9528,14 @@ const DocumentCard = ({
             </div>
           ) : (
             <Icon size={18} />
+          )}
+          {isRecommended && (
+            <div
+              className="absolute -top-1 -right-1 bg-emerald-600 text-white rounded-full w-4 h-4 flex items-center justify-center text-[10px] leading-none shadow-md ring-2 ring-white"
+              title={t("推荐保留（相似照片检测推荐的最佳版本）", "Recommended to keep (best version from the near-duplicate check)")}
+            >
+              ★
+            </div>
           )}
         </div>
         <div className="flex-1 min-w-0 cursor-pointer" onClick={onOpen}>
@@ -9487,6 +9936,94 @@ const DocumentCard = ({
           />
         </div>
       )}
+    </div>
+  );
+};
+
+// Grid/icon-view tile — Explorer-style thumbnail + name, shown instead of
+// DocumentCard's one-row-per-document layout when docViewMode === "grid".
+// Deliberately lighter than DocumentCard (no inline SN/due-date/description
+// editing): a click opens the full viewer, where all of that already lives —
+// this view is just a faster way to browse and spot the right file by eye.
+const DocumentGridTile = ({
+  doc, onOpen,
+  faceSelectMode = false, faceSelected = false, onToggleFaceSelect,
+  selectMode = false, selected = false, onToggleSelect,
+  scheduleMode = false, urgency = null,
+  isLastWorked = false, onMarkWorked,
+  // Near-duplicate "best copy" recommendation (see photos_near_duplicates'
+  // recommendedDocId, carried onto the containing folder node by the mark
+  // endpoint) -- shown as a ★ badge on the recommended document wherever a
+  // "疑似重复照片/组N" folder's contents are displayed, not just in the
+  // check dialog itself. badgeSize is the app-wide grid thumbnail size
+  // preference (gridThumbSize) -- this tile's own thumbnail size is set by
+  // its grid cell width (see the grid's gridTemplateColumns at the call
+  // site), which that same preference also controls.
+  isRecommended = false, badgeSize = "small",
+}) => {
+  const { t } = useLang();
+  const isImage = doc.mime?.startsWith("image/");
+  const _ext = (doc.name || "").split(".").pop().toLowerCase();
+  // HEIC/HEIF needs the server's converted preview to render in a browser
+  // <img> at all — same condition the document viewer uses.
+  const isHeic = doc.mime === "image/heic" || doc.mime === "image/heif" || _ext === "heic" || _ext === "heif";
+  const thumbUrl = isImage ? `${API_BASE}/api/docs/${doc.id}${isHeic ? "/preview" : ""}` : null;
+  const [thumbError, setThumbError] = useState(false);
+  const Icon = isImage ? ImageIcon : FileText;
+
+  const showCheckbox = faceSelectMode || selectMode;
+  const isChecked = faceSelectMode ? faceSelected : selected;
+  const toggleChecked = faceSelectMode ? onToggleFaceSelect : onToggleSelect;
+
+  const handleClick = () => {
+    if (showCheckbox) { toggleChecked && toggleChecked(); return; }
+    onMarkWorked && onMarkWorked();
+    onOpen && onOpen();
+  };
+
+  const cardUrgencyClass = scheduleMode && urgency ? URGENCY_ROW_CLASSES[urgency] : "";
+
+  return (
+    <div
+      onClick={handleClick}
+      title={doc.name}
+      className={`relative border rounded bg-white p-2 cursor-pointer flex flex-col items-center gap-1.5 ${
+        isLastWorked ? "border-indigo-400 bg-indigo-50/60 ring-1 ring-indigo-300" :
+        showCheckbox && isChecked ? "border-amber-400 bg-amber-50" :
+        cardUrgencyClass || "border-stone-200 hover:border-amber-300"
+      }`}
+    >
+      {showCheckbox && (
+        <div className="absolute top-1.5 left-1.5 z-10">
+          {isChecked
+            ? <CheckSquare size={16} className="text-amber-600 bg-white rounded" />
+            : <Square size={16} className="text-stone-500 bg-white/80 rounded" />}
+        </div>
+      )}
+      <div className="relative w-full aspect-square rounded bg-stone-100 flex items-center justify-center overflow-hidden">
+        {thumbUrl && !thumbError ? (
+          <img
+            src={thumbUrl}
+            alt={doc.name}
+            className="w-full h-full object-cover"
+            onError={() => setThumbError(true)}
+          />
+        ) : (
+          <Icon size={28} className="text-stone-400" />
+        )}
+        {isRecommended && (
+          <div
+            className={"absolute bg-emerald-600 text-white rounded-full flex items-center justify-center leading-none shadow-md ring-2 ring-white "
+              + (badgeSize === "large" ? "-top-1 -right-1 w-7 h-7 text-base" : "top-0.5 right-0.5 w-4 h-4 text-[10px]")}
+            title={t("推荐保留（相似照片检测推荐的最佳版本）", "Recommended to keep (best version from the near-duplicate check)")}
+          >
+            ★
+          </div>
+        )}
+      </div>
+      <div className="w-full text-[12px] text-stone-800 text-center leading-tight line-clamp-2 break-all">
+        {doc.name}
+      </div>
     </div>
   );
 };
@@ -12970,6 +13507,508 @@ const LinkPicker = ({
 };
 
 /* =============================================================================
+ * FOLDER/COMPONENT-LEVEL DESCRIPTION PANEL
+ * Same feature set as the document viewer's Description panel (voice
+ * dictation, AI organize/polish, AI Chinese-typo check, save-and-index,
+ * save-as-.txt-document) plus one folder-only extra: save/update the
+ * description as a standalone PDF filed into the folder.
+ * =============================================================================
+ */
+const NodeDescriptionPanel = ({ node, derivedDocs = [], onSaveDescription, onSaveTextAsDoc, onSaveDescPdf, onOpenAISettings }) => {
+  const { t } = useLang();
+
+  const [description, setDescription] = useState(node.description || "");
+  const [descSaved, setDescSaved] = useState(false);
+
+  // AI "organize & polish" (Gemini / DeepSeek, opt-in) -- same rubric as the
+  // document-level description panel.
+  const [aiSettings, setAiSettings] = useState({ configured: false, library_installed: true });
+  const [aiSettingsDS, setAiSettingsDS] = useState({ configured: false, library_installed: true });
+  const [polishStyle, setPolishStyle] = useState("organize");
+  const [polishing, setPolishing] = useState(false);
+  const [polishError, setPolishError] = useState("");
+  const [polishResult, setPolishResult] = useState(null);
+
+  // AI "check Chinese typos"
+  const [typoChecking, setTypoChecking] = useState(false);
+  const [typoError, setTypoError] = useState("");
+  const [typoIssues, setTypoIssues] = useState(null);
+
+  // Voice-to-text dictation (Web Speech API)
+  const [voiceLang, setVoiceLang] = useState("zh-CN");
+  const [listening, setListening] = useState(false);
+  const [voiceInterim, setVoiceInterim] = useState("");
+  const [voiceError, setVoiceError] = useState("");
+  const recognitionRef = useRef(null);
+  const SpeechRecognitionCtor = typeof window !== "undefined"
+    ? (window.SpeechRecognition || window.webkitSpeechRecognition)
+    : null;
+  const voiceSupported = !!SpeechRecognitionCtor;
+
+  // Upload-a-recording alternative to live mic dictation (.m4a/.mp3/.wav/...,
+  // transcribed server-side via Gemini) -- see runTranscribeAudioFile below.
+  const [transcribing, setTranscribing] = useState(false);
+  const [transcribeError, setTranscribeError] = useState("");
+  const audioFileInputRef = useRef(null);
+
+  // "Save as new document" (.txt) / "Save as PDF" state
+  const [savingNewDoc, setSavingNewDoc] = useState(false);
+  const [newDocMsg, setNewDocMsg] = useState(null);
+  const [savingPdf, setSavingPdf] = useState(false);
+  const [pdfMsg, setPdfMsg] = useState(null);
+
+  // Reset all per-node draft/result state when the selected folder changes.
+  useEffect(() => {
+    setDescription(node.description || "");
+    setDescSaved(false);
+    setPolishResult(null); setPolishError("");
+    setTypoIssues(null); setTypoError("");
+    setNewDocMsg(null); setPdfMsg(null);
+    setVoiceInterim(""); setVoiceError("");
+    setTranscribing(false); setTranscribeError("");
+    // Stop any dictation still running from the previously-selected folder
+    // (also covers unmount, since this panel is remounted with key=node.id).
+    return () => { try { recognitionRef.current && recognitionRef.current.stop(); } catch {} };
+  }, [node.id]);
+
+  useEffect(() => {
+    StorageAdapter.getAISettings("gemini").then(setAiSettings).catch(() => {});
+    StorageAdapter.getAISettings("deepseek").then(setAiSettingsDS).catch(() => {});
+  }, []);
+
+  const saveDescription = async () => {
+    if (!onSaveDescription) return;
+    await onSaveDescription(node.id, description);
+    setDescSaved(true);
+    setTimeout(() => setDescSaved(false), 1800);
+  };
+
+  const aiPolishReady = aiSettings.configured || aiSettingsDS.configured;
+  const polishProvider = aiSettings.configured ? "gemini" : "deepseek";
+
+  const runPolish = async () => {
+    const text = description.trim();
+    if (!text || polishing || !aiPolishReady) return;
+    setPolishing(true); setPolishError(""); setPolishResult(null);
+    try {
+      const r = await StorageAdapter.polishText(text, { provider: polishProvider, style: polishStyle });
+      setPolishResult({ text: (r.text || "").trim(), provider: r.provider });
+    } catch (e) {
+      setPolishError(e.message || String(e));
+    } finally {
+      setPolishing(false);
+    }
+  };
+  const acceptPolish = () => {
+    if (!polishResult) return;
+    setDescription(polishResult.text);
+    setDescSaved(false);
+    setPolishResult(null);
+  };
+
+  const runTypoCheck = async () => {
+    const text = description.trim();
+    if (!text || typoChecking || !aiPolishReady) return;
+    setTypoChecking(true); setTypoError(""); setTypoIssues(null);
+    try {
+      const r = await StorageAdapter.checkTyposCN(text, { provider: polishProvider });
+      setTypoIssues(Array.isArray(r.issues) ? r.issues : []);
+    } catch (e) {
+      setTypoError(e.message || String(e));
+    } finally {
+      setTypoChecking(false);
+    }
+  };
+  const applyTypoFix = (issue) => {
+    if (!issue || !description.includes(issue.original)) return;
+    setDescription((prev) => prev.replace(issue.original, issue.corrected));
+    setDescSaved(false);
+    setTypoIssues((prev) => (prev || []).filter((i) => i !== issue));
+  };
+  const applyAllTypoFixes = () => {
+    let next = description;
+    const applied = [];
+    for (const issue of typoIssues || []) {
+      if (next.includes(issue.original)) {
+        next = next.replace(issue.original, issue.corrected);
+        applied.push(issue);
+      }
+    }
+    if (applied.length) {
+      setDescription(next);
+      setDescSaved(false);
+      setTypoIssues((prev) => (prev || []).filter((i) => !applied.includes(i)));
+    }
+  };
+
+  // A .txt / PDF already saved from this panel for this folder, if any --
+  // once one exists we overwrite it in place instead of creating another.
+  const existingDerivedDoc = (feature) => (derivedDocs || []).find((e) => (e.sourceFeature || "") === feature) || null;
+
+  const saveAsNewDoc = async () => {
+    const text = description.trim();
+    if (!text || !onSaveTextAsDoc || savingNewDoc) return;
+    const existing = existingDerivedDoc("node_description");
+    let title = "";
+    if (!existing) {
+      const suggested = `${node.name || t("描述", "Description")} - ${t("描述", "Description")}`;
+      const answer = window.prompt(
+        t("新文档名称（保存为 .txt，存入同一文件夹）：", "New document name (saved as .txt in the same folder):"),
+        suggested
+      );
+      if (answer === null) return;
+      title = answer.trim();
+    }
+    setSavingNewDoc(true); setNewDocMsg(null);
+    try {
+      if (onSaveDescription) { try { await onSaveDescription(node.id, text); setDescSaved(true); } catch {} }
+      const res = await onSaveTextAsDoc(node.id, { text, title, reuse: !!existing });
+      setNewDocMsg({ name: res.name, updated: !!res.updated });
+      setTimeout(() => setNewDocMsg(null), 4000);
+    } catch (e) {
+      setNewDocMsg({ error: e.message || String(e) });
+    } finally {
+      setSavingNewDoc(false);
+    }
+  };
+
+  const saveAsPdf = async () => {
+    const text = description.trim();
+    if (!text || !onSaveDescPdf || savingPdf) return;
+    const existing = existingDerivedDoc("node_description_pdf");
+    setSavingPdf(true); setPdfMsg(null);
+    try {
+      if (onSaveDescription) { try { await onSaveDescription(node.id, text); setDescSaved(true); } catch {} }
+      const res = await onSaveDescPdf(node.id, { text, reuse: true });
+      setPdfMsg({ name: res.name, updated: !!res.updated || !!existing });
+      setTimeout(() => setPdfMsg(null), 4000);
+    } catch (e) {
+      setPdfMsg({ error: e.message || String(e) });
+    } finally {
+      setSavingPdf(false);
+    }
+  };
+
+  const stopListening = () => {
+    try { recognitionRef.current && recognitionRef.current.stop(); } catch {}
+  };
+  const startListening = (lang) => {
+    if (!SpeechRecognitionCtor) return;
+    stopListening();
+    const recognition = new SpeechRecognitionCtor();
+    recognition.lang = lang;
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.onresult = (event) => {
+      let finalChunk = "";
+      let interim = "";
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const result = event.results[i];
+        if (result.isFinal) finalChunk += result[0].transcript;
+        else interim += result[0].transcript;
+      }
+      if (finalChunk) {
+        setDescription((prev) => {
+          const needsSpace = prev && !/[\s\n]$/.test(prev);
+          return prev + (needsSpace ? " " : "") + finalChunk.trim();
+        });
+        setDescSaved(false);
+      }
+      setVoiceInterim(interim);
+    };
+    recognition.onerror = (event) => {
+      setVoiceError(
+        event.error === "not-allowed" ? t("麦克风权限被拒绝，请在浏览器设置中允许访问麦克风", "Microphone access denied — please allow microphone access in your browser settings")
+        : event.error === "no-speech" ? t("未检测到语音，请再试一次", "No speech detected, please try again")
+        : t(`语音识别出错：${event.error}`, `Speech recognition error: ${event.error}`)
+      );
+      setListening(false);
+      setVoiceInterim("");
+    };
+    recognition.onend = () => {
+      setListening(false);
+      setVoiceInterim("");
+    };
+    recognitionRef.current = recognition;
+    setVoiceError("");
+    setListening(true);
+    recognition.start();
+  };
+  const toggleListening = () => {
+    if (listening) stopListening();
+    else startListening(voiceLang);
+  };
+
+  // Upload-a-recording alternative to the mic: pick a file, send it to
+  // Gemini for transcription, append the result into the description the
+  // same way a finished chunk of live dictation does.
+  const runTranscribeAudioFile = async (file) => {
+    if (!file || transcribing) return;
+    setTranscribing(true); setTranscribeError("");
+    try {
+      const r = await StorageAdapter.transcribeAudio(file);
+      const text = (r.text || "").trim();
+      if (text) {
+        setDescription((prev) => {
+          const needsSpace = prev && !/[\s\n]$/.test(prev);
+          return prev + (needsSpace ? " " : "") + text;
+        });
+        setDescSaved(false);
+      }
+    } catch (e) {
+      setTranscribeError(e.message || String(e));
+    } finally {
+      setTranscribing(false);
+    }
+  };
+  const handleAudioFileChange = (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = "";   // allow picking the same file again next time
+    if (file) runTranscribeAudioFile(file);
+  };
+
+  const newDocButtonClass =
+    "text-sm px-2.5 py-1 border border-indigo-300 text-indigo-800 bg-indigo-50 hover:bg-indigo-100 rounded flex items-center gap-1 disabled:opacity-40";
+  const pdfButtonClass =
+    "text-sm px-2.5 py-1 border border-sky-300 text-sky-800 bg-sky-50 hover:bg-sky-100 rounded flex items-center gap-1 disabled:opacity-40";
+
+  return (
+    <section className="mb-5 border border-stone-200 rounded-lg overflow-hidden">
+      <div className="flex items-center justify-between px-3 py-2 border-b border-stone-200 bg-stone-50">
+        <div className="flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wider text-stone-700">
+          <Edit2 size={13} /> {t("描述", "Description")}
+        </div>
+        <span className="text-[12px] text-stone-600">
+          {node.description ? t("已索引", "Indexed") : t("未保存", "Not saved")}
+        </span>
+      </div>
+
+      <div className="px-3 py-1.5 border-b border-stone-200 flex items-center gap-2 flex-wrap">
+        {voiceSupported ? (
+          <>
+            <div className="flex rounded overflow-hidden border border-stone-300 text-[12px] shrink-0">
+              <button
+                onClick={() => setVoiceLang("zh-CN")}
+                disabled={listening}
+                title={t("识别语言：中文", "Recognition language: Chinese")}
+                className={"px-1.5 py-0.5 " + (voiceLang === "zh-CN" ? "bg-stone-700 text-white" : "bg-white text-stone-700 hover:bg-stone-100")}
+              >
+                中文
+              </button>
+              <button
+                onClick={() => setVoiceLang("en-US")}
+                disabled={listening}
+                title="Recognition language: English"
+                className={"px-1.5 py-0.5 border-l border-stone-300 " + (voiceLang === "en-US" ? "bg-stone-700 text-white" : "bg-white text-stone-700 hover:bg-stone-100")}
+              >
+                EN
+              </button>
+            </div>
+            <button
+              onClick={toggleListening}
+              title={listening ? t("停止语音输入", "Stop voice input") : t("开始语音输入，识别结果会自动追加到描述中", "Start voice input — recognized text will be appended to the description automatically")}
+              className={"text-sm px-2 py-1 rounded flex items-center gap-1 border shrink-0 " +
+                (listening ? "border-red-400 text-red-700 bg-red-50 animate-pulse" : "border-stone-300 text-stone-700 hover:bg-stone-100")}
+            >
+              {listening ? <MicOff size={12} /> : <Mic size={12} />}
+              {listening ? t("正在聆听…", "Listening…") : t("语音输入", "Voice input")}
+            </button>
+            {voiceInterim && <span className="text-[12px] text-stone-600 italic truncate min-w-0">{voiceInterim}</span>}
+          </>
+        ) : (
+          <span className="text-[12px] text-stone-600">{t("当前浏览器不支持语音输入（推荐使用 Chrome / Edge）", "This browser doesn't support voice input (Chrome / Edge recommended)")}</span>
+        )}
+        <input
+          ref={audioFileInputRef}
+          type="file"
+          accept="audio/*,.m4a,.caf,.aac,.amr,.3gp"
+          className="hidden"
+          onChange={handleAudioFileChange}
+        />
+        {aiSettings.configured ? (
+          <button
+            onClick={() => audioFileInputRef.current && audioFileInputRef.current.click()}
+            disabled={transcribing}
+            title={t("上传一段录音文件（如 .m4a），由 AI 转写为文字并追加到描述中", "Upload a recording file (e.g. .m4a) — AI transcribes it to text and appends it to the description")}
+            className="text-sm px-2 py-1 rounded flex items-center gap-1 border border-stone-300 text-stone-700 hover:bg-stone-100 shrink-0 disabled:opacity-50"
+          >
+            {transcribing ? <Loader size={12} className="animate-spin" /> : <Upload size={12} />}
+            {transcribing ? t("转写中…", "Transcribing…") : t("上传录音转文字", "Upload recording")}
+          </button>
+        ) : onOpenAISettings && (
+          <button onClick={onOpenAISettings} className="text-[12px] text-purple-700 hover:underline shrink-0">
+            {t("配置 AI 以支持录音转文字（Gemini）", "Set up AI to transcribe recordings (Gemini)")}
+          </button>
+        )}
+      </div>
+      {voiceError && <div className="px-3 py-1 text-[12px] text-red-600 bg-red-50 border-b border-red-100">{voiceError}</div>}
+      {transcribeError && <div className="px-3 py-1 text-[12px] text-red-600 bg-red-50 border-b border-red-100">{transcribeError}</div>}
+
+      <div className="px-3 py-1.5 border-b border-stone-200 bg-purple-50/50 flex items-center gap-2 flex-wrap">
+        <span className="text-[12px] text-purple-800 flex items-center gap-1 shrink-0">
+          <Sparkles size={12} className="text-purple-600" /> {t("AI 整理", "AI cleanup")}
+        </span>
+        <select
+          value={polishStyle}
+          onChange={(e) => setPolishStyle(e.target.value)}
+          title={t("选择整理方式", "Choose how the AI should rework the notes")}
+          className="text-[12px] border border-stone-300 rounded px-1 py-0.5 bg-white text-stone-700"
+        >
+          <option value="organize">{t("整理结构", "Organize")}</option>
+          <option value="polish">{t("润色文字", "Polish wording")}</option>
+          <option value="concise">{t("精简概括", "Make concise")}</option>
+        </select>
+        {aiPolishReady ? (
+          <button
+            onClick={runPolish}
+            disabled={polishing || !description.trim()}
+            title={t("用 AI 整理并润色上面的描述，结果需确认后才会替换原文", "Use AI to organize and polish the description above — you confirm before it replaces your text")}
+            className="text-[12px] px-2 py-1 border border-purple-300 text-purple-800 bg-white hover:bg-purple-50 rounded flex items-center gap-1 disabled:opacity-40"
+          >
+            {polishing ? (<><Loader size={11} className="animate-spin" /> {t("整理中…", "Working…")}</>) : (<><Sparkles size={11} /> {t("用 AI 整理润色", "Organize & polish")}</>)}
+          </button>
+        ) : onOpenAISettings && (
+          <button onClick={onOpenAISettings} className="text-[12px] text-purple-700 hover:underline">
+            {t("配置 AI（Gemini）", "Set up AI (Gemini)")}
+          </button>
+        )}
+        {aiPolishReady && (
+          <button
+            onClick={runTypoCheck}
+            disabled={typoChecking || !description.trim()}
+            title={t("用 AI 检查上面的描述有没有错别字、标点或成语误用", "Use AI to check the description above for typos, punctuation and idiom misuse")}
+            className="text-[12px] px-2 py-1 border border-purple-300 text-purple-800 bg-white hover:bg-purple-50 rounded flex items-center gap-1 disabled:opacity-40"
+          >
+            {typoChecking ? (<><Loader size={11} className="animate-spin" /> {t("检查中…", "Checking…")}</>) : (<><ListChecks size={11} /> {t("检查错别字", "Check typos")}</>)}
+          </button>
+        )}
+        {aiPolishReady && <span className="text-[11px] text-stone-500 shrink-0">{polishProvider === "deepseek" ? "DeepSeek" : "Gemini"}</span>}
+      </div>
+      {polishError && <div className="px-3 py-1 text-[12px] text-red-600 bg-red-50 border-b border-red-100">{polishError}</div>}
+      {typoError && <div className="px-3 py-1 text-[12px] text-red-600 bg-red-50 border-b border-red-100">{typoError}</div>}
+
+      <div className="p-3">
+        <textarea
+          value={description}
+          onChange={(e) => { setDescription(e.target.value); setDescSaved(false); }}
+          placeholder={t("为该文件夹/组件添加描述，保存后可在搜索中找到…", "Add a description for this folder/component — once saved it's searchable…")}
+          spellCheck={false}
+          rows={4}
+          className="w-full resize-y text-sm leading-relaxed text-stone-800 outline-none border border-stone-200 rounded p-2"
+        />
+      </div>
+
+      {polishResult && (
+        <div className="border-t border-purple-200 bg-purple-50 px-3 py-2 flex flex-col gap-1.5 max-h-[45%] overflow-auto">
+          <div className="text-[12px] font-medium text-purple-800 flex items-center gap-1"><Sparkles size={12} /> {t("AI 整理结果", "AI result")}</div>
+          <div className="text-[13px] text-stone-800 whitespace-pre-wrap bg-white border border-purple-200 rounded p-2">{polishResult.text}</div>
+          <div className="flex items-center gap-2 flex-wrap">
+            <button onClick={acceptPolish} className="text-[12px] px-2.5 py-1 bg-purple-600 text-white rounded hover:bg-purple-700">
+              {t("应用（替换上方文本）", "Apply (replace text above)")}
+            </button>
+            <button onClick={() => setPolishResult(null)} className="text-[12px] px-2.5 py-1 border border-stone-300 text-stone-700 rounded hover:bg-white">
+              {t("放弃", "Discard")}
+            </button>
+            <span className="text-[11px] text-stone-500 ml-auto">{t("原文保留，应用后仍需点“保存”", "Your original is kept — remember to Save after applying")}</span>
+          </div>
+        </div>
+      )}
+
+      {typoIssues && (
+        <div className="border-t border-purple-200 bg-purple-50 px-3 py-2 flex flex-col gap-1.5 max-h-[45%] overflow-auto">
+          <div className="text-[12px] font-medium text-purple-800 flex items-center gap-1"><ListChecks size={12} /> {t("错别字检查结果", "Typo check result")}</div>
+          {typoIssues.length === 0 ? (
+            <div className="text-[13px] text-stone-700">{t("未发现问题 ✅", "No issues found ✅")}</div>
+          ) : (
+            <>
+              {typoIssues.map((issue, i) => (
+                <div key={i} className="text-[13px] bg-white border border-purple-200 rounded p-2 flex flex-col gap-1">
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-[11px] px-1.5 py-0.5 rounded bg-purple-100 text-purple-800 shrink-0">{issue.type || t("问题", "Issue")}</span>
+                    <span className="text-stone-800 line-through decoration-red-400">{issue.original}</span>
+                    <span className="text-stone-400">→</span>
+                    <span className="text-emerald-700 font-medium">{issue.corrected}</span>
+                  </div>
+                  {issue.note && <div className="text-[12px] text-stone-500">{issue.note}</div>}
+                  <button
+                    onClick={() => applyTypoFix(issue)}
+                    disabled={!description.includes(issue.original)}
+                    className="self-start text-[11px] px-2 py-0.5 bg-purple-600 text-white rounded hover:bg-purple-700 disabled:opacity-40"
+                  >
+                    {t("应用此项", "Apply this")}
+                  </button>
+                </div>
+              ))}
+              <div className="flex items-center gap-2 flex-wrap">
+                <button onClick={applyAllTypoFixes} className="text-[12px] px-2.5 py-1 bg-purple-600 text-white rounded hover:bg-purple-700">{t("全部应用", "Apply all")}</button>
+                <button onClick={() => setTypoIssues(null)} className="text-[12px] px-2.5 py-1 border border-stone-300 text-stone-700 rounded hover:bg-white">{t("关闭", "Close")}</button>
+                <span className="text-[11px] text-stone-500 ml-auto">{t("原文保留，应用后仍需点“保存”", "Your original is kept — remember to Save after applying")}</span>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      <div className="px-3 py-2 border-t border-stone-200 bg-stone-50 flex flex-col gap-1.5">
+        <div className="flex items-center gap-2 flex-wrap">
+          {onSaveDescription && (
+            <button
+              onClick={saveDescription}
+              title={t("把描述存入索引，使其可被搜索", "Save the description into the index so it's searchable")}
+              className="text-sm px-2.5 py-1 border border-emerald-300 text-emerald-800 bg-emerald-50 hover:bg-emerald-100 rounded flex items-center gap-1"
+            >
+              <Save size={12} /> {descSaved ? t("已保存", "Saved") : t("保存并可搜索", "Save and make searchable")}
+            </button>
+          )}
+          {onSaveTextAsDoc && (
+            <button
+              onClick={saveAsNewDoc}
+              disabled={savingNewDoc || !description.trim()}
+              title={existingDerivedDoc("node_description")
+                ? t("覆盖同一文件夹中已保存的描述 .txt 文档（不新建）", "Overwrite the description .txt already saved in this folder (no new file)")
+                : t("把这段描述另存为同一文件夹中的一份新的 .txt 文档", "Save this description as a new .txt document in the same folder")}
+              className={newDocButtonClass}
+            >
+              {savingNewDoc
+                ? (<><Loader size={12} className="animate-spin" /> {t("保存中…", "Saving…")}</>)
+                : existingDerivedDoc("node_description")
+                  ? (<><Save size={12} /> {t("更新描述文档", "Update description file")}</>)
+                  : (<><FilePlus size={12} /> {t("另存为新文档", "Save as new document")}</>)}
+            </button>
+          )}
+          {onSaveDescPdf && (
+            <button
+              onClick={saveAsPdf}
+              disabled={savingPdf || !description.trim()}
+              title={existingDerivedDoc("node_description_pdf")
+                ? t("重新生成并覆盖同一文件夹中已保存的描述 PDF", "Regenerate and overwrite the description PDF already saved in this folder")
+                : t("把这段描述保存为同一文件夹中的一份 PDF 文档", "Save this description as a PDF document in the same folder")}
+              className={pdfButtonClass}
+            >
+              {savingPdf
+                ? (<><Loader size={12} className="animate-spin" /> {t("生成中…", "Generating…")}</>)
+                : existingDerivedDoc("node_description_pdf")
+                  ? (<><Download size={12} /> {t("更新 PDF", "Update PDF")}</>)
+                  : (<><Download size={12} /> {t("保存为 PDF", "Save as PDF")}</>)}
+            </button>
+          )}
+        </div>
+        {newDocMsg && (
+          <div className={"text-[12px] " + (newDocMsg.error ? "text-red-600" : "text-green-700")}>
+            {newDocMsg.error ? newDocMsg.error : <>{newDocMsg.updated ? t("已更新：", "Updated: ") : t("已创建：", "Created: ")}<span className="font-mono">{newDocMsg.name}</span></>}
+          </div>
+        )}
+        {pdfMsg && (
+          <div className={"text-[12px] " + (pdfMsg.error ? "text-red-600" : "text-green-700")}>
+            {pdfMsg.error ? pdfMsg.error : <>{pdfMsg.updated ? t("PDF 已更新：", "PDF updated: ") : t("PDF 已创建：", "PDF created: ")}<span className="font-mono">{pdfMsg.name}</span></>}
+          </div>
+        )}
+      </div>
+    </section>
+  );
+};
+
+/* =============================================================================
  * MAIN APP
  * =============================================================================
  */
@@ -13203,6 +14242,20 @@ function DMS({ storagePath, onChangeFolder }) {
     try { localStorage.setItem("dms:doc-sort-by", docSortBy); } catch {}
   }, [docSortBy]);
 
+  // "list" (current one-per-row layout) or "grid" (Explorer-style icon/
+  // thumbnail grid). A display preference, so persisted the same way as
+  // docSortBy above rather than reset per folder.
+  const [docViewMode, setDocViewMode] = useState(() => {
+    try {
+      const saved = localStorage.getItem("dms:doc-view-mode");
+      if (saved === "list" || saved === "grid") return saved;
+    } catch {}
+    return "list";
+  });
+  useEffect(() => {
+    try { localStorage.setItem("dms:doc-view-mode", docViewMode); } catch {}
+  }, [docViewMode]);
+
   // Bulk-download state — lets the user multi-select documents in a normal
   // folder and copy them to a folder on disk (defaults to the OS Downloads
   // folder). Mirrors the recycle-bin select-mode above but drives the
@@ -13215,6 +14268,13 @@ function DMS({ storagePath, onChangeFolder }) {
     setDownloadSelectMode(false);
     setDownloadSelectedIds(new Set());
   }, [selectedId]);
+
+  // Batch-rename state -- folder-level "rename every file on disk to
+  // YYYYMMDD + location + old name" (see openBatchRenameDialog / runBatchRename
+  // below). { items: [{id, oldName, newName}], skipped: [{id, oldName}] } | null
+  const [batchRenamePreview, setBatchRenamePreview] = useState(null);
+  const [batchRenaming, setBatchRenaming] = useState(false);
+  const [batchRenameError, setBatchRenameError] = useState("");
 
   // AI batch-fill state — lets the user multi-select documents in a normal
   // folder, pick one parameter, and have Gemini read that field's value
@@ -13304,6 +14364,149 @@ function DMS({ storagePath, onChangeFolder }) {
     setAiFillSelectMode(false);
     setAiFillSelectedIds(new Set());
   };
+
+  // Near-duplicate photo check -- lets the user multi-select a handful of
+  // photos in a normal folder and find ones that are near-identical to each
+  // other (recompressed, tiny crop, brightness tweak, burst shots), grouped
+  // by a similarity threshold the user sets each time (not a fixed constant
+  // -- see dupeThreshold below). Mirrors downloadSelectMode's select-UI.
+  // Purely a look-and-decide check: nothing is written until "标记以便审查"
+  // links the confirmed groups into a review folder (see markDupeGroups).
+  const [dupeSelectMode, setDupeSelectMode] = useState(false);
+  const [dupeSelectedIds, setDupeSelectedIds] = useState(new Set());
+  const [dupeThreshold, setDupeThreshold] = useState(75); // percent, 50-100
+  // "small" or "large" size for every photo thumbnail shown as a grid tile
+  // -- both in normal folder browsing (docViewMode "grid", see the toggle
+  // next to the list/grid view buttons) and in the near-duplicate results
+  // dialog's groups, plus the ★ recommended-pick badge sitting on a
+  // thumbnail in either place. One shared display preference, persisted
+  // like docViewMode above rather than reset per session -- defaults to
+  // "small" so it doesn't change the size of every existing grid view the
+  // first time this ships; "large" is an opt-in upgrade.
+  const [gridThumbSize, setGridThumbSize] = useState(() => {
+    try {
+      const saved = localStorage.getItem("dms:grid-thumb-size");
+      if (saved === "small" || saved === "large") return saved;
+    } catch {}
+    return "small";
+  });
+  useEffect(() => {
+    try { localStorage.setItem("dms:grid-thumb-size", gridThumbSize); } catch {}
+  }, [gridThumbSize]);
+  // { checking, result: { groups, scanned, skipped } | null, error, marking, marked } | null
+  const [dupeDialog, setDupeDialog] = useState(null);
+  useEffect(() => {
+    setDupeSelectMode(false);
+    setDupeSelectedIds(new Set());
+  }, [selectedId]);
+
+  const runDupeCheck = async () => {
+    const docIds = Array.from(dupeSelectedIds);
+    if (docIds.length < 2) return;
+    setDupeDialog({ checking: true, result: null, error: "", marking: false, marked: null });
+    try {
+      const result = await StorageAdapter.findNearDuplicates(docIds, dupeThreshold / 100);
+      setDupeDialog({ checking: false, result, error: "", marking: false, marked: null });
+    } catch (e) {
+      setDupeDialog({ checking: false, result: null, error: e.message || String(e), marking: false, marked: null });
+    }
+  };
+
+  const markDupeGroups = async () => {
+    if (!dupeDialog?.result?.groups?.length) return;
+    setDupeDialog((d) => (d ? { ...d, marking: true } : d));
+    try {
+      const marked = await StorageAdapter.markNearDuplicates(dupeDialog.result.groups, lang);
+      // The mark endpoint creates the "疑似重复照片/组N" folder(s) server-
+      // side (and stamps the recommended doc's id onto each) -- refetch so
+      // they (and that recommendation) show up in the tree right away
+      // instead of only after the next reload.
+      const { tree: freshTree } = await StorageAdapter.getTree();
+      if (freshTree) setTree(freshTree);
+      setDupeDialog((d) => (d ? { ...d, marking: false, marked } : d));
+      setDupeSelectMode(false);
+      setDupeSelectedIds(new Set());
+    } catch (e) {
+      setDupeDialog((d) => (d ? { ...d, marking: false, error: e.message || String(e) } : d));
+    }
+  };
+
+  // Near-duplicate results dialog: draggable (header) + resizable (edges/
+  // corner) window, same geometry pattern as FolderAskAIDialog/
+  // FloatingDocPreview elsewhere in this file. State lives here rather than
+  // in a dedicated dialog component (dupeDialog itself is plain DMS state,
+  // like downloadDialog/aiFillDialog above) -- but since DMS never unmounts
+  // during a session either, position/size still persist across close/
+  // reopen, same "stays where you left it" feel as those other windows.
+  const DUPE_DIALOG_MIN_W = 420;
+  const DUPE_DIALOG_MIN_H = 320;
+  const [dupePos, setDupePos] = useState({ x: null, y: null }); // null = centered default
+  const [dupeSize, setDupeSize] = useState(() => ({
+    w: typeof window !== "undefined" ? Math.min(576, window.innerWidth - 48) : 576,
+    h: typeof window !== "undefined" ? Math.min(640, window.innerHeight - 48) : 640,
+  }));
+  const [dupeInteracting, setDupeInteracting] = useState(null); // null | "move" | "x" | "y" | "xy"
+  const dupeDragRef = useRef(null);
+
+  const dupeRawPos = dupePos.x != null ? dupePos : {
+    x: (window.innerWidth - dupeSize.w) / 2,
+    y: (window.innerHeight - dupeSize.h) / 2,
+  };
+  const dupeCurPos = {
+    x: Math.min(Math.max(dupeRawPos.x, -(dupeSize.w - 120)), window.innerWidth - 120),
+    y: Math.min(Math.max(dupeRawPos.y, 0), Math.max(0, window.innerHeight - 60)),
+  };
+
+  const onDupeDragStart = (e) => {
+    e.preventDefault();
+    const start = dupeCurPos;
+    dupeDragRef.current = { startX: e.clientX, startY: e.clientY, origX: start.x, origY: start.y };
+    setDupeInteracting("move");
+    const onMove = (ev) => {
+      const d = dupeDragRef.current;
+      if (!d) return;
+      setDupePos({ x: d.origX + (ev.clientX - d.startX), y: d.origY + (ev.clientY - d.startY) });
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      dupeDragRef.current = null;
+      setDupeInteracting(null);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
+  const onDupeResizeStart = (axis) => (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dupeDragRef.current = { startX: e.clientX, startY: e.clientY, origW: dupeSize.w, origH: dupeSize.h };
+    setDupeInteracting(axis);
+    const onMove = (ev) => {
+      const d = dupeDragRef.current;
+      if (!d) return;
+      const dx = ev.clientX - d.startX;
+      const dy = ev.clientY - d.startY;
+      setDupeSize((prev) => ({
+        w: axis !== "y" ? Math.max(DUPE_DIALOG_MIN_W, d.origW + dx) : prev.w,
+        h: axis !== "x" ? Math.max(DUPE_DIALOG_MIN_H, d.origH + dy) : prev.h,
+      }));
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      dupeDragRef.current = null;
+      setDupeInteracting(null);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
+  const dupeInteractCursor = dupeInteracting === "x" ? "ew-resize"
+    : dupeInteracting === "y" ? "ns-resize"
+    : dupeInteracting === "xy" ? "nwse-resize"
+    : dupeInteracting === "move" ? "grabbing"
+    : "default";
 
   // Which document card shows the "working document" highlight — set
   // whenever an inline editor (rename/SN/due/doc-date/metadata) is opened
@@ -14056,11 +15259,20 @@ function DMS({ storagePath, onChangeFolder }) {
       const _photoExts = new Set(["jpg","jpeg","png","heic","heif","tif","tiff","webp","gif","bmp"]);
       const _isPhoto = file.type.startsWith("image/") ||
         _photoExts.has(file.name.split(".").pop().toLowerCase());
-      const photoDate = _isPhoto ? await readPhotoDate(file) : null;
-      if (photoDate) console.log(`[DMS] Photo date: ${photoDate.year}/${photoDate.month} lat=${photoDate.lat} lon=${photoDate.lon} for ${file.name}`);
+      // Videos have no EXIF "date taken" -- readVideoDate() reads the mvhd
+      // creation_time embedded in MP4/MOV-family containers instead, falling
+      // back to file.lastModified for anything else. The field names below
+      // stay "photo*" for continuity with the server API, even though they
+      // now also carry a video's date.
+      const _videoExts = new Set(["mp4","mov","m4v","avi","mkv","webm","wmv","3gp","3g2","mpg","mpeg","flv"]);
+      const _isVideo = file.type.startsWith("video/") ||
+        _videoExts.has(file.name.split(".").pop().toLowerCase());
+      const photoDate = _isPhoto ? await readPhotoDate(file) : _isVideo ? await readVideoDate(file) : null;
+      if (photoDate) console.log(`[DMS] ${_isVideo ? "Video" : "Photo"} date: ${photoDate.year}/${photoDate.month} lat=${photoDate.lat} lon=${photoDate.lon} for ${file.name}`);
 
-      // For photos, create year/month subfolders under the designated photo root
-      // (or the upload target folder if no root is set), unless uploading to current folder.
+      // For photos and videos, create year/month subfolders under the designated
+      // photo root (or the upload target folder if no root is set), unless
+      // uploading to current folder.
       let finalNodeId = effectiveNodeId;
       let photoBaseNodeId = null;
       if (photoDate && routeMode !== "current-folder") {
@@ -14696,6 +15908,31 @@ function DMS({ storagePath, onChangeFolder }) {
     return [updated, newId];
   };
 
+  // A "疑似重复照片/组N" (or "Suspected duplicates/Group N") folder is a
+  // review-only view -- every document in it is ALSO linked at its original
+  // location (see photos_near_duplicates/mark on the server, which links
+  // rather than moves). The normal "unlink here, keep the file since it's
+  // linked elsewhere" rule would make deleting from this specific folder
+  // look like nothing happened: the photo you just reviewed as a duplicate
+  // would only vanish from this one list, still sitting right where it was.
+  // So a delete issued directly inside one of these group folders removes
+  // the document's links everywhere (moving it to "Deleted files"), not
+  // just this one view -- unlike every other folder in the app.
+  const DUPE_REVIEW_PARENT_NAMES = new Set(["疑似重复照片", "Suspected duplicates"]);
+  const isDupeReviewGroupFolder = (nodeId) => {
+    const parent = findParentNode(tree, nodeId);
+    return !!parent && DUPE_REVIEW_PARENT_NAMES.has(parent.name);
+  };
+
+  // Remove a set of documents' references from every node in the tree --
+  // used when isDupeReviewGroupFolder forces a full delete rather than a
+  // single unlink. Doesn't touch the files themselves, just the links.
+  const stripDocsFromAllNodes = (root, idSet) => ({
+    ...root,
+    documents: (root.documents || []).filter((d) => !idSet.has(d.id)),
+    children: (root.children || []).map((c) => stripDocsFromAllNodes(c, idSet)),
+  });
+
   const unlinkDocFromNode = async (docId, nodeId) => {
     // If deleting from "Not Show in Tree", permanently delete from disk.
     const notShowNode = (tree.children || []).find(c => c.name === NOT_SHOW_FOLDER);
@@ -14709,10 +15946,18 @@ function DMS({ storagePath, onChangeFolder }) {
       return;
     }
 
+    const forceFullDelete = isDupeReviewGroupFolder(nodeId);
     const refs = refMap.get(docId) || [];
     const otherRefs = refs.filter((id) => id !== nodeId);
+    const isLastRef = otherRefs.length === 0 || forceFullDelete;
+
     let confirmMsg;
-    if (otherRefs.length === 0) {
+    if (forceFullDelete && otherRefs.length > 0) {
+      confirmMsg = t(
+        `确定删除此文档？\n\n这是"疑似重复照片"审查文件夹 — 删除会移除该文档的所有链接（包括原文件夹），并将其移至根目录下的"${NOT_SHOW_FOLDER}"文件夹，文件保留在磁盘上。`,
+        `Delete this document?\n\nThis is a "Suspected duplicates" review folder — deleting here removes every link to this document (including its original folder) and moves it to the "${NOT_SHOW_FOLDER}" folder at the root; the file stays on disk.`
+      );
+    } else if (isLastRef) {
       confirmMsg = t(
         `确定从此文件夹移除此文档？\n\n文档将被移至根目录下的"${NOT_SHOW_FOLDER}"文件夹，文件保留在磁盘上。`,
         `Remove this document from this folder?\n\nThe document will be moved to the "${NOT_SHOW_FOLDER}" folder at the root; the file stays on disk.`
@@ -14725,15 +15970,19 @@ function DMS({ storagePath, onChangeFolder }) {
     }
     if (!confirm(confirmMsg)) return;
 
-    // Remove from current node.
-    let workingTree = updateNodeInTree(tree, nodeId, (n) => ({
-      ...n,
-      documents: (n.documents || []).filter((d) => d.id !== docId),
-    }));
+    // Remove from current node -- or, in a dupe-review group folder, from
+    // every node that links it, since a delete there is meant to act as a
+    // real delete, not just "unlink this one view".
+    let workingTree = forceFullDelete
+      ? stripDocsFromAllNodes(tree, new Set([docId]))
+      : updateNodeInTree(tree, nodeId, (n) => ({
+          ...n,
+          documents: (n.documents || []).filter((d) => d.id !== docId),
+        }));
 
     let updatedIndex = docIndex;
-    if (otherRefs.length === 0) {
-      // Last reference — move to "Not Show in Tree" instead of leaving orphaned.
+    if (isLastRef) {
+      // Last reference (or forced) — move to "Not Show in Tree" instead of leaving orphaned.
       let notShowId;
       [workingTree, notShowId] = getOrCreateNotShowNode(workingTree);
       workingTree = updateNodeInTree(workingTree, notShowId, (n) => ({
@@ -14765,12 +16014,31 @@ function DMS({ storagePath, onChangeFolder }) {
     const ids = Array.from(new Set(docIds));
     if (!ids.length) return;
     const idSet = new Set(ids);
+    const forceFullDelete = isDupeReviewGroupFolder(nodeId);
 
-    const lastRefIds = ids.filter((id) => (refMap.get(id) || []).filter((n) => n !== nodeId).length === 0);
+    // The *real* elsewhere-linked count, straight off refMap -- used only to
+    // decide which confirm message to show. Computed before forcing below,
+    // since once forced every id counts as a "last ref" by definition and
+    // this would otherwise always read 0, silently skipping the warning
+    // that other links are about to be removed too.
+    const actualLinkedElsewhereCount = ids.filter(
+      (id) => (refMap.get(id) || []).filter((n) => n !== nodeId).length > 0
+    ).length;
+
+    // In a dupe-review group folder, every selected doc is treated as its
+    // last reference regardless of refMap -- see isDupeReviewGroupFolder.
+    const lastRefIds = forceFullDelete
+      ? ids
+      : ids.filter((id) => (refMap.get(id) || []).filter((n) => n !== nodeId).length === 0);
     const linkedElsewhereCount = ids.length - lastRefIds.length;
 
     let confirmMsg;
-    if (linkedElsewhereCount === 0) {
+    if (forceFullDelete && actualLinkedElsewhereCount > 0) {
+      confirmMsg = t(
+        `确定删除选中的 ${ids.length} 份文档？\n\n这是"疑似重复照片"审查文件夹 — 删除会移除这些文档的所有链接（包括原文件夹），并将其移至根目录下的"${NOT_SHOW_FOLDER}"文件夹，文件保留在磁盘上。`,
+        `Delete the selected ${ids.length} document(s)?\n\nThis is a "Suspected duplicates" review folder — deleting here removes every link to these documents (including their original folders) and moves them to the "${NOT_SHOW_FOLDER}" folder at the root; the files stay on disk.`
+      );
+    } else if (linkedElsewhereCount === 0) {
       confirmMsg = t(
         `确定从此文件夹移除选中的 ${ids.length} 份文档？\n\n文档将被移至根目录下的"${NOT_SHOW_FOLDER}"文件夹，文件保留在磁盘上。`,
         `Remove the selected ${ids.length} document(s) from this folder?\n\nThey'll be moved to the "${NOT_SHOW_FOLDER}" folder at the root; the files stay on disk.`
@@ -14788,10 +16056,14 @@ function DMS({ storagePath, onChangeFolder }) {
     }
     if (!confirm(confirmMsg)) return;
 
-    let workingTree = updateNodeInTree(tree, nodeId, (n) => ({
-      ...n,
-      documents: (n.documents || []).filter((d) => !idSet.has(d.id)),
-    }));
+    // Remove from current node -- or, in a dupe-review group folder, from
+    // every node that links each doc (see unlinkDocFromNode's forceFullDelete).
+    let workingTree = forceFullDelete
+      ? stripDocsFromAllNodes(tree, idSet)
+      : updateNodeInTree(tree, nodeId, (n) => ({
+          ...n,
+          documents: (n.documents || []).filter((d) => !idSet.has(d.id)),
+        }));
 
     let updatedIndex = docIndex;
     if (lastRefIds.length > 0) {
@@ -15000,6 +16272,68 @@ function DMS({ storagePath, onChangeFolder }) {
     await persistIndex(newIndex);
   };
 
+  // Strip characters that are illegal in a filename on Windows/macOS/Linux —
+  // the batch-rename below builds a name from free-text location data, and
+  // that name lands on the actual file on disk, so it has to be safe there.
+  const sanitizeForFilename = (s) => (s || "").replace(/[\\/:*?"<>|]/g, "").trim();
+
+  // Build one document's batch-rename target: YYYYMMDD + the first 10
+  // characters of its location + "-" + its current name. Date comes from
+  // the same resolution the trend plot uses (its own docDate, else the
+  // YYYY-MM folder it's filed under), falling back to the upload date when
+  // neither applies. Returns null if no date can be resolved at all (the
+  // file is left untouched). The location segment is simply omitted when
+  // the document has none.
+  const computeBatchRenameTarget = (doc) => {
+    const dateStr = resolveDocTime(doc, tree) || (doc.uploadedAt ? doc.uploadedAt.slice(0, 10) : null);
+    if (!dateStr || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return null;
+    const yyyymmdd = dateStr.replace(/-/g, "");
+    const locObj = doc.metadata?.Location;
+    const addr = locObj && typeof locObj === "object" ? (locObj.actual || locObj.design || "") : (typeof locObj === "string" ? locObj : "");
+    const locPart = sanitizeForFilename(addr).slice(0, 10);
+    return `${yyyymmdd}${locPart}-${doc.name}`;
+  };
+
+  // Folder-level "batch rename" — computes the YYYYMMDD+location+oldname
+  // target for every document currently shown in this folder and opens the
+  // preview dialog for confirmation before anything on disk changes.
+  const openBatchRenameDialog = () => {
+    const items = [];
+    const skipped = [];
+    for (const doc of visibleDocs) {
+      const newName = computeBatchRenameTarget(doc);
+      if (!newName || newName === doc.name) {
+        if (!newName) skipped.push({ id: doc.id, oldName: doc.name });
+        continue;
+      }
+      items.push({ id: doc.id, oldName: doc.name, newName });
+    }
+    setBatchRenameError("");
+    setBatchRenamePreview({ items, skipped });
+  };
+
+  // Applies the previewed renames: the physical file first (same
+  // rename-file endpoint the single-document rename uses), then one
+  // combined docIndex save for the whole batch.
+  const runBatchRename = async () => {
+    if (!batchRenamePreview || batchRenamePreview.items.length === 0) return;
+    setBatchRenaming(true);
+    setBatchRenameError("");
+    try {
+      for (const it of batchRenamePreview.items) {
+        await StorageAdapter.renameDocFile(it.id, it.newName);
+      }
+      const byId = new Map(batchRenamePreview.items.map((it) => [it.id, it.newName]));
+      const newIndex = docIndexRef.current.map((e) => (byId.has(e.id) ? { ...e, name: byId.get(e.id) } : e));
+      await persistIndex(newIndex);
+      setBatchRenamePreview(null);
+    } catch (e) {
+      setBatchRenameError(e.message || String(e));
+    } finally {
+      setBatchRenaming(false);
+    }
+  };
+
   // Update document's own SN (empty string clears override → falls back to inheritance)
   const updateDocSn = async (docId, newSn) => {
     const trimmed = (newSn || "").trim();
@@ -15102,6 +16436,34 @@ function DMS({ storagePath, onChangeFolder }) {
     setViewerDoc((cur) => (cur && cur.id === docId ? { ...cur, description: clean } : cur));
   };
 
+  // Persist a folder/component's Description field (node.description lives
+  // in the tree, not the doc index) -- the node-level counterpart of
+  // handleSaveDescription above.
+  const handleSaveNodeDescription = async (nodeId, description) => {
+    const newTree = updateNodeInTree(tree, nodeId, (n) => ({ ...n, description: description || "" }));
+    await persistTree(newTree);
+  };
+
+  // Save/overwrite a folder's Description as a .txt or PDF document filed
+  // into that same folder, then reload the tree + index so it shows up in
+  // the folder's document list immediately. Mirrors handleSaveTextAsDoc.
+  const handleSaveNodeDescriptionText = async (nodeId, opts) => {
+    const res = await StorageAdapter.saveNodeDescriptionText(nodeId, opts);
+    const { tree: freshTree } = await StorageAdapter.getTree();
+    if (freshTree) setTree(freshTree);
+    const freshIndex = await StorageAdapter.listDocumentIndex();
+    setDocIndex(freshIndex);
+    return res;
+  };
+  const handleSaveNodeDescriptionPdf = async (nodeId, opts) => {
+    const res = await StorageAdapter.saveNodeDescriptionPdf(nodeId, opts);
+    const { tree: freshTree } = await StorageAdapter.getTree();
+    if (freshTree) setTree(freshTree);
+    const freshIndex = await StorageAdapter.listDocumentIndex();
+    setDocIndex(freshIndex);
+    return res;
+  };
+
   // Persist this document's locally-added parameter keys (kept separate from
   // the global key-parameter list). Index-only update, like OCR text.
   const handleSaveLocalParams = async (docId, localKeyParams) => {
@@ -15159,6 +16521,13 @@ function DMS({ storagePath, onChangeFolder }) {
         docSortBy
       )
     : [];
+
+  // Prev/Next targets for the doc viewer's navigation buttons -- walks
+  // visibleDocs (the same list, same order, as the folder panel below), so
+  // "next photo" steps through exactly what's on screen.
+  const viewerDocIndex = viewerDoc ? visibleDocs.findIndex((d) => d.id === viewerDoc.id) : -1;
+  const viewerPrevDoc = viewerDocIndex > 0 ? visibleDocs[viewerDocIndex - 1] : null;
+  const viewerNextDoc = viewerDocIndex >= 0 && viewerDocIndex < visibleDocs.length - 1 ? visibleDocs[viewerDocIndex + 1] : null;
 
   if (loading) {
     return <div className="h-screen flex items-center justify-center bg-stone-50 text-stone-700 text-base">{t("正在加载文档库…", "Loading document library…")}</div>;
@@ -15596,13 +16965,6 @@ function DMS({ storagePath, onChangeFolder }) {
                         className="w-full text-base border border-stone-300 rounded px-2 py-1 font-mono"
                       />
                     </div>
-                    <textarea
-                      value={selectedNode.description || ""}
-                      onChange={(e) => updateNodeMeta({ description: e.target.value })}
-                      placeholder={t("描述", "Description")}
-                      className="w-full text-base border border-stone-300 rounded px-2 py-1"
-                      rows={2}
-                    />
                     <div className="pt-2 mt-1 border-t border-amber-200/70 space-y-3">
                       <label className="text-[12px] uppercase tracking-wider text-stone-700 block mb-0.5">
                         {t("登录信息（可选，可添加多组）", "Login info (optional, add as many as you need)")}
@@ -15744,12 +17106,22 @@ function DMS({ storagePath, onChangeFolder }) {
                         </span>
                       </div>
                     </div>
-                    <button onClick={() => setEditingNode(true)} className="text-stone-700 hover:text-stone-900 p-1" title={t("编辑名称、序列号及描述", "Edit name, serial number, and description")}>
+                    <button onClick={() => setEditingNode(true)} className="text-stone-700 hover:text-stone-900 p-1" title={t("编辑名称及序列号", "Edit name and serial number")}>
                       <Edit2 size={14} />
                     </button>
                   </div>
                 )}
               </div>
+
+              <NodeDescriptionPanel
+                key={selectedNode.id}
+                node={selectedNode}
+                derivedDocs={docIndex.filter((e) => e.derivedFromNode === selectedNode.id)}
+                onSaveDescription={handleSaveNodeDescription}
+                onSaveTextAsDoc={handleSaveNodeDescriptionText}
+                onSaveDescPdf={handleSaveNodeDescriptionPdf}
+                onOpenAISettings={() => setShowAISettings(true)}
+              />
 
               <section>
                 <div className="flex items-center justify-between mb-3">
@@ -15885,29 +17257,61 @@ function DMS({ storagePath, onChangeFolder }) {
                   </div>
                 )}
 
-                {!isRecycleBinNode && (selectedNode.documents || []).length > 1 && (
+                {!isRecycleBinNode && (selectedNode.documents || []).length > 0 && (
                   <div className="flex items-center gap-2 mb-2 px-1">
-                    <label className="text-[12px] text-stone-700">
-                      {t("排序：", "Sort by:")}
-                    </label>
-                    <select
-                      value={docSortBy}
-                      onChange={(e) => setDocSortBy(e.target.value)}
-                      title={t("选择文档列表的排序方式", "Choose how the document list is ordered")}
-                      className="text-[13px] border border-stone-300 rounded px-1.5 py-1 bg-white hover:border-amber-400 focus:outline-none focus:border-amber-500"
-                    >
-                      <option value="name">{t("名称 (A–Z)", "Name (A–Z)")}</option>
-                      <option value="docDate">{t("日期（元数据）", "Date (metadata)")}</option>
-                      <option value="dueDate">{t("到期日（元数据）", "Due (metadata)")}</option>
-                      <option value="uploadedAt">{t("修改日期", "Date modified")}</option>
-                    </select>
+                    {(selectedNode.documents || []).length > 1 && (
+                      <>
+                        <label className="text-[12px] text-stone-700">
+                          {t("排序：", "Sort by:")}
+                        </label>
+                        <select
+                          value={docSortBy}
+                          onChange={(e) => setDocSortBy(e.target.value)}
+                          title={t("选择文档列表的排序方式", "Choose how the document list is ordered")}
+                          className="text-[13px] border border-stone-300 rounded px-1.5 py-1 bg-white hover:border-amber-400 focus:outline-none focus:border-amber-500"
+                        >
+                          <option value="name">{t("名称 (A–Z)", "Name (A–Z)")}</option>
+                          <option value="docDate">{t("日期（元数据）", "Date (metadata)")}</option>
+                          <option value="dueDate">{t("到期日（元数据）", "Due (metadata)")}</option>
+                          <option value="uploadedAt">{t("修改日期", "Date modified")}</option>
+                        </select>
+                      </>
+                    )}
+                    {docViewMode === "grid" && (
+                      <div className="flex items-center border border-stone-300 rounded overflow-hidden shrink-0" title={t("缩略图大小", "Thumbnail size")}>
+                        <button
+                          onClick={() => setGridThumbSize("small")}
+                          className={"px-2 py-1 text-[12px] " + (gridThumbSize === "small" ? "bg-stone-700 text-white" : "bg-white text-stone-600 hover:bg-stone-100")}
+                        >{t("小图标", "Small")}</button>
+                        <button
+                          onClick={() => setGridThumbSize("large")}
+                          className={"px-2 py-1 text-[12px] border-l border-stone-300 " + (gridThumbSize === "large" ? "bg-stone-700 text-white" : "bg-white text-stone-600 hover:bg-stone-100")}
+                        >{t("大图标", "Large")}</button>
+                      </div>
+                    )}
+                    <div className="ml-auto flex items-center border border-stone-300 rounded overflow-hidden shrink-0">
+                      <button
+                        onClick={() => setDocViewMode("list")}
+                        title={t("列表视图", "List view")}
+                        className={"px-1.5 py-1 flex items-center " + (docViewMode === "list" ? "bg-stone-700 text-white" : "bg-white text-stone-600 hover:bg-stone-100")}
+                      >
+                        <ListView size={14} />
+                      </button>
+                      <button
+                        onClick={() => setDocViewMode("grid")}
+                        title={t("图标视图（缩略图，如 Windows 资源管理器）", "Icon view (thumbnails, like Windows Explorer)")}
+                        className={"px-1.5 py-1 flex items-center border-l border-stone-300 " + (docViewMode === "grid" ? "bg-stone-700 text-white" : "bg-white text-stone-600 hover:bg-stone-100")}
+                      >
+                        <LayoutGrid size={14} />
+                      </button>
+                    </div>
                   </div>
                 )}
 
                 {!isRecycleBinNode && (selectedNode.documents || []).length > 0 && (
                   <div className="flex items-center justify-between mb-3 px-3 py-2 border border-stone-300 rounded bg-stone-50">
                     <div className="flex items-center gap-2">
-                      {!downloadSelectMode && !aiFillSelectMode ? (
+                      {!downloadSelectMode && !aiFillSelectMode && !dupeSelectMode ? (
                         <>
                           <button
                             onClick={() => { setDownloadSelectMode(true); setDownloadSelectedIds(new Set()); }}
@@ -15921,6 +17325,20 @@ function DMS({ storagePath, onChangeFolder }) {
                             title={t("批量选择多份文档，用 AI 从中读取某个参数的值并填入", "Multi-select documents and have AI read one parameter's value off each, to fill in")}
                           >
                             <Sparkles size={12} /> {t("AI 填参数", "AI-fill parameter")}
+                          </button>
+                          <button
+                            onClick={openBatchRenameDialog}
+                            className="text-sm px-3 py-1.5 border border-teal-300 hover:bg-teal-50 hover:border-teal-400 text-teal-700 rounded flex items-center gap-1.5"
+                            title={t("将此文件夹内所有文档重命名为「日期+地点-原文件名」，磁盘上的实际文件也会同步改名", "Rename every document in this folder to \"date + location - original name\" — the actual file on disk is renamed too")}
+                          >
+                            <Tag size={12} /> {t("批量重命名", "Batch rename")}
+                          </button>
+                          <button
+                            onClick={() => { setDupeSelectMode(true); setDupeSelectedIds(new Set()); setDupeDialog(null); }}
+                            className="text-sm px-3 py-1.5 border border-sky-300 hover:bg-sky-50 hover:border-sky-400 text-sky-700 rounded flex items-center gap-1.5"
+                            title={t("选择几张照片，检测其中彼此高度相似（近似重复）的照片", "Select a few photos to check for near-duplicates among them")}
+                          >
+                            <Copy size={12} /> {t("查找相似照片", "Find near-duplicates")}
                           </button>
                         </>
                       ) : downloadSelectMode ? (
@@ -15937,7 +17355,7 @@ function DMS({ storagePath, onChangeFolder }) {
                             {t(`已选 ${downloadSelectedIds.size} / ${visibleDocs.length}`, `${downloadSelectedIds.size} / ${visibleDocs.length} selected`)}
                           </span>
                         </>
-                      ) : (
+                      ) : aiFillSelectMode ? (
                         <>
                           <button
                             onClick={() => setAiFillSelectedIds(new Set(visibleDocs.map((d) => d.id)))}
@@ -15950,6 +17368,30 @@ function DMS({ storagePath, onChangeFolder }) {
                           <span className="text-[13px] text-stone-700">
                             {t(`已选 ${aiFillSelectedIds.size} / ${visibleDocs.length}`, `${aiFillSelectedIds.size} / ${visibleDocs.length} selected`)}
                           </span>
+                        </>
+                      ) : (
+                        <>
+                          <button
+                            onClick={() => setDupeSelectedIds(new Set(visibleDocs.filter((d) => d.mime?.startsWith("image/")).map((d) => d.id)))}
+                            className="text-sm px-3 py-1.5 border border-sky-300 hover:bg-sky-50 hover:border-sky-400 text-sky-700 rounded"
+                          >{t("全选照片", "Select all photos")}</button>
+                          <button
+                            onClick={() => setDupeSelectedIds(new Set())}
+                            className="text-sm px-3 py-1.5 border border-stone-300 hover:bg-stone-100 text-stone-700 rounded"
+                          >{t("清除", "Clear")}</button>
+                          <span className="text-[13px] text-stone-700">
+                            {t(`已选 ${dupeSelectedIds.size} 张照片`, `${dupeSelectedIds.size} photo(s) selected`)}
+                          </span>
+                          <label className="text-[13px] text-stone-700 flex items-center gap-1.5 ml-2">
+                            {t("相似度阈值", "Similarity threshold")}
+                            <input
+                              type="number" min={50} max={100} step={1}
+                              value={dupeThreshold}
+                              onChange={(e) => setDupeThreshold(Math.min(100, Math.max(50, Number(e.target.value) || 0)))}
+                              className="w-16 border border-stone-300 rounded px-1.5 py-1 text-[13px]"
+                            />
+                            %
+                          </label>
                         </>
                       )}
                     </div>
@@ -16001,6 +17443,24 @@ function DMS({ storagePath, onChangeFolder }) {
                         </button>
                       </div>
                     )}
+                    {dupeSelectMode && (
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => { setDupeSelectMode(false); setDupeSelectedIds(new Set()); }}
+                          className="text-sm px-3 py-1.5 border border-stone-300 hover:bg-stone-100 text-stone-700 rounded flex items-center gap-1.5"
+                        >
+                          <X size={12} /> {t("取消", "Cancel")}
+                        </button>
+                        <button
+                          onClick={runDupeCheck}
+                          disabled={dupeSelectedIds.size < 2}
+                          className="text-sm px-3 py-1.5 border border-sky-400 bg-sky-50 hover:bg-sky-100 text-sky-700 rounded flex items-center gap-1.5 disabled:opacity-40"
+                          title={t("比较所选照片，找出彼此相似度达到阈值的照片", "Compare the selected photos and find ones at or above the threshold similarity to each other")}
+                        >
+                          <Copy size={12} /> {t("检测相似照片", "Check selected")} ({dupeSelectedIds.size})
+                        </button>
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -16010,16 +17470,54 @@ function DMS({ storagePath, onChangeFolder }) {
                   </div>
                 )}
 
-                <div className="space-y-3">
+                <div
+                  className={docViewMode === "grid" && !isRecycleBinNode ? "grid gap-3" : "space-y-3"}
+                  style={docViewMode === "grid" && !isRecycleBinNode
+                    ? { gridTemplateColumns: `repeat(auto-fill, minmax(${gridThumbSize === "large" ? 200 : 110}px, 1fr))` }
+                    : undefined}
+                >
                   {visibleDocs.map((doc) => {
                     const refs = refMap.get(doc.id) || [];
                     const otherRefs = refs.filter((id) => id !== selectedId).length;
+                    // Recycle bin always stays in the detailed list view (its
+                    // own permanent-delete select flow lives in DocumentCard) —
+                    // the view toggle is hidden there for the same reason.
+                    if (docViewMode === "grid" && !isRecycleBinNode) {
+                      return (
+                        <DocumentGridTile
+                          key={doc.id}
+                          doc={doc}
+                          onOpen={() => openDoc(doc.id)}
+                          isRecommended={selectedNode.recommendedDocId === doc.id}
+                          badgeSize={gridThumbSize}
+                          faceSelectMode={faceSelectMode && doc.mime?.startsWith("image/")}
+                          faceSelected={faceSelectedIds.has(doc.id)}
+                          onToggleFaceSelect={() => setFaceSelectedIds((prev) => {
+                            const n = new Set(prev);
+                            n.has(doc.id) ? n.delete(doc.id) : n.add(doc.id);
+                            return n;
+                          })}
+                          selectMode={downloadSelectMode || aiFillSelectMode || (dupeSelectMode && doc.mime?.startsWith("image/"))}
+                          selected={dupeSelectMode ? dupeSelectedIds.has(doc.id) : aiFillSelectMode ? aiFillSelectedIds.has(doc.id) : downloadSelectedIds.has(doc.id)}
+                          onToggleSelect={() => (dupeSelectMode ? setDupeSelectedIds : aiFillSelectMode ? setAiFillSelectedIds : setDownloadSelectedIds)((prev) => {
+                            const n = new Set(prev);
+                            n.has(doc.id) ? n.delete(doc.id) : n.add(doc.id);
+                            return n;
+                          })}
+                          scheduleMode={scheduleMode}
+                          urgency={urgencyTier(doc.dueDate)}
+                          isLastWorked={lastWorkedDocId === doc.id}
+                          onMarkWorked={() => setLastWorkedDocId(doc.id)}
+                        />
+                      );
+                    }
                     return (
                       <DocumentCard
                         key={doc.id}
                         doc={doc}
                         otherRefCount={otherRefs}
                         nodeSn={selectedNode.sn || ""}
+                        isRecommended={selectedNode.recommendedDocId === doc.id}
                         onOpen={() => openDoc(doc.id)}
                         onOpenNative={() => { openDocNative(doc.id); setLastWorkedDocId(doc.id); }}
                         onDelete={() => deleteDoc(doc.id)}
@@ -16040,11 +17538,15 @@ function DMS({ storagePath, onChangeFolder }) {
                           n.has(doc.id) ? n.delete(doc.id) : n.add(doc.id);
                           return n;
                         })}
-                        selectMode={isRecycleBinNode ? recycleSelectMode : (downloadSelectMode || aiFillSelectMode)}
+                        selectMode={isRecycleBinNode ? recycleSelectMode
+                          : dupeSelectMode ? doc.mime?.startsWith("image/")
+                          : (downloadSelectMode || aiFillSelectMode)}
                         selected={isRecycleBinNode ? recycleSelectedIds.has(doc.id)
+                          : dupeSelectMode ? dupeSelectedIds.has(doc.id)
                           : aiFillSelectMode ? aiFillSelectedIds.has(doc.id)
                           : downloadSelectedIds.has(doc.id)}
                         onToggleSelect={() => (isRecycleBinNode ? setRecycleSelectedIds
+                          : dupeSelectMode ? setDupeSelectedIds
                           : aiFillSelectMode ? setAiFillSelectedIds
                           : setDownloadSelectedIds)((prev) => {
                           const n = new Set(prev);
@@ -16083,6 +17585,8 @@ function DMS({ storagePath, onChangeFolder }) {
         derivedDocs={viewerDoc ? docIndex.filter((e) => e.derivedFrom === viewerDoc.id) : []}
         onOpenAISettings={() => setShowAISettings(true)}
         nodeId={selectedId}
+        onPrevDoc={viewerPrevDoc ? () => openDoc(viewerPrevDoc.id) : null}
+        onNextDoc={viewerNextDoc ? () => openDoc(viewerNextDoc.id) : null}
       />
 
       <FaceTaggingDialog
@@ -16091,6 +17595,82 @@ function DMS({ storagePath, onChangeFolder }) {
         docIds={Array.from(faceSelectedIds)}
         onLabeled={() => { /* PeoplePanel refreshes itself on next open */ }}
       />
+
+      {batchRenamePreview && (
+        <div
+          className="fixed inset-0 bg-stone-900/70 z-50 flex items-center justify-center p-4"
+          onClick={() => { if (!batchRenaming) setBatchRenamePreview(null); }}
+        >
+          <div
+            className="bg-white w-full max-w-2xl max-h-[85vh] flex flex-col rounded shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between px-4 py-3 border-b border-stone-200">
+              <div className="flex items-center gap-1.5 text-base font-medium text-stone-800">
+                <Tag size={15} /> {t("批量重命名", "Batch rename")}
+              </div>
+              <button onClick={() => !batchRenaming && setBatchRenamePreview(null)} className="text-stone-600 hover:text-stone-700">
+                <X size={16} />
+              </button>
+            </div>
+
+            <div className="px-4 py-2 border-b border-stone-100 text-[13px] text-stone-700">
+              {batchRenamePreview.items.length > 0
+                ? t(
+                    `将把以下 ${batchRenamePreview.items.length} 个文件重命名为「日期+地点-原文件名」，磁盘上的实际文件也会同步改名：`,
+                    `The following ${batchRenamePreview.items.length} file(s) will be renamed to "date + location - original name" — the actual files on disk are renamed too:`
+                  )
+                : t("此文件夹内没有可重命名的文件（都已是目标名称，或缺少日期信息）。", "There's nothing to rename in this folder (already at the target name, or missing date information).")}
+            </div>
+
+            {batchRenamePreview.items.length > 0 && (
+              <div className="flex-1 min-h-0 overflow-auto p-4 space-y-2">
+                {batchRenamePreview.items.map((it) => (
+                  <div key={it.id} className="text-[13px] border border-stone-200 rounded px-2.5 py-1.5">
+                    <div className="text-stone-600 truncate">{it.oldName}</div>
+                    <div className="text-teal-800 font-medium truncate">→ {it.newName}</div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {batchRenamePreview.skipped.length > 0 && (
+              <div className="px-4 py-2 border-t border-amber-200 bg-amber-50 text-[12px] text-amber-800">
+                {t(
+                  `${batchRenamePreview.skipped.length} 个文件因缺少日期信息被跳过：`,
+                  `${batchRenamePreview.skipped.length} file(s) skipped for missing date information:`
+                )}{" "}
+                {batchRenamePreview.skipped.map((s) => s.oldName).join(", ")}
+              </div>
+            )}
+
+            {batchRenameError && (
+              <div className="px-4 py-2 border-t border-red-200 bg-red-50 text-[12px] text-red-700">{batchRenameError}</div>
+            )}
+
+            <div className="px-4 py-3 border-t border-stone-200 flex items-center justify-end gap-2">
+              <button
+                onClick={() => setBatchRenamePreview(null)}
+                disabled={batchRenaming}
+                className="text-sm px-3 py-1.5 border border-stone-300 hover:bg-stone-100 text-stone-700 rounded disabled:opacity-40"
+              >
+                {t("取消", "Cancel")}
+              </button>
+              {batchRenamePreview.items.length > 0 && (
+                <button
+                  onClick={runBatchRename}
+                  disabled={batchRenaming}
+                  className="text-sm px-3 py-1.5 border border-teal-400 bg-teal-50 hover:bg-teal-100 text-teal-800 rounded flex items-center gap-1.5 disabled:opacity-40"
+                >
+                  {batchRenaming
+                    ? (<><Loader size={13} className="animate-spin" /> {t("重命名中…", "Renaming…")}</>)
+                    : t(`确认重命名 (${batchRenamePreview.items.length})`, `Confirm rename (${batchRenamePreview.items.length})`)}
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {showTextTree && (() => {
         const treeText = buildTreeText(tree, { showMeta: textTreeMeta });
@@ -16605,6 +18185,158 @@ function DMS({ storagePath, onChangeFolder }) {
             setDownloadFolderBrowserOpen(false);
           }}
         />
+      )}
+
+      {dupeDialog && (
+        <>
+          <div
+            className="fixed inset-0 bg-stone-900/50 z-40"
+            onClick={() => !dupeDialog.checking && !dupeDialog.marking && setDupeDialog(null)}
+          />
+          <div
+            className="fixed z-50 bg-white rounded-lg shadow-2xl flex flex-col overflow-hidden"
+            style={{ left: dupeCurPos.x, top: dupeCurPos.y, width: dupeSize.w, height: dupeSize.h }}
+          >
+            <div
+              className="px-4 py-3 border-b border-stone-200 flex items-center justify-between shrink-0 cursor-move select-none bg-stone-50"
+              onMouseDown={onDupeDragStart}
+            >
+              <h3 className="font-semibold text-base text-stone-800 flex items-center gap-1.5 min-w-0">
+                <Copy size={15} className="text-sky-600 shrink-0" />
+                <span className="truncate">{t(`相似照片检测（阈值 ${dupeThreshold}%）`, `Near-duplicate check (${dupeThreshold}% threshold)`)}</span>
+              </h3>
+              <button
+                onClick={() => !dupeDialog.checking && !dupeDialog.marking && setDupeDialog(null)}
+                onMouseDown={(e) => e.stopPropagation()}
+                className="text-stone-500 hover:text-stone-800 shrink-0"
+              ><X size={16} /></button>
+            </div>
+
+            <div className="flex-1 min-h-0 overflow-y-auto px-6 py-4 flex flex-col gap-3">
+            {dupeDialog.checking && (
+              <div className="flex items-center gap-2 text-sm text-stone-600 py-6 justify-center">
+                <Loader size={14} className="animate-spin" /> {t("正在比较所选照片…", "Comparing selected photos…")}
+              </div>
+            )}
+
+            {dupeDialog.error && (
+              <div className="text-sm text-red-600 bg-red-50 border border-red-200 rounded px-3 py-2">{dupeDialog.error}</div>
+            )}
+
+            {dupeDialog.marked && (
+              <div className="text-sm text-green-700 bg-green-50 border border-green-200 rounded px-3 py-2">
+                {t(`已将 ${dupeDialog.marked.groups.length} 组照片链接到「疑似重复照片」文件夹，供你查看后处理。`,
+                   `Linked ${dupeDialog.marked.groups.length} group(s) into the "疑似重复照片" (Suspected duplicates) folder for you to review.`)}
+              </div>
+            )}
+
+            {dupeDialog.result && !dupeDialog.marked && (
+              <>
+                <div className="flex items-center justify-between gap-2">
+                  <div className="text-[13px] text-stone-600">
+                    {t(`共检查 ${dupeDialog.result.scanned} 张照片，找到 ${dupeDialog.result.groups.length} 组相似照片。`,
+                       `Checked ${dupeDialog.result.scanned} photo(s), found ${dupeDialog.result.groups.length} group(s).`)}
+                    {dupeDialog.result.skipped.length > 0 &&
+                      t(` (跳过 ${dupeDialog.result.skipped.length} 个：非照片或无法读取)`,
+                        ` (skipped ${dupeDialog.result.skipped.length}: not a photo or unreadable)`)}
+                  </div>
+                  {dupeDialog.result.groups.length > 0 && (
+                    <div className="flex items-center border border-stone-300 rounded overflow-hidden shrink-0" title={t("照片缩略图及推荐标记（★）的大小", "Size of the photo thumbnails and the recommended (★) badge")}>
+                      <button
+                        onClick={() => setGridThumbSize("small")}
+                        className={"px-2 py-1 text-[12px] " + (gridThumbSize === "small" ? "bg-stone-700 text-white" : "bg-white text-stone-600 hover:bg-stone-100")}
+                      >{t("小图标", "Small")}</button>
+                      <button
+                        onClick={() => setGridThumbSize("large")}
+                        className={"px-2 py-1 text-[12px] border-l border-stone-300 " + (gridThumbSize === "large" ? "bg-stone-700 text-white" : "bg-white text-stone-600 hover:bg-stone-100")}
+                      >{t("大图标", "Large")}</button>
+                    </div>
+                  )}
+                </div>
+
+                {dupeDialog.result.groups.length === 0 ? (
+                  <div className="border border-dashed border-stone-300 rounded p-6 text-center text-sm text-stone-600">
+                    {t("在所选照片中未找到达到该相似度阈值的重复照片。可以尝试降低阈值再试一次。",
+                       "No photos in your selection met the similarity threshold. Try a lower threshold and check again.")}
+                  </div>
+                ) : (
+                  <div className="flex flex-col gap-3">
+                    {dupeDialog.result.groups.map((group, gi) => (
+                      <div key={gi} className="border border-stone-200 rounded p-2">
+                        <div className="text-[12px] text-stone-600 mb-1.5">
+                          {t(`组 ${gi + 1} — ${group.docIds.length} 张照片 · 最低相似度 ${Math.round(group.minSimilarity * 100)}%`,
+                             `Group ${gi + 1} — ${group.docIds.length} photos · lowest similarity ${Math.round(group.minSimilarity * 100)}%`)}
+                        </div>
+                        <div className="flex flex-wrap gap-2">
+                          {group.docIds.map((docId) => {
+                            const meta = docIndexRef.current.find((e) => e.id === docId);
+                            const isRecommended = docId === group.recommendedDocId;
+                            const photoInfo = group.photos?.[docId];
+                            return (
+                              <div key={docId} className={gridThumbSize === "large" ? "w-32" : "w-16"}>
+                                <div className="relative">
+                                  <img
+                                    src={`${API_BASE}/api/docs/${docId}${meta?.mime === "image/heic" || meta?.mime === "image/heif" ? "/preview" : ""}`}
+                                    alt={meta?.name || docId}
+                                    className={(gridThumbSize === "large" ? "w-32 h-32" : "w-16 h-16")
+                                      + ` object-cover rounded border bg-stone-100 ${isRecommended ? "border-emerald-500 ring-1 ring-emerald-400" : "border-stone-200"}`}
+                                  />
+                                  {isRecommended && (
+                                    <div
+                                      className={"absolute bg-emerald-600 text-white rounded-full flex items-center justify-center leading-none shadow-md ring-2 ring-white "
+                                        + (gridThumbSize === "large" ? "-top-2.5 -right-2.5 w-7 h-7 text-base" : "-top-1.5 -right-1.5 w-4 h-4 text-[10px]")}
+                                      title={t("推荐保留（分辨率/文件大小最优）", "Recommended to keep (best resolution/file size)")}
+                                    >
+                                      ★
+                                    </div>
+                                  )}
+                                </div>
+                                <div className="text-[10px] text-stone-500 truncate mt-0.5" title={meta?.name}>{meta?.name}</div>
+                                {photoInfo && (
+                                  <div className="text-[9px] text-stone-400 truncate">
+                                    {photoInfo.width}×{photoInfo.height} · {formatBytes(photoInfo.size)}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
+
+            <div className="flex justify-end gap-2 mt-1">
+              <button
+                onClick={() => setDupeDialog(null)}
+                disabled={dupeDialog.checking || dupeDialog.marking}
+                className="text-sm px-3 py-1.5 rounded border border-stone-300 hover:bg-stone-50 text-stone-700 disabled:opacity-40"
+              >{t("关闭", "Close")}</button>
+              {dupeDialog.result?.groups.length > 0 && !dupeDialog.marked && (
+                <button
+                  onClick={markDupeGroups}
+                  disabled={dupeDialog.marking}
+                  className="text-sm px-3 py-1.5 rounded bg-sky-600 hover:bg-sky-700 text-white disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5"
+                >
+                  {dupeDialog.marking
+                    ? (<><Loader size={13} className="animate-spin" /> {t("标记中…", "Marking…")}</>)
+                    : (<><Tag size={12} /> {t("标记以便审查", "Mark for review")}</>)}
+                </button>
+              )}
+            </div>
+            </div>
+
+            {/* resize handles — right edge, bottom edge, bottom-right corner */}
+            <div onMouseDown={onDupeResizeStart("x")} className="absolute top-0 right-0 w-1.5 h-full cursor-ew-resize z-30" />
+            <div onMouseDown={onDupeResizeStart("y")} className="absolute bottom-0 left-0 w-full h-1.5 cursor-ns-resize z-30" />
+            <div onMouseDown={onDupeResizeStart("xy")} className="absolute bottom-0 right-0 w-4 h-4 cursor-nwse-resize z-30" />
+            {dupeInteracting && (
+              <div className="fixed inset-0 z-[55]" style={{ cursor: dupeInteractCursor }} />
+            )}
+          </div>
+        </>
       )}
 
       {dupDialog && (

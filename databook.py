@@ -771,6 +771,71 @@ def build_prompt_cover_pdf(request_text: str, folder_name: str = "",
     return buf.getvalue()
 
 
+# ---------------------------------------------------------------------------
+# Folder/component-level Description → PDF (see /api/nodes/<node_id>/
+# save-description-pdf in dms_server.py). Rebuilt from scratch on every save,
+# same "regenerate the whole file" pattern as build_qa_log_pdf above, so the
+# saved PDF always mirrors the node's current Description field exactly.
+# ---------------------------------------------------------------------------
+def build_node_description_pdf(node_name: str, node_path: str = "", sn: str = "",
+                               description: str = "", updated_at: str = "") -> bytes:
+    """Render a folder/component's Description field as a standalone PDF.
+
+    node_name:    the node's display name (title of the page).
+    node_path:    breadcrumb path shown as context, e.g. "Pump A / Casing".
+    sn:           the node's serial number, if any.
+    description:  the free-form description text, shown verbatim.
+    updated_at:   timestamp string to stamp on the page (when last saved).
+    """
+    _init_fonts()
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=letter,
+        leftMargin=MARGIN, rightMargin=MARGIN,
+        topMargin=MARGIN, bottomMargin=MARGIN,
+        title=f"Description — {node_name}",
+    )
+
+    styles = getSampleStyleSheet()
+    h_kicker = ParagraphStyle(
+        "NDKicker", parent=styles["Normal"],
+        fontName=_FONT_BOLD, fontSize=9, leading=12, textColor=SUBTLE, spaceAfter=2,
+    )
+    h_title = ParagraphStyle(
+        "NDTitle", parent=styles["Normal"],
+        fontName=_FONT_BOLD, fontSize=18, leading=23, textColor=black, spaceAfter=4,
+    )
+    h_meta = ParagraphStyle(
+        "NDMeta", parent=styles["Normal"],
+        fontName=_FONT, fontSize=9, leading=13, textColor=SUBTLE, spaceAfter=3,
+    )
+    p_body = ParagraphStyle(
+        "NDBody", parent=styles["Normal"],
+        fontName=_FONT, fontSize=11.5, leading=17, textColor=black, spaceAfter=8,
+    )
+
+    def _para_text(s: str) -> str:
+        return _escape(s).replace("\n", "<br/>")
+
+    story: list = [
+        Paragraph("DESCRIPTION / 描述", h_kicker),
+        Paragraph(_escape(node_name or "Untitled"), h_title),
+    ]
+    meta_bits = " · ".join(filter(None, [
+        node_path or "",
+        (f"SN: {sn}" if sn else ""),
+        (f"Updated: {updated_at}" if updated_at else ""),
+    ]))
+    if meta_bits:
+        story.append(Paragraph(_escape(meta_bits), h_meta))
+    story.append(Spacer(1, 0.15 * inch))
+    story.append(HRFlowable(width="100%", thickness=0.5, color=BORDER, spaceAfter=10))
+    story.append(Paragraph(_para_text(description or "(no description)"), p_body))
+
+    doc.build(story)
+    return buf.getvalue()
+
+
 def _exif_datetime_original(img_path: Path) -> str:
     """Return the photo's 'date taken' from EXIF (YYYY-MM-DD HH:MM:SS), or ""."""
     try:

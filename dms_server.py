@@ -511,6 +511,24 @@ def _get_node_path_parts(tree: dict, node_id: str) -> list:
     return _walk(tree, node_id, []) or []
 
 
+def _node_display_path(tree: dict, node_id: str) -> str:
+    """Breadcrumb of a node's real (unsanitized) names, root..node, joined
+    with " / " -- for display in generated documents (e.g. the folder
+    Description PDF header), as opposed to _get_node_path_parts' sanitized
+    names which are for on-disk folder paths."""
+    def _walk(node, target, path):
+        current = path + [node.get("name") or node.get("id") or ""]
+        if node.get("id") == target:
+            return current
+        for child in (node.get("children") or []):
+            result = _walk(child, target, current)
+            if result is not None:
+                return result
+        return None
+    parts = _walk(tree, node_id, []) if tree else None
+    return " / ".join(p for p in (parts or []) if p)
+
+
 def _path_exists_for_node(tree: dict | None, node_id: str | None) -> bool:
     return bool(tree and node_id and _get_node_path_parts(tree, node_id))
 
@@ -533,10 +551,15 @@ def _get_node_docs_dir(node_id: str | None, tree: dict | None = None) -> "Path |
 
 
 _PHOTO_EXTS = {"jpg", "jpeg", "png", "heic", "heif", "tif", "tiff", "webp", "gif", "bmp"}
+_VIDEO_EXTS = {"mp4", "mov", "m4v", "avi", "mkv", "webm", "wmv", "3gp", "3g2", "mpg", "mpeg", "flv"}
 
 
 def _is_photo_file(ext: str, mime: str) -> bool:
     return (ext or "").lower() in _PHOTO_EXTS or (mime or "").startswith("image/")
+
+
+def _is_video_file(ext: str, mime: str) -> bool:
+    return (ext or "").lower() in _VIDEO_EXTS or (mime or "").startswith("video/")
 
 
 def _valid_photo_year_month(year: str | None, month: str | None) -> bool:
@@ -3352,11 +3375,13 @@ def rename_doc_file(doc_id):
     return jsonify({"ok": True, "filename": dest.name})
 
 
-def _route_upload_out_dir(docs_dir, tree, node_id, is_photo, valid_date, route_mode,
+def _route_upload_out_dir(docs_dir, tree, node_id, is_dated_media, valid_date, route_mode,
                            photo_year, photo_month, photo_base_node_id):
     """Shared by post_doc and post_doc_stream: where a newly-uploaded file's
-    bytes should land, given its (already-resolved) photo routing info."""
-    if is_photo and valid_date and route_mode != "current-folder":
+    bytes should land, given its (already-resolved) photo/video routing info.
+    is_dated_media covers both photos and videos -- the routing itself (into a
+    year/month subfolder) doesn't care which kind of file supplied the date."""
+    if is_dated_media and valid_date and route_mode != "current-folder":
         node_parts = _get_node_path_parts(tree, node_id) if tree and node_id else []
         date_parts = [_safe_folder_name(photo_year), _safe_folder_name(photo_month)]
         if len(node_parts) >= 2 and node_parts[-2:] == date_parts:
@@ -3438,6 +3463,7 @@ def post_doc():
     photo_base_node_id = request.form.get("photo_base_node_id", "").strip() or None
 
     is_photo = _is_photo_file(ext, mime)
+    is_video = _is_video_file(ext, mime)
     # Only photos need the whole file in memory (for the EXIF date/GPS scans
     # below), and photos are never anywhere near video/PDF size. Everything
     # else is streamed straight to disk further down instead of buffering a
@@ -3451,6 +3477,10 @@ def post_doc():
     if is_photo and not _valid_date and route_mode != "current-folder":
         photo_year, photo_month = _read_photo_date(file_data, mime)
         _valid_date = _valid_photo_year_month(photo_year, photo_month)
+    # Videos have no server-side date scan (dms.html already computed
+    # photo_year/photo_month client-side from the file's modified date before
+    # upload -- see readPhotoDate's fallback path) -- if a non-browser client
+    # posted a video without those fields, it just skips year/month routing.
     photo_lat = request.form.get("photo_lat", "").strip() or None
     photo_lon = request.form.get("photo_lon", "").strip() or None
 
@@ -3460,7 +3490,7 @@ def post_doc():
     )
     tree = idx.get("tree")
     out_dir = _route_upload_out_dir(
-        docs_dir, tree, node_id, is_photo, _valid_date, route_mode,
+        docs_dir, tree, node_id, is_photo or is_video, _valid_date, route_mode,
         photo_year, photo_month, photo_base_node_id,
     )
 
@@ -3487,7 +3517,21 @@ def post_doc():
     # document's own date is almost always on its cover/header, and this
     # keeps the cost bounded — full extraction, run on demand elsewhere in
     # the app, reads up to 50 pages and can be much slower).
-    detected_date, detected_date_raw, detected_date_confidence = _scan_uploaded_doc_date(out_path, orig_name)
+    #
+    # Skipped entirely for a photo that already has a usable date (EXIF, or
+    # dms.html's own file.lastModified fallback -- see readPhotoDate, which
+    # always returns *something* for a photo, so _valid_date is true for
+    # virtually every photo uploaded through the app's own UI). The scan
+    # means a full Tesseract OCR pass over the saved image; at full camera
+    # resolution (a plain 10+ MB photo, no downscaling first) that can take
+    # upwards of a minute for a photo that was never going to have a text
+    # date printed on it in the first place. The cost only ever pays off for
+    # a scanned document/receipt with no date of its own -- exactly the case
+    # still handled below.
+    if is_photo and _valid_date:
+        detected_date, detected_date_raw, detected_date_confidence = None, None, None
+    else:
+        detected_date, detected_date_raw, detected_date_confidence = _scan_uploaded_doc_date(out_path, orig_name)
 
     location = None
     gps_lat, gps_lon = None, None
@@ -3578,6 +3622,7 @@ def post_doc_stream():
     photo_lon = (request.args.get("photo_lon") or "").strip() or None
 
     is_photo = _is_photo_file(ext, mime)
+    is_video = _is_video_file(ext, mime)
     _valid_date = _valid_photo_year_month(photo_year, photo_month)
 
     print(
@@ -3586,7 +3631,7 @@ def post_doc_stream():
     )
     tree = idx.get("tree")
     out_dir = _route_upload_out_dir(
-        docs_dir, tree, node_id, is_photo, _valid_date, route_mode,
+        docs_dir, tree, node_id, is_photo or is_video, _valid_date, route_mode,
         photo_year, photo_month, photo_base_node_id,
     )
 
@@ -3600,7 +3645,14 @@ def post_doc_stream():
         tmp_path.unlink(missing_ok=True)
         raise
 
-    detected_date, detected_date_raw, detected_date_confidence = _scan_uploaded_doc_date(out_path, orig_name)
+    # See the matching comment in post_doc -- skip the OCR date-scan for a
+    # photo that already has a usable date, since Tesseract over a full-res
+    # image (this endpoint only ever carries large files) can take upwards
+    # of a minute for no benefit.
+    if is_photo and _valid_date:
+        detected_date, detected_date_raw, detected_date_confidence = None, None, None
+    else:
+        detected_date, detected_date_raw, detected_date_confidence = _scan_uploaded_doc_date(out_path, orig_name)
 
     location = None
     gps_lat, gps_lon = None, None
@@ -5700,6 +5752,111 @@ def check_typos_cn_route():
     })
 
 
+# MIME types Gemini's audio-understanding API is documented to accept.
+# https://ai.google.dev/gemini-api/docs/audio -- wav/mp3/aiff/aac/ogg/flac.
+# Anything else (m4a, webm, caf, ...) gets transcoded to 16-bit PCM WAV via
+# ffmpeg first; see _to_speech_friendly_audio. (Tried FLAC here first, but
+# ffmpeg's default 24-bit-per-sample FLAC encoding made gemini-3.6-flash
+# return an empty response with finish_reason STOP and zero candidate
+# tokens -- no error, just silently nothing. Plain 16-bit PCM WAV doesn't
+# hit that and reliably gets a real answer back.)
+_GEMINI_NATIVE_AUDIO_MIMES = {
+    "audio/wav", "audio/x-wav", "audio/mpeg", "audio/mp3", "audio/aiff",
+    "audio/aac", "audio/ogg", "audio/flac", "audio/x-flac",
+}
+_AUDIO_EXT_MIME = {
+    "mp3": "audio/mp3", "wav": "audio/wav", "aif": "audio/aiff", "aiff": "audio/aiff",
+    "aac": "audio/aac", "ogg": "audio/ogg", "oga": "audio/ogg", "flac": "audio/flac",
+    "m4a": "audio/mp4", "mp4": "audio/mp4", "webm": "audio/webm", "caf": "audio/x-caf",
+    "3gp": "audio/3gpp", "amr": "audio/amr", "wma": "audio/x-ms-wma",
+}
+
+
+def _to_speech_friendly_audio(raw_bytes: bytes, orig_filename: str, orig_content_type: str = "") -> tuple:
+    """Normalize an uploaded voice-recording file into a format Gemini's
+    audio-understanding API accepts, for /api/transcribe-audio.
+
+    Container formats outside Gemini's documented list (notably .m4a/.caf
+    voice memos, and .webm from MediaRecorder) are transcoded to 16kHz mono
+    FLAC via ffmpeg -- plenty for speech, and small to upload. If ffmpeg
+    isn't on PATH (or the conversion fails), falls back to sending the file
+    as-is with a best-guess mime type; several common formats (mp3/wav/ogg/
+    flac/aac) work fine that way too, so this only ever hard-fails on a
+    format Gemini can't read AND ffmpeg couldn't convert.
+
+    Returns (audio_bytes, mime_type).
+    """
+    ext = Path(orig_filename or "").suffix.lower().lstrip(".")
+    guessed_mime = _AUDIO_EXT_MIME.get(ext) or (orig_content_type or "").split(";")[0].strip().lower()
+
+    if guessed_mime in _GEMINI_NATIVE_AUDIO_MIMES:
+        return raw_bytes, guessed_mime
+
+    if shutil.which("ffmpeg"):
+        with tempfile.TemporaryDirectory() as td:
+            in_path = Path(td) / ("in." + (ext or "bin"))
+            out_path = Path(td) / "out.wav"
+            in_path.write_bytes(raw_bytes)
+            try:
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", str(in_path),
+                     "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(out_path)],
+                    capture_output=True, check=True, timeout=120,
+                )
+                return out_path.read_bytes(), "audio/wav"
+            except Exception:
+                pass   # fall through to sending the original bytes as-is
+
+    return raw_bytes, guessed_mime or "audio/mp4"
+
+
+@app.route("/api/transcribe-audio", methods=["POST"])
+def post_transcribe_audio():
+    """Transcribe an uploaded voice-recording file (.m4a, .mp3, .wav, ...) to
+    text via Gemini -- the "upload a recording" alternative to live
+    microphone dictation in the Description panel (DocumentViewer /
+    NodeDescriptionPanel, dms.html). Always uses Gemini: DeepSeek has no
+    audio-input API.
+
+    multipart/form-data: file=<audio blob>
+    Returns { ok, text, provider: "gemini", model }.
+    """
+    if "file" not in request.files:
+        return jsonify({"error": "请选择要转写的录音文件。"}), 400
+    f = request.files["file"]
+    raw = f.read()
+    if not raw:
+        return jsonify({"error": "录音文件为空。"}), 400
+    if len(raw) > 25 * 1024 * 1024:
+        return jsonify({"error": "录音文件过大（上限 25MB）。"}), 400
+
+    cfg = load_config()
+    enc = cfg.get(_ai_key_field("gemini"), "")
+    if not enc:
+        return jsonify({"error": "未配置 Gemini API Key，请先在设置中添加。"}), 400
+    try:
+        api_key = decrypt_secret(enc)
+    except Exception:
+        return jsonify({"error": "无法读取已保存的 API Key，请重新设置。"}), 400
+
+    audio_bytes, mime_type = _to_speech_friendly_audio(raw, f.filename or "", f.mimetype or "")
+
+    try:
+        import ai_extraction
+        result = ai_extraction.transcribe_audio_with_gemini(audio_bytes, mime_type, api_key)
+    except ai_extraction.AIExtractionError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({
+        "ok": True,
+        "text": result["text"],
+        "provider": "gemini",
+        "model": result.get("model"),
+    })
+
+
 @app.route("/api/docs/<doc_id>/extract-keys-ai", methods=["POST"])
 def post_doc_extract_keys_ai(doc_id):
     """AI-assisted key-parameter extraction via Gemini (opt-in).
@@ -5763,6 +5920,60 @@ def post_doc_extract_keys_ai(doc_id):
         "found_count": found_n,
         "pages_used": len(images),
         "method": "gemini-ai",
+    })
+
+
+@app.route("/api/docs/<doc_id>/scan-barcode", methods=["POST"])
+def post_doc_scan_barcode(doc_id):
+    """Decode any barcode(s) (UPC/EAN/Code128/QR/...) in a document's image --
+    e.g. a phone photo of a barcode label. Fully offline/deterministic (zbar
+    via pyzbar), no AI key needed. The document's own date/location are
+    already captured automatically from EXIF at upload time (see
+    _read_photo_gps / _read_photo_date); this only adds the decoded value.
+
+    No body needed. Returns { ok, doc_id, results: [{type, data}], count }.
+    """
+    docs_dir = get_docs_dir()
+    if not docs_dir:
+        return jsonify({"error": "Storage path not configured"}), 503
+    if "/" in doc_id or "\\" in doc_id or ".." in doc_id:
+        return jsonify({"error": "Invalid doc_id"}), 400
+
+    import pdf_extraction
+    if not pdf_extraction.barcode_scan_available():
+        return jsonify({
+            "error": ("未安装条码识别库。请在运行此程序的 Python 中执行：\n"
+                      "    brew install zbar\n"
+                      "    pip3 install pyzbar\n"
+                      "然后重启服务器。")
+        }), 500
+
+    matches = list(docs_dir.rglob(f"{doc_id}__*")) or list(docs_dir.rglob(f"{doc_id}*"))
+    if not matches:
+        return jsonify({"error": "Document not found on disk"}), 404
+
+    try:
+        # A dedicated page render at a higher resolution than the AI-vision
+        # default (1600px) -- fine detail (small/dense barcodes) survives
+        # better, and this never leaves the machine so there's no request-size
+        # cost to worry about the way there is when sending it to Gemini.
+        images = pdf_extraction.render_pages_for_ai(matches[0], max_pages=1, max_dim=2400)
+    except Exception as e:
+        return jsonify({"error": f"无法读取文档页面图像：{e}"}), 500
+
+    if not images:
+        return jsonify({"error": "此文档类型不支持条码识别（仅支持 PDF 和图片）。"}), 400
+
+    try:
+        results = pdf_extraction.decode_barcodes(images[0])
+    except Exception as e:
+        return jsonify({"error": f"条码识别失败：{e}"}), 500
+
+    return jsonify({
+        "ok": True,
+        "doc_id": doc_id,
+        "results": results,
+        "count": len(results),
     })
 
 
@@ -6010,6 +6221,219 @@ def post_doc_save_text_as_doc(doc_id):
         "node_id": target_node_id,
         "updated": False,
     })
+
+
+class _DocLimitReached(Exception):
+    pass
+
+
+def _save_or_update_node_derived_doc(idx: dict, tree: dict, target_node_id: str,
+                                     file_bytes: bytes, mime: str, display_name: str,
+                                     source_feature: str, reuse: bool) -> dict:
+    """Shared save/overwrite-in-place logic for a file derived from a
+    folder/node-level feature (the Description .txt export and PDF export).
+
+    Mirrors the reuse pattern in post_doc_save_text_as_doc above, but keyed by
+    derivedFromNode + sourceFeature instead of derivedFrom -- there's no
+    source *document* here, the source is the folder/node itself, so a
+    second save for the same node + feature overwrites in place rather than
+    accumulating "Description (2)", "(3)", ...
+
+    Returns {doc_id, name, size, node_id, updated}. Raises _DocLimitReached
+    or ValueError (node not found) on failure -- callers turn those into the
+    appropriate HTTP error response.
+    """
+    docs_dir = get_docs_dir()
+    # Unlike `idx.get("docIndex") or []`, this keeps doc_index as the actual
+    # list object stored on idx even when it starts out empty ([] is falsy,
+    # so `or []` would otherwise silently swap in a disconnected list and the
+    # .append() below would never reach write_index()).
+    doc_index = idx.get("docIndex")
+    if doc_index is None:
+        doc_index = []
+        idx["docIndex"] = doc_index
+
+    if reuse:
+        existing = next(
+            (d for d in doc_index
+             if d.get("derivedFromNode") == target_node_id
+             and (d.get("sourceFeature") or "") == source_feature),
+            None,
+        )
+        if existing:
+            matches = (list(docs_dir.rglob(f"{existing['id']}__*"))
+                       or list(docs_dir.rglob(f"{existing['id']}*")))
+            out_path = matches[0] if matches else None
+            if out_path is None:
+                out_dir = _get_node_docs_dir(
+                    existing.get("originalNodeId") or target_node_id, tree) or docs_dir
+                out_dir.mkdir(parents=True, exist_ok=True)
+                out_path = out_dir / f"{existing['id']}__{_safe_filename_part(existing.get('name') or display_name)}"
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_bytes(file_bytes)
+            existing["size"] = len(file_bytes)
+            existing["uploadedAt"] = datetime.utcnow().isoformat() + "Z"
+            existing["mime"] = mime
+            if mime == "text/plain":
+                existing["ocrText"] = file_bytes.decode("utf-8", "ignore")
+            write_index(idx)
+            return {
+                "doc_id": existing["id"],
+                "name": existing.get("name") or display_name,
+                "size": len(file_bytes),
+                "node_id": existing.get("originalNodeId") or target_node_id,
+                "updated": True,
+            }
+
+    node = _find_node_by_id(tree, target_node_id)
+    if node is None:
+        raise ValueError("No folder to file the new document into")
+    if not _reserve_doc_slots(idx, 1):
+        raise _DocLimitReached(f"Document upload limit reached ({_get_max_documents()} total).")
+
+    new_doc_id = "DOC-" + datetime.now().strftime("%Y%m%d") + "-" + secrets.token_hex(4).upper()
+    out_dir = _get_node_docs_dir(target_node_id, tree) or docs_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{new_doc_id}__{_safe_filename_part(display_name)}"
+    out_path.write_bytes(file_bytes)
+
+    entry = {
+        "id": new_doc_id,
+        "name": display_name,
+        "mime": mime,
+        "size": len(file_bytes),
+        "uploadedAt": datetime.utcnow().isoformat() + "Z",
+        "originalNodeId": target_node_id,
+        "metadata": {},
+        "derivedFromNode": target_node_id,
+        "sourceFeature": source_feature,
+    }
+    if mime == "text/plain":
+        entry["ocrText"] = file_bytes.decode("utf-8", "ignore")
+    doc_index.append(entry)
+    node.setdefault("documents", []).append({"id": new_doc_id})
+    write_index(idx)
+    return {
+        "doc_id": new_doc_id,
+        "name": display_name,
+        "size": len(file_bytes),
+        "node_id": target_node_id,
+        "updated": False,
+    }
+
+
+@app.route("/api/nodes/<node_id>/save-description-text", methods=["POST"])
+def post_node_save_description_text(node_id):
+    """Save a folder/component's Description as a .txt document filed into
+    that same folder -- the node-level counterpart of
+    /api/docs/<doc_id>/save-text-as-doc.
+
+    Body (JSON): { "text": str, "title": str, "reuse": bool }
+    Returns { ok, doc_id, name, size, node_id, updated }.
+    """
+    docs_dir = get_docs_dir()
+    if not docs_dir:
+        return jsonify({"error": "Storage path not configured"}), 503
+    if "/" in node_id or "\\" in node_id or ".." in node_id:
+        return jsonify({"error": "Invalid node_id"}), 400
+
+    payload = request.get_json(force=True, silent=True) or {}
+    text = (payload.get("text") or "").strip()
+    title = (payload.get("title") or "").strip()
+    reuse = bool(payload.get("reuse"))
+    if not text:
+        return jsonify({"error": "Provide non-empty 'text'"}), 400
+
+    idx = read_index()
+    tree = idx.get("tree")
+    node = _find_node_by_id(tree, node_id) if tree else None
+    if node is None:
+        return jsonify({"error": "Folder not found"}), 404
+
+    node_name = node.get("name") or node_id
+    display_name = (title if title.lower().endswith(".txt") else title + ".txt") if title \
+        else f"{node_name} - Description.txt"
+    header = [
+        "Description",
+        f"Folder: {node_name} ({node_id})",
+        "Saved: " + datetime.now().strftime("%Y-%m-%d %H:%M"),
+    ]
+    file_bytes = ("\n".join(header) + "\n" + ("-" * 40) + "\n\n" + text + "\n").encode("utf-8")
+
+    try:
+        result = _save_or_update_node_derived_doc(
+            idx, tree, node_id, file_bytes, "text/plain", display_name,
+            "node_description", reuse)
+    except _DocLimitReached as e:
+        return jsonify({"error": str(e), "code": "upload_limit_reached"}), 403
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    return jsonify({"ok": True, **result})
+
+
+@app.route("/api/nodes/<node_id>/save-description-pdf", methods=["POST"])
+def post_node_save_description_pdf(node_id):
+    """Render a folder/component's Description as a PDF and file it into
+    that same folder. Re-saving (reuse=true, the default from the UI)
+    overwrites the same PDF in place -- see build_node_description_pdf.
+
+    Body (JSON): { "text": str, "title": str, "reuse": bool }
+    Returns { ok, doc_id, name, size, node_id, updated }.
+    """
+    docs_dir = get_docs_dir()
+    if not docs_dir:
+        return jsonify({"error": "Storage path not configured"}), 503
+    if "/" in node_id or "\\" in node_id or ".." in node_id:
+        return jsonify({"error": "Invalid node_id"}), 400
+
+    payload = request.get_json(force=True, silent=True) or {}
+    text = (payload.get("text") or "").strip()
+    title = (payload.get("title") or "").strip()
+    reuse = payload.get("reuse", True)
+    if not text:
+        return jsonify({"error": "Provide non-empty 'text'"}), 400
+
+    idx = read_index()
+    tree = idx.get("tree")
+    node = _find_node_by_id(tree, node_id) if tree else None
+    if node is None:
+        return jsonify({"error": "Folder not found"}), 404
+
+    node_name = node.get("name") or node_id
+    display_name = (title if title.lower().endswith(".pdf") else title + ".pdf") if title \
+        else f"{node_name} - Description.pdf"
+
+    try:
+        from databook import build_node_description_pdf
+        pdf_bytes = build_node_description_pdf(
+            node_name=node_name,
+            node_path=_node_display_path(tree, node_id),
+            sn=node.get("sn") or "",
+            description=text,
+            updated_at=datetime.now().strftime("%Y-%m-%d %H:%M"),
+        )
+    except ImportError as e:
+        return jsonify({
+            "error": ("Databook libraries not installed. Run:\n"
+                      "    pip3 install pypdf reportlab Pillow\n"
+                      "Then restart the server.\n\nDetail: " + str(e))
+        }), 500
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": f"PDF generation failed: {e}"}), 500
+
+    try:
+        result = _save_or_update_node_derived_doc(
+            idx, tree, node_id, pdf_bytes, "application/pdf", display_name,
+            "node_description_pdf", bool(reuse))
+    except _DocLimitReached as e:
+        return jsonify({"error": str(e), "code": "upload_limit_reached"}), 403
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    return jsonify({"ok": True, **result})
 
 
 @app.route("/api/docs/<doc_id>/extract-keys", methods=["POST"])
@@ -8254,6 +8678,224 @@ def faces_delete_person(person_id):
     faces_data["recognitions"] = [r for r in faces_data.get("recognitions", []) if r["personId"] != person_id]
     write_faces(faces_data)
     return jsonify({"ok": True})
+
+
+# ---- Near-duplicate photo detection ----------------------------------------
+# Unlike face recognition, this needs no ML model -- a perceptual "difference
+# hash" (dHash) computed with Pillow (already a dependency) is the standard,
+# fast way to tell "basically the same photo" (recompression, tiny crop,
+# brightness tweak, burst shots) from a different one. Only ever run against
+# a caller-supplied set of doc_ids (typically a small user selection), so no
+# caching/indexing of hashes is needed.
+
+def _photo_fingerprint(path: Path, hash_size: int = 8) -> "dict | None":
+    """Return {"hash", "width", "height"} for one photo, or None on failure.
+
+    The hash is a hash_size*hash_size-bit difference hash (dHash): resize to
+    (hash_size+1) x hash_size grayscale, then set each bit based on whether a
+    pixel is brighter than its right-hand neighbor. EXIF orientation is
+    applied first so a photo saved rotated hashes the same as the same photo
+    already upright. width/height (post-orientation) ride along on the same
+    Image.open() so recommending the highest-resolution photo in a matched
+    group (see photos_near_duplicates) costs no extra file read.
+    """
+    try:
+        try:
+            import pillow_heif
+            pillow_heif.register_heif_opener()
+        except ImportError:
+            pass
+        from PIL import Image, ImageOps
+        img = Image.open(path)
+        img = ImageOps.exif_transpose(img)
+        width, height = img.size
+        small = img.convert("L").resize((hash_size + 1, hash_size), Image.Resampling.LANCZOS)
+        pixels = list(small.getdata())
+        bits = 0
+        for row in range(hash_size):
+            row_start = row * (hash_size + 1)
+            for col in range(hash_size):
+                bits <<= 1
+                if pixels[row_start + col] > pixels[row_start + col + 1]:
+                    bits |= 1
+        return {"hash": bits, "width": width, "height": height}
+    except Exception as e:
+        print(f"[DMS] photo fingerprint failed for {path}: {e}")
+        return None
+
+
+def _hamming_distance(a: int, b: int) -> int:
+    return bin(a ^ b).count("1")
+
+
+class _UnionFind:
+    """Minimal union-find so a chain of near-duplicates (A~B~C) becomes one
+    group instead of two separate overlapping pairs."""
+    def __init__(self, items):
+        self._parent = {x: x for x in items}
+
+    def find(self, x):
+        while self._parent[x] != x:
+            self._parent[x] = self._parent[self._parent[x]]
+            x = self._parent[x]
+        return x
+
+    def union(self, a, b):
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self._parent[ra] = rb
+
+
+@app.route("/api/photos/near-duplicates", methods=["POST"])
+def photos_near_duplicates():
+    """Compare a caller-chosen set of photos pairwise and group the ones at
+    or above `threshold` similarity. Doesn't touch the tree/index -- purely a
+    look-and-decide check; see /api/photos/near-duplicates/mark to act on it."""
+    data = request.get_json(force=True) or {}
+    doc_ids = data.get("docIds") or []
+    threshold = data.get("threshold")
+    try:
+        threshold = float(threshold)
+    except (TypeError, ValueError):
+        threshold = 0.75
+    threshold = min(max(threshold, 0.5), 1.0)
+
+    if len(doc_ids) < 2:
+        return jsonify({"error": "Select at least 2 photos"}), 400
+
+    idx = read_index()
+    doc_meta = {d["id"]: d for d in idx.get("docIndex", [])}
+
+    fingerprints = {}
+    skipped = []
+    for doc_id in doc_ids:
+        meta = doc_meta.get(doc_id)
+        mime = (meta or {}).get("mime", "")
+        name = (meta or {}).get("name", doc_id)
+        ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        if not _is_photo_file(ext, mime):
+            skipped.append({"docId": doc_id, "reason": "not a photo"})
+            continue
+        file_path = _resolve_photo_path(doc_id)
+        if not file_path:
+            skipped.append({"docId": doc_id, "reason": "file not found"})
+            continue
+        fp = _photo_fingerprint(file_path)
+        if fp is None:
+            skipped.append({"docId": doc_id, "reason": "could not read image"})
+            continue
+        fp["size"] = (meta or {}).get("size") or file_path.stat().st_size
+        fingerprints[doc_id] = fp
+
+    ids = list(fingerprints.keys())
+    uf = _UnionFind(ids)
+    edges = []  # every pair that met the threshold
+    hash_size = 8
+    total_bits = hash_size * hash_size
+    for i in range(len(ids)):
+        for j in range(i + 1, len(ids)):
+            a, b = ids[i], ids[j]
+            similarity = 1 - (_hamming_distance(fingerprints[a]["hash"], fingerprints[b]["hash"]) / total_bits)
+            if similarity >= threshold:
+                edges.append({"a": a, "b": b, "similarity": round(similarity, 4)})
+                uf.union(a, b)
+
+    clusters: dict = {}
+    for doc_id in ids:
+        clusters.setdefault(uf.find(doc_id), []).append(doc_id)
+
+    groups = []
+    for members in clusters.values():
+        if len(members) < 2:
+            continue
+        member_set = set(members)
+        group_edges = [e for e in edges if e["a"] in member_set and e["b"] in member_set]
+        # Recommend the photo most likely to be the "best" copy to keep --
+        # highest resolution first (a recompressed/re-exported near-duplicate
+        # is usually downsized), file size as the tiebreaker (less
+        # compression at the same resolution). Purely a suggestion shown in
+        # the UI -- nothing is deleted automatically.
+        best_id = max(
+            members,
+            key=lambda d: (fingerprints[d]["width"] * fingerprints[d]["height"], fingerprints[d]["size"]),
+        )
+        groups.append({
+            "docIds": members,
+            "pairs": group_edges,
+            "minSimilarity": round(min(e["similarity"] for e in group_edges), 4),
+            "recommendedDocId": best_id,
+            "photos": {
+                d: {"width": fingerprints[d]["width"], "height": fingerprints[d]["height"], "size": fingerprints[d]["size"]}
+                for d in members
+            },
+        })
+    groups.sort(key=lambda g: -g["minSimilarity"])
+
+    return jsonify({"ok": True, "groups": groups, "scanned": len(ids), "skipped": skipped})
+
+
+@app.route("/api/photos/near-duplicates/mark", methods=["POST"])
+def photos_near_duplicates_mark():
+    """File confirmed near-duplicate groups into a review folder, one
+    subfolder per group -- mirrors /api/faces/create-folder's pattern of
+    linking (not moving) matched docs so originals stay where they are."""
+    data = request.get_json(force=True) or {}
+    groups = data.get("groups") or []
+    if not groups:
+        return jsonify({"error": "groups is required"}), 400
+    is_en = data.get("lang") == "en"
+    parent_name = "Suspected duplicates" if is_en else "疑似重复照片"
+    group_prefix = "Group " if is_en else "组"
+
+    idx = read_index()
+    tree = idx.get("tree")
+    if not tree:
+        return jsonify({"error": "No project tree found"}), 400
+
+    # Reuse an existing review folder under either language's name (rather
+    # than fragmenting into two parents the moment someone switches the
+    # app's language) -- only fall back to creating one, in the requested
+    # language, if neither already exists.
+    review_parent = None
+    for candidate in ("疑似重复照片", "Suspected duplicates"):
+        review_parent = next((c for c in tree.get("children") or [] if c.get("name") == candidate), None)
+        if review_parent:
+            break
+    if review_parent is None:
+        review_parent = _get_or_create_child_node(tree, parent_name)
+
+    existing_group_names = {c.get("name") for c in review_parent.get("children") or []}
+    next_n = 1
+    result_groups = []
+    for group in groups:
+        doc_ids = group.get("docIds") or []
+        if len(doc_ids) < 2:
+            continue
+        while f"{group_prefix}{next_n}" in existing_group_names:
+            next_n += 1
+        group_name = f"{group_prefix}{next_n}"
+        existing_group_names.add(group_name)
+        next_n += 1
+
+        group_node = _get_or_create_child_node(review_parent, group_name)
+        existing_ids = {d["id"] for d in (group_node.get("documents") or []) if isinstance(d, dict)}
+        added = 0
+        for doc_id in doc_ids:
+            if doc_id not in existing_ids:
+                group_node.setdefault("documents", []).append({"id": doc_id})
+                existing_ids.add(doc_id)
+                added += 1
+        # Carry the check's "best copy" recommendation onto the folder itself
+        # so it's still visible after marking, not just in the fleeting
+        # results dialog -- the client reads this back to badge that one
+        # document wherever this node's contents are displayed.
+        recommended_doc_id = group.get("recommendedDocId")
+        if recommended_doc_id in doc_ids:
+            group_node["recommendedDocId"] = recommended_doc_id
+        result_groups.append({"nodeId": group_node["id"], "name": group_name, "added": added, "recommendedDocId": group_node.get("recommendedDocId")})
+
+    write_index(idx)
+    return jsonify({"ok": True, "parentNodeId": review_parent["id"], "groups": result_groups})
 
 
 # ---- Guide download -------------------------------------------------------

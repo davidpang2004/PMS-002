@@ -19,7 +19,11 @@ from pdf_extraction import split_value_unit_description
 # active for some accounts -- so a single retirement doesn't hard-break this
 # feature until the code is next updated.
 DEFAULT_MODEL = "gemini-3.5-flash"
-FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash"]
+# gemini-2.5-flash and gemini-2.0-flash have since been retired ("no longer
+# available", confirmed via the live API); kept here as a last resort in
+# case that ever changes back, but gemini-3.6-flash is the fallback that
+# actually works today.
+FALLBACK_MODELS = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.0-flash"]
 
 # DeepSeek's API is OpenAI-compatible REST, so it's called with plain
 # `requests` rather than a dedicated SDK -- one fewer optional dependency.
@@ -630,6 +634,77 @@ def polish_description_text(text: str, api_key: str, provider: str = "gemini",
         out = re.sub(r"\n?```$", "", out).strip()
     if not out:
         raise AIExtractionError("AI 未返回有效的结果。")
+    return {"text": out, "model": model_used}
+
+
+def transcribe_audio_with_gemini(audio_bytes: bytes, mime_type: str, api_key: str,
+                                 model: str = DEFAULT_MODEL) -> dict:
+    """Transcribe a voice recording to text -- the "upload a recording" (.m4a,
+    .mp3, .wav, ...) alternative to live microphone dictation in the
+    Description panel (see /api/transcribe-audio in dms_server.py). DeepSeek
+    has no audio-input API, so this is Gemini-only regardless of which
+    provider the caller uses for text cleanup.
+
+    audio_bytes/mime_type: already normalized by the caller (dms_server's
+    _to_speech_friendly_audio) into a format Gemini's audio input accepts.
+
+    Returns {"text": str, "model": str}.
+    """
+    if not audio_bytes:
+        raise AIExtractionError("没有可转写的录音文件。")
+    if not api_key:
+        raise AIExtractionError("未配置 Gemini API Key，请先在设置中添加。")
+
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError:
+        raise AIExtractionError(
+            "未安装 google-genai 库。请在运行此程序的 Python 中执行：pip install google-genai")
+
+    prompt = (
+        "Transcribe this audio recording verbatim, in the same language it is "
+        "spoken in -- do not translate it. Do not summarize, paraphrase, add "
+        "commentary, timestamps or speaker labels. Return ONLY the spoken "
+        "words as plain text, with normal punctuation and paragraph breaks.\n\n"
+        "If the recording contains no speech at all (e.g. it's music, "
+        "silence, or only background/ambient noise), respond with exactly "
+        "the single token NO_SPEECH_DETECTED and nothing else."
+    )
+    audio_part = types.Part.from_bytes(data=audio_bytes, mime_type=mime_type)
+    contents = [prompt, audio_part]
+
+    client = genai.Client(api_key=api_key)
+    candidates = [model] + [m for m in FALLBACK_MODELS if m != model]
+    response = None
+    last_error = None
+    model_used = None
+    for candidate in candidates:
+        try:
+            response = client.models.generate_content(model=candidate, contents=contents)
+            model_used = candidate
+            last_error = None
+            break
+        except Exception as e:
+            last_error = e
+            msg = str(e)
+            if "NOT_FOUND" in msg or "404" in msg or "no longer available" in msg:
+                continue
+            break
+
+    if last_error is not None:
+        raise AIExtractionError(f"调用 Gemini API 失败：{last_error}")
+
+    out = (getattr(response, "text", None) or "").strip()
+    if out.startswith("```"):
+        out = re.sub(r"^```[a-zA-Z]*\n?", "", out)
+        out = re.sub(r"\n?```$", "", out).strip()
+    # An empty response (finish_reason STOP, zero candidate tokens) has been
+    # observed for non-speech audio too -- some models, told "return ONLY
+    # the spoken words", literally return nothing when there are none,
+    # despite the NO_SPEECH_DETECTED instruction above. Treat both the same.
+    if not out or out.strip(" .\n").upper() == "NO_SPEECH_DETECTED":
+        raise AIExtractionError("这段录音中没有检测到语音内容（可能是音乐、静音或环境噪音）。")
     return {"text": out, "model": model_used}
 
 

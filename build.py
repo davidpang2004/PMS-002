@@ -81,7 +81,7 @@ def ensure_venv():
         [str(venv_python), "-m", "pip", "install", "--quiet", "--upgrade",
          "pip", "pyinstaller", "flask", "waitress", "pypdf", "reportlab", "Pillow",
          "pillow-heif", "PyMuPDF", "qrcode", "numpy", "cryptography", "google-genai",
-         "openpyxl"],
+         "openpyxl", "pyzbar"],
         check=True,
     )
 
@@ -384,6 +384,21 @@ def build_pyinstaller_command() -> list[str]:
         print("  qrcode found — Mobile Upload QR codes will be available.")
     except ImportError:
         print("  qrcode not installed — Mobile Upload will show URL only (no QR code).")
+
+    # pyzbar is OPTIONAL — it decodes barcodes/QR codes for the document
+    # viewer's "Scan barcode" button. It also needs the zbar shared library
+    # (`brew install zbar` on macOS) at runtime -- that's a system library,
+    # not something PyInstaller can bundle, so it's on the user to install
+    # like Tesseract; the endpoint reports a clear error if it's missing.
+    try:
+        import pyzbar  # noqa: F401  # type: ignore
+        cmd.extend(["--collect-submodules", "pyzbar"])
+        cmd.extend(["--collect-all", "pyzbar"])
+        cmd.extend(["--hidden-import", "pyzbar"])
+        print("  pyzbar found — barcode scanning will be available in the build "
+              "(still needs zbar installed on the machine running it).")
+    except ImportError:
+        print("  pyzbar not installed — barcode scanning omitted. Run: pip install pyzbar")
 
     # pyngrok is used by the Remote Upload dialog to create a public tunnel.
     # The ngrok binary itself is downloaded to ~/.ngrok2/ at runtime, so it

@@ -782,6 +782,77 @@ def render_pages_for_ai(file_path: Path, max_pages: int = 3,
     return images
 
 
+def barcode_scan_available() -> bool:
+    try:
+        from pyzbar.pyzbar import decode  # noqa: F401
+        return True
+    except ImportError:
+        return False
+    except Exception:
+        # pyzbar imports fine but fails to load the underlying zbar shared
+        # library (e.g. `brew install zbar` was never run) -- report
+        # unavailable rather than raising on the caller.
+        return False
+
+
+def decode_barcodes(image_bytes: bytes) -> list[dict]:
+    """Decode any 1D/2D barcodes (UPC/EAN/Code128/QR/...) found in an image.
+
+    Used by /api/docs/<doc_id>/scan-barcode -- the caller gets the image
+    bytes from render_pages_for_ai (which already applies EXIF rotation and
+    handles HEIC), covering a phone photo of a barcode/label the same way
+    that function already covers a phone photo for AI vision extraction.
+
+    Returns a deduplicated list of {"type": str, "data": str}, in the order
+    first seen. A phone photo can be tilted a few degrees and zbar handles
+    that fine, but a barcode shot at a hard 90°/180°/270° won't scan on the
+    first pass -- so if nothing is found upright, this retries rotated
+    copies of the image before giving up.
+
+    Returns [] if pyzbar/zbar isn't installed or nothing decodes.
+    """
+    try:
+        from pyzbar.pyzbar import decode
+    except ImportError:
+        return []
+
+    from PIL import Image
+
+    try:
+        im = Image.open(io.BytesIO(image_bytes))
+        im.load()
+    except Exception:
+        return []
+
+    seen = set()
+    results: list[dict] = []
+
+    def _collect(pil_img) -> bool:
+        found_new = False
+        try:
+            decoded = decode(pil_img)
+        except Exception:
+            return False
+        for d in decoded:
+            try:
+                text = d.data.decode("utf-8")
+            except UnicodeDecodeError:
+                text = d.data.decode("latin-1", errors="replace")
+            key = (d.type, text)
+            if key not in seen:
+                seen.add(key)
+                results.append({"type": d.type, "data": text})
+                found_new = True
+        return found_new
+
+    if _collect(im):
+        return results
+    for angle in (90, 180, 270):
+        if _collect(im.rotate(angle, expand=True)):
+            break
+    return results
+
+
 def ocr_status() -> dict:
     """Report OCR capability so the UI can tell the user what works.
 
@@ -810,6 +881,10 @@ def ocr_status() -> dict:
         "languages": langs,                # installed Tesseract language packs
         "ocr_lang": ocr_languages() if tesseract_available() else "",
         "chinese_available": has_chinese,
+        # Piggybacks on this same capability probe (already fetched by the
+        # viewer on open) rather than adding a second round trip just for
+        # the "Scan barcode" button's enabled/disabled state.
+        "barcode_scan_available": barcode_scan_available(),
     }
 
 
