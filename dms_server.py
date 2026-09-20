@@ -126,7 +126,19 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> None:
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+    """Write the config file atomically -- same reasoning as write_index():
+    a plain write_text() truncates-then-writes in place, so two overlapping
+    writers (e.g. two DMS instances pointed at different projects both
+    touching shared settings) could interleave and corrupt it. Writing to a
+    temp file in the same directory and os.replace()-ing it into place
+    instead makes the write atomic at the filesystem level."""
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG_PATH.with_suffix(f".json.tmp-{secrets.token_hex(4)}")
+    try:
+        tmp.write_text(json.dumps(cfg, indent=2))
+        os.replace(tmp, CONFIG_PATH)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 # Set by the launcher when a project path is passed as a command-line argument.
