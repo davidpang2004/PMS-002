@@ -67,7 +67,7 @@ class AppendQaLogTests(unittest.TestCase):
             entry3 = next(d for d in idx3["docIndex"] if d["id"] == log_id)
             self.assertEqual([r["question"] for r in entry3["aiQaLog"]], ["Q1?", "Q2?"])
 
-            log_files = list(docs_dir.rglob(f"{log_id}__*"))
+            log_files = list(docs_dir.rglob(f"*{log_id}*"))
             self.assertEqual(len(log_files), 1)
             self.assertGreater(len(PdfReader(str(log_files[0])).pages), 0)
 

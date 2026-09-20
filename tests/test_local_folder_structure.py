@@ -71,8 +71,8 @@ class LocalFolderStructureTests(unittest.TestCase):
 
             self.assertEqual(response.status_code, 200)
             self.assertFalse((storage_root / "docs" / "MyPhoto").exists())
-            self.assertFalse((storage_root / "docs" / "New Project" / "DOC-TEST-001__photo.jpg").exists())
-            self.assertTrue((storage_root / "docs" / "New Project" / "2024" / "05" / "DOC-TEST-001__photo.jpg").exists())
+            self.assertFalse((storage_root / "docs" / "New Project" / "photo+DOC-TEST-001.jpg").exists())
+            self.assertTrue((storage_root / "docs" / "New Project" / "2024" / "05" / "photo+DOC-TEST-001.jpg").exists())
 
     def test_post_doc_current_folder_route_keeps_photo_in_selected_folder(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -109,8 +109,8 @@ class LocalFolderStructureTests(unittest.TestCase):
             )
 
             self.assertEqual(response.status_code, 200)
-            self.assertTrue((storage_root / "docs" / "New Project" / "DOC-TEST-002__photo.jpg").exists())
-            self.assertFalse((storage_root / "docs" / "New Project" / "2024" / "05" / "DOC-TEST-002__photo.jpg").exists())
+            self.assertTrue((storage_root / "docs" / "New Project" / "photo+DOC-TEST-002.jpg").exists())
+            self.assertFalse((storage_root / "docs" / "New Project" / "2024" / "05" / "photo+DOC-TEST-002.jpg").exists())
 
 
 if __name__ == "__main__":

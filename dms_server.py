@@ -350,6 +350,56 @@ def _safe_filename_part(name: str) -> str:
     return safe or "file"
 
 
+def _doc_filename(doc_id: str, safe_name: str) -> str:
+    """On-disk filename for a document: "<name>+<DOC-ID>.<ext>" -- the
+    DOC-ID sits at the end (separated by "+"), not the front, so a Finder/
+    Explorer listing of the storage folder sorts and reads by the document's
+    own name first. safe_name must already be sanitized (see
+    _safe_filename_part). Files written before this format existed used
+    "<DOC-ID>__<name>.<ext>" and are never renamed to match -- see
+    _find_doc_files, which locates a document under either layout, so old
+    files keep working forever with no migration."""
+    stem, ext = os.path.splitext(safe_name)
+    return f"{stem}+{doc_id}{ext}"
+
+
+def _find_doc_files(docs_dir: Path, doc_id: str) -> list:
+    """Locate the on-disk file(s) for doc_id. Matches the DOC-ID anywhere in
+    the filename -- this one lookup transparently supports every on-disk
+    layout a document may have been saved under (current "name+DOC-ID.ext"
+    suffix, or the older "DOC-ID__name.ext" prefix), since a DOC-ID is a
+    long, effectively-unique token wherever it appears in the name. See
+    _doc_filename for how new files are named."""
+    return list(docs_dir.rglob(f"*{doc_id}*"))
+
+
+def _doc_display_name_in_use(docs_dir: Path, display_name: str) -> bool:
+    """Whether some on-disk file already carries this exact display name,
+    under either on-disk layout (see _doc_filename / _find_doc_files)."""
+    stem, ext = os.path.splitext(display_name)
+    return bool(
+        list(docs_dir.rglob(f"*__{display_name}"))
+        or list(docs_dir.rglob(f"{stem}+*{ext}"))
+    )
+
+
+def _doc_id_from_filename(name: str) -> str:
+    """Recover the DOC-ID embedded in an on-disk filename, under either
+    layout (see _doc_filename): the current "name+DOC-ID.ext" suffix
+    (DOC-ID is everything after the last "+" in the stem -- display names
+    may themselves contain "+", but a DOC-ID never does, so the *last* one
+    is always the separator) or the older "DOC-ID__name.ext" prefix
+    (DOC-ID is everything before the first "__"). Falls back to the bare
+    stem if neither separator is present."""
+    sep = name.find("__")
+    if sep != -1:
+        return name[:sep]
+    stem = Path(name).stem
+    if "+" in stem:
+        return stem.rsplit("+", 1)[-1]
+    return stem
+
+
 def _safe_folder_name(name: str) -> str:
     """Return a filesystem-safe folder name from a node name (no extension logic)."""
     safe = re.sub(r'[/\\:*?"<>|\x00-\x1f]', '_', name).strip('. ')
@@ -802,9 +852,7 @@ def _sync_doc_files_to_tree_paths(tree: dict | None) -> None:
     for f in docs_dir.rglob("*"):
         if not f.is_file():
             continue
-        name = f.name
-        sep = name.find("__")
-        key = name[:sep] if sep != -1 else f.stem
+        key = _doc_id_from_filename(f.name)
         if key not in file_map:
             file_map[key] = f
 
@@ -1020,7 +1068,7 @@ def _migrate_flat_docs() -> None:
         node_id = entry.get("originalNodeId") or ""
         if not doc_id or not node_id:
             continue
-        match = next((f for f in flat_files if f.name.startswith(f"{doc_id}__")), None)
+        match = next((f for f in flat_files if doc_id in f.name), None)
         if not match:
             continue
         parts = _get_node_path_parts(tree, node_id)
@@ -2472,7 +2520,7 @@ def mobile_upload():
             attach_node_id = node_id
             out_dir = docs_dir
 
-        out_path = out_dir / f"{doc_id}__{safe_name}"
+        out_path = out_dir / _doc_filename(doc_id, safe_name)
         try:
             out_path.write_bytes(data)
         except Exception as _e:
@@ -3059,9 +3107,7 @@ def get_doc(doc_id):
         return jsonify({"error": "Storage path not configured"}), 503
 
     # Search recursively — files may be in per-node subdirectories.
-    matches = list(docs_dir.rglob(f"{doc_id}__*"))
-    if not matches:
-        matches = list(docs_dir.rglob(f"{doc_id}*"))
+    matches = _find_doc_files(docs_dir, doc_id)
     if not matches:
         abort(404)
     file_path = matches[0]
@@ -3300,7 +3346,7 @@ def download_docs_to_folder():
 
     copied, skipped = [], []
     for doc_id in doc_ids:
-        matches = list(docs_dir.rglob(f"{doc_id}__*")) or list(docs_dir.rglob(f"{doc_id}*"))
+        matches = _find_doc_files(docs_dir, doc_id)
         if not matches:
             skipped.append(doc_id)
             continue
@@ -3354,7 +3400,7 @@ def rename_doc_file(doc_id):
     if not new_name:
         return jsonify({"error": "name is required"}), 400
 
-    matches = list(docs_dir.rglob(f"{doc_id}__*")) or list(docs_dir.rglob(f"{doc_id}*"))
+    matches = _find_doc_files(docs_dir, doc_id)
     if not matches:
         return jsonify({"error": "Document file not found"}), 404
     src = matches[0]
@@ -3362,7 +3408,7 @@ def rename_doc_file(doc_id):
     safe_name = _safe_filename_part(new_name)
     if not Path(safe_name).suffix and src.suffix:
         safe_name = f"{safe_name}{src.suffix}"
-    dest = src.parent / f"{doc_id}__{safe_name}"
+    dest = src.parent / _doc_filename(doc_id, safe_name)
 
     if dest != src:
         if dest.exists():
@@ -3494,7 +3540,7 @@ def post_doc():
         photo_year, photo_month, photo_base_node_id,
     )
 
-    out_path = out_dir / f"{doc_id}__{safe_name}"
+    out_path = out_dir / _doc_filename(doc_id, safe_name)
     if file_data is not None:
         out_path.write_bytes(file_data)
     else:
@@ -3635,7 +3681,7 @@ def post_doc_stream():
         photo_year, photo_month, photo_base_node_id,
     )
 
-    out_path = out_dir / f"{doc_id}__{safe_name}"
+    out_path = out_dir / _doc_filename(doc_id, safe_name)
     tmp_path = out_path.with_name(out_path.name + ".part")
     try:
         with open(tmp_path, "wb") as out_fh:
@@ -3682,7 +3728,7 @@ def get_doc_preview(doc_id):
     if "/" in doc_id or "\\" in doc_id or ".." in doc_id:
         return jsonify({"error": "Invalid doc_id"}), 400
 
-    matches = list(docs_dir.rglob(f"{doc_id}__*")) or list(docs_dir.rglob(f"{doc_id}*"))
+    matches = _find_doc_files(docs_dir, doc_id)
     if not matches:
         abort(404)
     file_path = matches[0]
@@ -3731,7 +3777,7 @@ def download_token(token: str):
     docs_dir = get_docs_dir()
     if not docs_dir:
         abort(503)
-    matches = list(docs_dir.rglob(f"{doc_id}__*")) or list(docs_dir.rglob(f"{doc_id}*"))
+    matches = _find_doc_files(docs_dir, doc_id)
     idx = read_index()
     meta = next((d for d in idx.get("docIndex", []) if d.get("id") == doc_id), None)
     if not matches:
@@ -4054,9 +4100,7 @@ def send_email():
     if not meta:
         return jsonify({"error": "Document not found"}), 404
 
-    matches = list(docs_dir.rglob(f"{doc_id}__*"))
-    if not matches:
-        matches = list(docs_dir.rglob(f"{doc_id}*"))
+    matches = _find_doc_files(docs_dir, doc_id)
     if not matches:
         fname = meta.get("name", doc_id) if meta else doc_id
         return jsonify({"error": f"文件不存在：{fname}（可能已从磁盘中删除或移走）"}), 404
@@ -4958,9 +5002,7 @@ def delete_doc(doc_id):
     if not docs_dir:
         return jsonify({"error": "Storage path not configured"}), 503
 
-    matches = list(docs_dir.rglob(f"{doc_id}__*"))
-    if not matches:
-        matches = list(docs_dir.rglob(f"{doc_id}*"))
+    matches = _find_doc_files(docs_dir, doc_id)
     for m in matches:
         try:
             m.unlink()
@@ -5009,9 +5051,7 @@ def open_doc_native(doc_id):
     if not docs_dir:
         return jsonify({"error": "Storage path not configured"}), 503
 
-    matches = list(docs_dir.rglob(f"{doc_id}__*"))
-    if not matches:
-        matches = list(docs_dir.rglob(f"{doc_id}*"))
+    matches = _find_doc_files(docs_dir, doc_id)
     if not matches:
         abort(404)
 
@@ -5069,17 +5109,17 @@ def paste_screenshot():
         out_dir = docs_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Find next available sequence number for this folder prefix
-    existing = list(docs_dir.rglob(f"*__{safe_folder}#*.pdf"))
+    # Find next available sequence number for this folder prefix (a loose
+    # starting count under either on-disk layout -- the while loop below is
+    # what actually guarantees no collision).
+    existing = list(docs_dir.rglob(f"*{safe_folder}#*.pdf"))
     n = len(existing) + 1
     safe_name = f"{safe_folder}#{n:03d}.pdf"
-    while (out_dir / f"{doc_id}__{safe_name}").exists() or any(
-        p.name.endswith(f"__{safe_name}") for p in docs_dir.rglob(f"*__{safe_name}")
-    ):
+    while (out_dir / _doc_filename(doc_id, safe_name)).exists() or _doc_display_name_in_use(docs_dir, safe_name):
         n += 1
         safe_name = f"{safe_folder}#{n:03d}.pdf"
 
-    out_path = out_dir / f"{doc_id}__{safe_name}"
+    out_path = out_dir / _doc_filename(doc_id, safe_name)
     out_path.write_bytes(pdf_bytes)
 
     print(f"[DMS] paste-screenshot → {out_path.name} ({len(pdf_bytes)} bytes)")
@@ -5130,9 +5170,7 @@ def post_doc_ocr(doc_id):
     if "/" in doc_id or "\\" in doc_id or ".." in doc_id:
         return jsonify({"error": "Invalid doc_id"}), 400
 
-    matches = list(docs_dir.rglob(f"{doc_id}__*"))
-    if not matches:
-        matches = list(docs_dir.rglob(f"{doc_id}*"))
+    matches = _find_doc_files(docs_dir, doc_id)
     if not matches:
         return jsonify({"error": "Document not found on disk"}), 404
     file_path = matches[0]
@@ -5354,11 +5392,11 @@ def _append_qa_log(idx: dict, node: dict, target_node_id: str, base_name: str,
 
     if existing_log_entry:
         log_doc_id = existing_log_entry["id"]
-        matches = list(docs_dir.rglob(f"{log_doc_id}__*")) or list(docs_dir.rglob(f"{log_doc_id}*"))
-        log_path = matches[0] if matches else out_dir / f"{log_doc_id}__{_safe_filename_part(log_display_name)}"
+        matches = _find_doc_files(docs_dir, log_doc_id)
+        log_path = matches[0] if matches else out_dir / _doc_filename(log_doc_id, _safe_filename_part(log_display_name))
     else:
         log_doc_id = "DOC-" + datetime.now().strftime("%Y%m%d") + "-" + secrets.token_hex(4).upper()
-        log_path = out_dir / f"{log_doc_id}__{_safe_filename_part(log_display_name)}"
+        log_path = out_dir / _doc_filename(log_doc_id, _safe_filename_part(log_display_name))
 
     log_path.write_bytes(pdf_bytes)
     size = len(pdf_bytes)
@@ -5476,7 +5514,7 @@ def ask_ai():
         mime = (entry.get("mime") or "").lower()
         if mime != "application/pdf" and not mime.startswith("image/"):
             continue
-        matches = list(docs_dir.rglob(f"{entry['id']}__*")) or list(docs_dir.rglob(f"{entry['id']}*"))
+        matches = _find_doc_files(docs_dir, entry['id'])
         if not matches:
             continue
         auto_extract_budget -= 1
@@ -5515,7 +5553,7 @@ def ask_ai():
                 if vision_budget <= 0:
                     break
                 name = (entry.get("name") or "")
-                on_disk = list(docs_dir.rglob(f"{entry['id']}__*")) or list(docs_dir.rglob(f"{entry['id']}*"))
+                on_disk = _find_doc_files(docs_dir, entry['id'])
                 if not on_disk:
                     continue
                 ext = (on_disk[0].suffix or ("." + name.rsplit(".", 1)[-1] if "." in name else "")).lower()
@@ -5892,7 +5930,7 @@ def post_doc_extract_keys_ai(doc_id):
     except Exception:
         return jsonify({"error": "无法读取已保存的 API Key，请重新设置。"}), 400
 
-    matches = list(docs_dir.rglob(f"{doc_id}__*")) or list(docs_dir.rglob(f"{doc_id}*"))
+    matches = _find_doc_files(docs_dir, doc_id)
     if not matches:
         return jsonify({"error": "Document not found on disk"}), 404
 
@@ -5948,7 +5986,7 @@ def post_doc_scan_barcode(doc_id):
                       "然后重启服务器。")
         }), 500
 
-    matches = list(docs_dir.rglob(f"{doc_id}__*")) or list(docs_dir.rglob(f"{doc_id}*"))
+    matches = _find_doc_files(docs_dir, doc_id)
     if not matches:
         return jsonify({"error": "Document not found on disk"}), 404
 
@@ -6027,7 +6065,7 @@ def post_doc_ask(doc_id):
     if not doc_text:
         # No text/metadata yet -- try a one-off OCR pass, same as ask_ai does
         # per-candidate, so a fresh upload can still be asked about.
-        matches = list(docs_dir.rglob(f"{doc_id}__*")) or list(docs_dir.rglob(f"{doc_id}*"))
+        matches = _find_doc_files(docs_dir, doc_id)
         if matches:
             try:
                 import pdf_extraction
@@ -6159,14 +6197,13 @@ def post_doc_save_text_as_doc(doc_id):
             None,
         )
         if existing:
-            matches = (list(docs_dir.rglob(f"{existing['id']}__*"))
-                       or list(docs_dir.rglob(f"{existing['id']}*")))
+            matches = _find_doc_files(docs_dir, existing['id'])
             out_path = matches[0] if matches else None
             if out_path is None:
                 out_dir = _get_node_docs_dir(
                     existing.get("originalNodeId") or target_node_id, tree) or docs_dir
                 out_dir.mkdir(parents=True, exist_ok=True)
-                out_path = out_dir / f"{existing['id']}__{_safe_filename_part(existing.get('name') or display_name)}"
+                out_path = out_dir / _doc_filename(existing['id'], _safe_filename_part(existing.get('name') or display_name))
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_bytes(file_bytes)
             existing["size"] = len(file_bytes)
@@ -6194,7 +6231,7 @@ def post_doc_save_text_as_doc(doc_id):
     new_doc_id = "DOC-" + datetime.now().strftime("%Y%m%d") + "-" + secrets.token_hex(4).upper()
     out_dir = _get_node_docs_dir(target_node_id, tree) or docs_dir
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{new_doc_id}__{_safe_filename_part(display_name)}"
+    out_path = out_dir / _doc_filename(new_doc_id, _safe_filename_part(display_name))
     out_path.write_bytes(file_bytes)
 
     doc_index.append({
@@ -6261,14 +6298,13 @@ def _save_or_update_node_derived_doc(idx: dict, tree: dict, target_node_id: str,
             None,
         )
         if existing:
-            matches = (list(docs_dir.rglob(f"{existing['id']}__*"))
-                       or list(docs_dir.rglob(f"{existing['id']}*")))
+            matches = _find_doc_files(docs_dir, existing['id'])
             out_path = matches[0] if matches else None
             if out_path is None:
                 out_dir = _get_node_docs_dir(
                     existing.get("originalNodeId") or target_node_id, tree) or docs_dir
                 out_dir.mkdir(parents=True, exist_ok=True)
-                out_path = out_dir / f"{existing['id']}__{_safe_filename_part(existing.get('name') or display_name)}"
+                out_path = out_dir / _doc_filename(existing['id'], _safe_filename_part(existing.get('name') or display_name))
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_bytes(file_bytes)
             existing["size"] = len(file_bytes)
@@ -6294,7 +6330,7 @@ def _save_or_update_node_derived_doc(idx: dict, tree: dict, target_node_id: str,
     new_doc_id = "DOC-" + datetime.now().strftime("%Y%m%d") + "-" + secrets.token_hex(4).upper()
     out_dir = _get_node_docs_dir(target_node_id, tree) or docs_dir
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{new_doc_id}__{_safe_filename_part(display_name)}"
+    out_path = out_dir / _doc_filename(new_doc_id, _safe_filename_part(display_name))
     out_path.write_bytes(file_bytes)
 
     entry = {
@@ -6483,7 +6519,7 @@ def post_doc_extract_keys(doc_id):
         text = supplied_text
         info = {"method": "supplied", "used_ocr": False}
     else:
-        matches = list(docs_dir.rglob(f"{doc_id}__*")) or list(docs_dir.rglob(f"{doc_id}*"))
+        matches = _find_doc_files(docs_dir, doc_id)
         if not matches:
             return jsonify({"error": "Document not found on disk"}), 404
         force_ocr = bool(payload.get("force_ocr"))
@@ -6840,7 +6876,7 @@ def combine_to_folder():
         display_name += ".pdf"
     safe_fn = _safe_filename_part(display_name)
     out_dir = _get_node_docs_dir(node_id, tree) or docs_dir
-    out_path = out_dir / f"{new_doc_id}__{safe_fn}"
+    out_path = out_dir / _doc_filename(new_doc_id, safe_fn)
     out_path.write_bytes(pdf_bytes)
 
     # Add the new combined doc to docIndex
@@ -6887,7 +6923,7 @@ def combine_to_folder():
             recycle_folder.mkdir(parents=True, exist_ok=True)
 
         for doc_id in unlinked_doc_ids:
-            matches = list(docs_dir.rglob(f"{doc_id}__*")) or list(docs_dir.rglob(f"{doc_id}*"))
+            matches = _find_doc_files(docs_dir, doc_id)
             if not matches or not recycle_folder:
                 continue
             dest = recycle_folder / matches[0].name
@@ -6933,6 +6969,180 @@ def combine_to_folder():
         "name": display_name,
         "size": len(pdf_bytes),
     })
+
+
+# ---- Convert documents to individual PDFs, in place -------------------------
+@app.route("/api/docs/convert-to-pdf", methods=["POST"])
+def convert_to_pdf():
+    """
+    Convert each selected document into its own standalone PDF (no merging,
+    no renaming beyond swapping the extension) and move the original files
+    into the recycle bin ("Not Show in Tree" / "Deleted files"), same as
+    the per-node soft-delete used elsewhere.
+
+    Unlike /api/docs/combine-to-folder, each converted PDF is placed back
+    into whichever folder its source document came from (selection can span
+    multiple folders) rather than into one target node, and there's no
+    single "title" -- every output keeps the source file's own base name.
+
+    Request JSON:
+      { "selection": [{nodeId, docIds}] }   // same format as combine-to-folder
+
+    Response: { "ok": true, "converted": [{doc_id, name, size}], "skipped": [{name, reason}] }
+    """
+    if not get_storage_root():
+        return jsonify({"error": "Storage path not configured"}), 503
+
+    data = request.get_json(force=True) or {}
+    selection = data.get("selection") or []
+    if not selection:
+        return jsonify({"error": "No documents selected"}), 400
+
+    docs_dir = get_docs_dir()
+    idx = read_index()
+    tree = idx.get("tree")
+    docs_by_id = {d["id"]: d for d in idx.get("docIndex", [])}
+
+    from databook import build_convert_to_pdf_bytes, _doc_path, _exif_datetime_original
+
+    converted = []
+    skipped = []
+    to_unlink: dict[str, set] = {}          # nodeId -> {source doc ids to remove}
+    new_docs_by_node: dict[str, list] = {}  # nodeId -> [new doc entries to add]
+
+    for entry in selection:
+        node_id = (entry.get("nodeId") or "").strip()
+        doc_ids = entry.get("docIds") or []
+        if not node_id or not doc_ids:
+            continue
+        out_dir = _get_node_docs_dir(node_id, tree) or docs_dir
+
+        for doc_id in doc_ids:
+            doc = docs_by_id.get(doc_id)
+            if not doc:
+                continue
+            name = doc.get("name") or doc_id
+            doc_path = _doc_path(docs_dir, doc_id)
+            if doc_path is None:
+                skipped.append({"name": name, "reason": "File not found on disk"})
+                continue
+
+            mime = (doc.get("mime") or "").lower()
+            ext = (doc_path.suffix or Path(name).suffix).lower().lstrip(".")
+            is_pdf = mime == "application/pdf" or (not mime.startswith("image/") and ext == "pdf")
+            if is_pdf:
+                skipped.append({"name": name, "reason": "Already a PDF"})
+                continue
+
+            try:
+                pdf_bytes = build_convert_to_pdf_bytes(doc_path, mime, name)
+            except ValueError as e:
+                skipped.append({"name": name, "reason": str(e)})
+                continue
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                skipped.append({"name": name, "reason": f"Conversion failed: {e}"})
+                continue
+
+            new_doc_id = "DOC-" + datetime.now().strftime("%Y%m%d") + "-" + secrets.token_hex(4).upper()
+            stem = Path(name).stem
+            doc_date = (doc.get("docDate") or "").strip()
+            is_photo_ext = mime.startswith("image/") or ext in {"jpg", "jpeg", "png", "tif", "tiff", "heic", "heif"}
+            if not doc_date and is_photo_ext:
+                # docDate is only populated when DMS recognized a date in the
+                # document's own text (see _scan_uploaded_doc_date) -- plain
+                # photos rarely have one, so fall back to the camera's own
+                # EXIF "date taken" before giving up on a date prefix.
+                try:
+                    doc_date = (_exif_datetime_original(doc_path) or "")[:10]
+                except Exception:
+                    doc_date = ""
+            # Prefix with the document's own date (docDate, or EXIF for
+            # photos) so converted files sort/read chronologically, unless
+            # the source name is already dated that way.
+            if doc_date and not stem.startswith(doc_date):
+                display_name = f"{doc_date}-{stem}.pdf"
+            else:
+                display_name = f"{stem}.pdf"
+            safe_fn = _safe_filename_part(display_name)
+            out_path = out_dir / _doc_filename(new_doc_id, safe_fn)
+            out_path.write_bytes(pdf_bytes)
+
+            new_doc = {
+                "id": new_doc_id,
+                "name": display_name,
+                "mime": "application/pdf",
+                "size": len(pdf_bytes),
+                "uploadedAt": datetime.utcnow().isoformat() + "Z",
+                "originalNodeId": node_id,
+                "metadata": {},
+            }
+            idx.setdefault("docIndex", []).append(new_doc)
+            docs_by_id[new_doc_id] = new_doc
+            new_docs_by_node.setdefault(node_id, []).append(new_doc_id)
+            to_unlink.setdefault(node_id, set()).add(doc_id)
+            converted.append({"doc_id": new_doc_id, "name": display_name, "size": len(pdf_bytes)})
+
+    unlinked_doc_ids = {d for ids in to_unlink.values() for d in ids}
+
+    # Move the now-converted original files into the recycle bin, exactly
+    # like combine_to_folder's soft-delete -- on disk and in the tree/docIndex.
+    not_show_id = None
+    if tree and unlinked_doc_ids:
+        for child in (tree.get("children") or []):
+            if child.get("name") == NOT_SHOW_FOLDER_NAME:
+                not_show_id = child["id"]
+                break
+        if not_show_id is None:
+            not_show_id = f"NODE-{secrets.token_hex(4).upper()}"
+            tree.setdefault("children", []).append(
+                {"id": not_show_id, "name": NOT_SHOW_FOLDER_NAME, "children": [], "documents": []}
+            )
+
+        recycle_folder = _get_node_docs_dir(not_show_id, tree)
+        if recycle_folder:
+            recycle_folder.mkdir(parents=True, exist_ok=True)
+
+        for doc_id in unlinked_doc_ids:
+            matches = _find_doc_files(docs_dir, doc_id)
+            if not matches or not recycle_folder:
+                continue
+            dest = recycle_folder / matches[0].name
+            if dest.exists():
+                continue
+            try:
+                shutil.move(str(matches[0]), str(dest))
+            except OSError as e:
+                print(f"[DMS] Warning: could not move {doc_id} to recycle bin: {e}")
+
+        for d in idx.get("docIndex", []):
+            if d.get("id") in unlinked_doc_ids:
+                d["originalNodeId"] = not_show_id
+
+    def _update_node(node):
+        nid = node.get("id", "")
+        if nid in to_unlink:
+            node["documents"] = [
+                d for d in (node.get("documents") or [])
+                if d.get("id") not in to_unlink[nid]
+            ]
+        for new_id in new_docs_by_node.get(nid, []):
+            node.setdefault("documents", []).append({"id": new_id})
+        if not_show_id and nid == not_show_id:
+            existing = {d.get("id") for d in (node.get("documents") or [])}
+            node.setdefault("documents", []).extend(
+                {"id": d} for d in unlinked_doc_ids if d not in existing
+            )
+        for child in (node.get("children") or []):
+            _update_node(child)
+
+    if tree:
+        _update_node(tree)
+
+    write_index(idx)
+
+    return jsonify({"ok": True, "converted": converted, "skipped": skipped})
 
 
 # ---- Plot snapshot Excel export --------------------------------------------
@@ -7040,7 +7250,7 @@ def plot_snapshot():
         d = by_id.get(ref.get("id"))
         if d and (d.get("name") or "").lower() == display_name.lower():
             existing_doc_id = d["id"]
-            matches = list(docs_dir.rglob(f"{existing_doc_id}__*")) or list(docs_dir.rglob(f"{existing_doc_id}*"))
+            matches = _find_doc_files(docs_dir, existing_doc_id)
             existing_path = matches[0] if matches else None
             break
 
@@ -7062,7 +7272,7 @@ def plot_snapshot():
         doc_id, out_path = existing_doc_id, existing_path
     else:
         doc_id = "DOC-" + datetime.now().strftime("%Y%m%d") + "-" + secrets.token_hex(4).upper()
-        out_path = out_dir / f"{doc_id}__{_safe_filename_part(display_name)}"
+        out_path = out_dir / _doc_filename(doc_id, _safe_filename_part(display_name))
 
     _write_xlsx_rows(out_path, rows)
     size = out_path.stat().st_size
@@ -7445,15 +7655,17 @@ def export_project_selected():
     filtered_idx = dict(idx)
     filtered_idx["docIndex"] = included_docs
 
-    # Build a map from doc_id → file path by scanning docs/
+    # Build a map from doc_id → file path (see _find_doc_files -- this
+    # matches the DOC-ID anywhere in the name, so it finds files under
+    # either on-disk layout rather than assuming it's a "__"-separated
+    # prefix, which isn't true of newer suffix-named files).
     docs_dir = root / "docs"
     doc_file_map: dict[str, Path] = {}
     if docs_dir.exists():
-        for fpath in docs_dir.rglob("*"):
-            if fpath.is_file():
-                doc_id = fpath.name.split("__")[0]
-                if doc_id in included_doc_ids:
-                    doc_file_map[doc_id] = fpath
+        for doc_id in included_doc_ids:
+            matches = _find_doc_files(docs_dir, doc_id)
+            if matches:
+                doc_file_map[doc_id] = matches[0]
 
     filename = _dms_backup_filename(root, "PART")
     out_path = root / filename
@@ -8066,7 +8278,7 @@ def import_zip_docs():
                 out_dir = _get_node_docs_dir(node["id"], idx.get("tree")) or docs_dir
                 target_node = node
 
-                out_path = out_dir / f"{doc_id}__{safe_name}"
+                out_path = out_dir / _doc_filename(doc_id, safe_name)
                 out_path.write_bytes(data)
 
                 target_node.setdefault("documents", []).append({"id": doc_id})
@@ -8299,9 +8511,7 @@ def _resolve_photo_path(doc_id: str):
     docs_dir = get_docs_dir()
     if not docs_dir:
         return None
-    matches = list(docs_dir.rglob(f"{doc_id}__*"))
-    if not matches:
-        matches = list(docs_dir.rglob(f"{doc_id}*"))
+    matches = _find_doc_files(docs_dir, doc_id)
     return matches[0] if matches else None
 
 

@@ -501,7 +501,10 @@ const buildTreeText = (root, { showMeta = false } = {}) => {
 const readPhotoDate = async (file) => {
   const fallback = (lat = null, lon = null) => {
     const d = new Date(file.lastModified);
-    return { year: String(d.getFullYear()), month: String(d.getMonth() + 1).padStart(2, "0"), lat, lon };
+    return {
+      year: String(d.getFullYear()), month: String(d.getMonth() + 1).padStart(2, "0"),
+      day: String(d.getDate()).padStart(2, "0"), lat, lon,
+    };
   };
   const _ext = file.name.split(".").pop().toLowerCase();
   const _isJpegLike = file.type.startsWith("image/jpeg") || file.type.startsWith("image/tiff") ||
@@ -527,7 +530,8 @@ const readPhotoDate = async (file) => {
         const readDate = (off) => {
           if (tiff + off + 19 > buf.byteLength) return null;
           const s = new TextDecoder("ascii").decode(new Uint8Array(buf, tiff + off, 19));
-          return /^\d{4}:\d{2}/.test(s) ? { year: s.slice(0, 4), month: s.slice(5, 7) } : null;
+          return /^\d{4}:\d{2}:\d{2}/.test(s)
+            ? { year: s.slice(0, 4), month: s.slice(5, 7), day: s.slice(8, 10) } : null;
         };
         const readRational3 = (off) => {
           if (tiff + off + 24 > buf.byteLength) return null;
@@ -599,7 +603,10 @@ const readPhotoDate = async (file) => {
 const readVideoDate = async (file) => {
   const fallback = () => {
     const d = new Date(file.lastModified);
-    return { year: String(d.getFullYear()), month: String(d.getMonth() + 1).padStart(2, "0"), lat: null, lon: null };
+    return {
+      year: String(d.getFullYear()), month: String(d.getMonth() + 1).padStart(2, "0"),
+      day: String(d.getDate()).padStart(2, "0"), lat: null, lon: null,
+    };
   };
   const _ext = file.name.split(".").pop().toLowerCase();
   const _isIsoBmff = file.type === "video/mp4" || file.type === "video/quicktime" ||
@@ -656,7 +663,10 @@ const readVideoDate = async (file) => {
     const unixSeconds = creationTime - 2082844800;
     if (!creationTime || unixSeconds < 0 || unixSeconds > Date.now() / 1000 + 86400) return fallback();
     const d = new Date(unixSeconds * 1000);
-    return { year: String(d.getFullYear()), month: String(d.getMonth() + 1).padStart(2, "0"), lat: null, lon: null };
+    return {
+      year: String(d.getFullYear()), month: String(d.getMonth() + 1).padStart(2, "0"),
+      day: String(d.getDate()).padStart(2, "0"), lat: null, lon: null,
+    };
   } catch (e) {
     console.warn("[DMS] mvhd parse failed, falling back to file date:", e);
     return fallback();
@@ -4593,6 +4603,13 @@ const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree,
   const { t } = useLang();
   const [q, setQ] = useState("");
   const [showUnref, setShowUnref] = useState(false);
+  // How multi-word keyword queries combine:
+  // - "and": every word must appear somewhere in the document (default,
+  //   original behavior).
+  // - "or": any one of the words is enough.
+  // - "phrase": the whole query must appear verbatim, as typed (a sentence
+  //   search) -- words are not split at all.
+  const [matchMode, setMatchMode] = useState("and");
   // Folder to restrict search/AI Q&A to (null = whole project). Seeded from
   // whichever folder is currently open in the main tree, so opening Search
   // starts scoped to where you already are; the folder-tree picker below
@@ -4666,11 +4683,12 @@ const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree,
   }, [scopeNode]);
 
   const results = useMemo(() => {
-    const words = q.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    const trimmed = q.trim().toLowerCase();
+    const words = trimmed.split(/\s+/).filter(Boolean);
     let pool = index;
     if (scopeDocIdSet) pool = pool.filter((d) => scopeDocIdSet.has(d.id));
     if (showUnref) pool = pool.filter((d) => !(refMap.get(d.id)?.length));
-    if (!words.length) return pool;
+    if (!trimmed) return pool;
     return pool.filter((entry) => {
       const haystack = [
         entry.id,
@@ -4684,9 +4702,40 @@ const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree,
           return String(v);
         }),
       ].join(" ").toLowerCase();
+      if (matchMode === "phrase") return haystack.includes(trimmed);
+      if (matchMode === "or") return words.some((w) => haystack.includes(w));
       return words.every((w) => haystack.includes(w));
     });
-  }, [q, index, refMap, showUnref, scopeDocIdSet]);
+  }, [q, index, refMap, showUnref, scopeDocIdSet, matchMode]);
+
+  // Folders (within the current scope, or the whole tree if unscoped) whose
+  // own name matches the query -- shown as its own section above the
+  // document results so a folder can be found by name, not just by
+  // documents inside it. Clicking a match jumps straight to it in the Tree
+  // tab via onJumpToNode (the same expandToNode used for a document's
+  // folder reference, which works for any node id).
+  const scopeFolders = useMemo(() => {
+    const list = [];
+    const walk = (node) => {
+      if (!node) return;
+      list.push(node);
+      for (const c of node.children || []) walk(c);
+    };
+    walk(scopeNode || tree);
+    return list;
+  }, [tree, scopeNode]);
+
+  const folderMatches = useMemo(() => {
+    const trimmed = q.trim().toLowerCase();
+    if (!trimmed) return [];
+    const words = trimmed.split(/\s+/).filter(Boolean);
+    return scopeFolders.filter((node) => {
+      const name = (node.name || "").toLowerCase();
+      if (matchMode === "phrase") return name.includes(trimmed);
+      if (matchMode === "or") return words.some((w) => name.includes(w));
+      return words.every((w) => name.includes(w));
+    });
+  }, [q, scopeFolders, matchMode]);
 
   const unrefCount = useMemo(
     () => index.filter((d) => !(refMap.get(d.id)?.length)).length,
@@ -4845,9 +4894,36 @@ const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree,
           type="text"
           value={q}
           onChange={(e) => setQ(e.target.value)}
-          placeholder={t("按编号、名称、描述或元数据搜索…", "Search by number, name, description, or metadata…")}
+          placeholder={matchMode === "phrase"
+            ? t("输入完整句子，按原样精确匹配…", "Type a full sentence to match verbatim…")
+            : t("按编号、名称、描述或元数据搜索，多个词用空格分隔…", "Search by number, name, description, or metadata — separate words with spaces…")}
           className="w-full pl-8 pr-3 py-1.5 text-sm border border-stone-300 rounded focus:outline-none focus:border-amber-600"
         />
+      </div>
+      <div className="flex items-center gap-1.5 text-[12px]">
+        <span className="text-stone-700">{t("多词匹配：", "Multi-word match:")}</span>
+        <div className="flex rounded overflow-hidden border border-stone-300">
+          {[
+            ["and", t("全部包含 (AND)", "All words (AND)")],
+            ["or", t("任一包含 (OR)", "Any word (OR)")],
+            ["phrase", t("整句匹配", "Whole sentence")],
+          ].map(([mode, label]) => (
+            <button
+              key={mode}
+              onClick={() => setMatchMode(mode)}
+              title={mode === "phrase"
+                ? t("将输入框中的全部文字作为一句话精确匹配", "Match the entire text in the box verbatim, as one phrase")
+                : mode === "and"
+                ? t("文档需同时包含所有词才算匹配", "A document must contain every word to match")
+                : t("文档包含任意一个词即算匹配", "A document matches if it contains any one word")}
+              className={"px-2 py-1 " + (matchMode === mode
+                ? "bg-stone-700 text-white"
+                : "bg-white text-stone-700 hover:bg-stone-100") + (mode !== "and" ? " border-l border-stone-300" : "")}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
       </div>
       <div className="flex items-center justify-between">
         <label className="flex items-center gap-1.5 text-[13px] text-stone-700 cursor-pointer">
@@ -4869,6 +4945,25 @@ const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree,
             : t(`共 ${results.length} 份文档`, `${results.length} documents total`)}
         </span>
       </div>
+      {folderMatches.length > 0 && (
+        <div className="space-y-1">
+          <div className="text-[12px] uppercase tracking-wider text-stone-700">
+            {t("匹配的文件夹（点击跳转）", "Matching folders (click to jump)")}
+          </div>
+          {folderMatches.map((node) => (
+            <div
+              key={node.id}
+              className="border border-amber-300 bg-amber-50 rounded p-2 text-sm hover:bg-amber-100 cursor-pointer flex items-center gap-1.5"
+              title={t("点击跳转到该文件夹", "Click to jump to this folder")}
+              onClick={() => onJumpToNode(node.id)}
+            >
+              <Folder size={12} className="text-amber-700 shrink-0" />
+              <span className="font-medium text-stone-800 truncate">{node.name}</span>
+              <span className="text-[12px] text-stone-600 truncate ml-auto">{getPathFor(node.id)}</span>
+            </div>
+          ))}
+        </div>
+      )}
       <div className="space-y-1 max-h-[60vh] overflow-auto">
         {results.map((r) => {
           const refs = refMap.get(r.id) || [];
@@ -8030,6 +8125,224 @@ const CombineFolderModal = ({ node, docIndex, formatBytes, onClose, onSaved }) =
 };
 
 
+/* =============================================================================
+ * UI: CONVERT TO PDF MODAL
+ * =============================================================================
+ */
+const ConvertToPdfModal = ({ node, docIndex, formatBytes, onClose, onSaved }) => {
+  const { t } = useLang();
+  const [includeSubfolders, setIncludeSubfolders] = useState(false);
+  const [selectedKeys, setSelectedKeys] = useState(new Set());
+  const [generating, setGenerating] = useState(false);
+  const [error, setError] = useState(null);
+  const [result, setResult] = useState(null); // { converted, skipped } after a run
+
+  const docsById = useMemo(() => new Map(docIndex.map((d) => [d.id, d])), [docIndex]);
+
+  const docEntries = useMemo(() => {
+    const entries = [];
+    for (const d of (node.documents || [])) {
+      entries.push({ nodeId: node.id, docId: d.id, nodeName: node.name });
+    }
+    if (includeSubfolders) {
+      const walkChildren = (n) => {
+        for (const child of (n.children || [])) {
+          for (const d of (child.documents || [])) {
+            entries.push({ nodeId: child.id, docId: d.id, nodeName: child.name });
+          }
+          walkChildren(child);
+        }
+      };
+      walkChildren(node);
+    }
+    return entries;
+  }, [node, includeSubfolders]);
+
+  useEffect(() => {
+    setSelectedKeys(new Set(docEntries.map((e) => e.nodeId + ":" + e.docId)));
+  }, [docEntries]);
+
+  const toggle = (nodeId, docId) => {
+    const k = nodeId + ":" + docId;
+    setSelectedKeys((prev) => {
+      const n = new Set(prev);
+      if (n.has(k)) n.delete(k); else n.add(k);
+      return n;
+    });
+  };
+
+  const convert = async () => {
+    setError(null);
+    setResult(null);
+    setGenerating(true);
+    try {
+      const nodeDocMap = new Map();
+      for (const e of docEntries) {
+        if (selectedKeys.has(e.nodeId + ":" + e.docId)) {
+          if (!nodeDocMap.has(e.nodeId)) nodeDocMap.set(e.nodeId, []);
+          nodeDocMap.get(e.nodeId).push(e.docId);
+        }
+      }
+      const selection = Array.from(nodeDocMap.entries()).map(([nodeId, docIds]) => ({ nodeId, docIds }));
+      if (!selection.length) { setError(t("请至少选择一份文档", "Select at least one document")); setGenerating(false); return; }
+
+      const res = await fetch("/api/docs/convert-to-pdf", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ selection }),
+      });
+      if (!res.ok) {
+        let msg = `HTTP ${res.status}`;
+        try { msg = (await res.json()).error || msg; } catch {}
+        throw new Error(msg);
+      }
+      const data = await res.json();
+      setResult({ converted: data.converted || [], skipped: data.skipped || [] });
+      await onSaved();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setGenerating(false);
+    }
+  };
+
+  return (
+    <div
+      className="fixed inset-0 bg-stone-900/70 z-50 flex items-center justify-center p-4"
+      onClick={() => !generating && onClose()}
+    >
+      <div
+        className="bg-white w-full max-w-lg rounded shadow-2xl flex flex-col max-h-[88vh]"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* Header */}
+        <div className="flex items-center justify-between px-5 pt-5 pb-3 border-b border-stone-200">
+          <div>
+            <div className="text-[12px] tracking-[0.2em] uppercase text-stone-700 mb-0.5">{t("转换为 PDF", "Convert to PDF")}</div>
+            <h2 className="text-lg font-semibold text-stone-900">{node.name}</h2>
+          </div>
+          <button onClick={onClose} disabled={generating} className="text-stone-600 hover:text-stone-700 p-1">
+            <X size={16} />
+          </button>
+        </div>
+
+        {/* Options */}
+        <div className="px-5 py-3 border-b border-stone-200">
+          <label className="flex items-center gap-2 text-base text-stone-700 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={includeSubfolders}
+              onChange={(e) => setIncludeSubfolders(e.target.checked)}
+              className="accent-amber-600"
+            />
+            {t("包含子文件夹中的文档", "Include documents in subfolders")}
+          </label>
+        </div>
+
+        {/* Document list */}
+        <div className="flex-1 overflow-auto px-5 py-2">
+          {docEntries.length === 0 ? (
+            <div className="text-base text-stone-700 py-6 text-center">
+              {includeSubfolders ? t("此文件夹及子文件夹中暂无文档", "No documents in this folder or its subfolders") : t("此文件夹中暂无文档", "No documents in this folder")}
+            </div>
+          ) : (
+            <>
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-[13px] text-stone-700">
+                  {t("已选", "Selected")} <span className="font-mono tabular-nums">{selectedKeys.size}</span> / {docEntries.length} {t("份", "")}
+                </span>
+                <div className="flex gap-3">
+                  <button
+                    onClick={() => setSelectedKeys(new Set(docEntries.map((e) => e.nodeId + ":" + e.docId)))}
+                    className="text-[13px] text-amber-700 hover:text-amber-900"
+                  >{t("全选", "Select all")}</button>
+                  <button
+                    onClick={() => setSelectedKeys(new Set())}
+                    className="text-[13px] text-stone-700 hover:text-stone-700"
+                  >{t("清除", "Clear")}</button>
+                </div>
+              </div>
+              <div className="space-y-0.5">
+                {docEntries.map((entry) => {
+                  const doc = docsById.get(entry.docId);
+                  const k = entry.nodeId + ":" + entry.docId;
+                  const checked = selectedKeys.has(k);
+                  return (
+                    <div
+                      key={k}
+                      onClick={() => toggle(entry.nodeId, entry.docId)}
+                      className={`flex items-center gap-2 px-2 py-1.5 rounded cursor-pointer text-base ${checked ? "bg-amber-50" : "hover:bg-stone-50"}`}
+                    >
+                      <span className="shrink-0">
+                        {checked
+                          ? <CheckSquare size={13} className="text-amber-700" />
+                          : <Square size={13} className="text-stone-600" />}
+                      </span>
+                      {doc?.mime?.startsWith("image/")
+                        ? <ImageIcon size={12} className="text-stone-600 shrink-0" />
+                        : <FileText size={12} className="text-stone-600 shrink-0" />}
+                      <span className="truncate flex-1 text-stone-700">{doc?.name || entry.docId}</span>
+                      {includeSubfolders && entry.nodeName !== node.name && (
+                        <span className="text-[12px] text-stone-600 shrink-0 italic">{entry.nodeName}</span>
+                      )}
+                      {doc && (
+                        <span className="text-[12px] text-stone-600 shrink-0 font-mono">{formatBytes(doc.size)}</span>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </>
+          )}
+        </div>
+
+        {/* Footer */}
+        <div className="px-5 py-4 border-t border-stone-200">
+          {error && (
+            <div className="text-sm text-red-600 bg-red-50 border border-red-200 rounded px-3 py-2 mb-3">{error}</div>
+          )}
+          {result && (
+            <div className="text-sm bg-stone-50 border border-stone-200 rounded px-3 py-2 mb-3 space-y-1">
+              <div className="text-stone-700">
+                {t(`已转换 ${result.converted.length} 份文档为 PDF`, `Converted ${result.converted.length} document(s) to PDF`)}
+              </div>
+              {result.skipped.length > 0 && (
+                <div className="text-amber-700">
+                  {t(`跳过 ${result.skipped.length} 份：`, `Skipped ${result.skipped.length}:`)}{" "}
+                  {result.skipped.map((s) => `${s.name} (${s.reason})`).join("; ")}
+                </div>
+              )}
+            </div>
+          )}
+          {!result ? (
+            <>
+              <button
+                onClick={convert}
+                disabled={generating || selectedKeys.size === 0}
+                className="w-full px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white text-base font-medium rounded disabled:opacity-40 flex items-center justify-center gap-2"
+              >
+                {generating ? <Loader size={14} className="animate-spin" /> : <FileText size={14} />}
+                {generating ? t("转换中…", "Converting…") : t(`将 ${selectedKeys.size} 份文档转换为 PDF`, `Convert ${selectedKeys.size} document(s) to PDF`)}
+              </button>
+              <p className="text-[12px] text-stone-700 text-center mt-1.5">
+                {t("每份文档单独转换为 PDF（若有日期则以“YYYY-MM-DD-”开头），原始文件移至「已删除文件」", "Each document is converted to its own PDF, named with a “YYYY-MM-DD-” date prefix when one is known; the originals are moved to “Deleted files”")}
+              </p>
+            </>
+          ) : (
+            <button
+              onClick={onClose}
+              className="w-full px-4 py-2 bg-stone-700 hover:bg-stone-800 text-white text-base font-medium rounded"
+            >
+              {t("完成", "Done")}
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+
 const SendToPhoneDialog = ({ doc, onClose }) => {
   const { t } = useLang();
   const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform);
@@ -9488,20 +9801,24 @@ const DocumentCard = ({
 
   return (
     <div
-      draggable={!faceSelectMode && !selectMode}
+      draggable={!faceSelectMode && (!selectMode || isChecked)}
       onDragStart={(e) => {
-        if (faceSelectMode || selectMode) return;
+        if (faceSelectMode || (selectMode && !isChecked)) return;
         e.stopPropagation();
         e.dataTransfer.effectAllowed = "move";
         // Custom MIME type marks this as an internal document drag so
         // folder tree nodes can tell it apart from OS file drops and
         // from folder-reorder drags (both use different data shapes).
+        // The actual doc id(s) being moved are tracked separately (via
+        // onDragStart's own closure, which knows the full selection when
+        // several checkboxes are checked) -- dataTransfer here only needs
+        // to carry the marker plus this card's own id as a fallback.
         e.dataTransfer.setData("application/x-dms-doc", doc.id);
         e.dataTransfer.setData("text/plain", doc.id);
         onDragStart && onDragStart();
       }}
       onDragEnd={() => onDragEnd && onDragEnd()}
-      title={showCheckbox ? undefined : t("拖拽到左侧文件夹树可移动此文档", "Drag onto a folder in the tree to move this document there")}
+      title={showCheckbox ? (isChecked ? t("拖拽到左侧文件夹树可移动所有已勾选的文档", "Drag onto a folder in the tree to move all checked documents there") : undefined) : t("拖拽到左侧文件夹树可移动此文档", "Drag onto a folder in the tree to move this document there")}
       className={`border rounded bg-white transition-opacity ${
         isDragging ? "opacity-40" :
         isEditing ? "border-indigo-400 bg-indigo-50/60 ring-1 ring-indigo-300" :
@@ -14600,22 +14917,32 @@ function DMS({ storagePath, onChangeFolder }) {
   const [showEmailSettings, setShowEmailSettings] = useState(false);
   const [showAISettings, setShowAISettings] = useState(false);
   const [showCombineModal, setShowCombineModal] = useState(false);
+  const [showConvertToPdfModal, setShowConvertToPdfModal] = useState(false);
   const [keyParameters, setKeyParameters] = useState(DEFAULT_KEY_PARAMETERS);
   const ctxUploadInputRef = useRef(null);
   const ctxUploadTargetRef = useRef(null);
   const [folderPickerOpen, setFolderPickerOpen] = useState(false);
   const [pendingFolderFiles, setPendingFolderFiles] = useState([]); // [{folderName, files}]
-  // When checked in the "Upload folder" dialog: recreate each source
-  // folder's subfolders as real DMS folders (no date-based routing) instead
-  // of the default flat/year-month placement.
-  const [mirrorSubfolders, setMirrorSubfolders] = useState(false);
-  // When checked in the "Upload folder" dialog: reproduce each picked
-  // folder verbatim under the current node — the picked folder itself
-  // becomes a new child folder, and every subfolder and file inside it is
-  // recreated at the same relative path. The matching directories are
-  // created on the local drive by the server's PUT /api/tree handler (see
-  // _create_local_folder_structure); the files upload into them normally.
-  const [keepSourceTree, setKeepSourceTree] = useState(false);
+  // Which of the three placement modes the "Upload folder" dialog uses:
+  // - "year-month" (default): every file across every picked folder and
+  //   subfolder is routed by its date into year/month folders under the
+  //   current node (creating them if missing) — no source folder structure
+  //   is kept.
+  // - "mirror": recreate each source folder's subfolders as real DMS
+  //   folders (no date-based routing) instead of year/month placement.
+  // - "keep-tree": reproduce each picked folder verbatim under the current
+  //   node — the picked folder itself becomes a new child folder, and every
+  //   subfolder and file inside it is recreated at the same relative path.
+  //   The matching directories are created on the local drive by the
+  //   server's PUT /api/tree handler (see _create_local_folder_structure);
+  //   the files upload into them normally.
+  const [folderUploadMode, setFolderUploadMode] = useState("year-month");
+  // Optional text the "Upload folder" dialog inserts into every uploaded
+  // file's name: right after the auto date prefix when one applies (see
+  // uploadFilesToNode), or at the very front of the name when it doesn't.
+  // Empty by default -- names are left exactly as today's behavior produces
+  // them unless the user opts in.
+  const [folderUploadExtraText, setFolderUploadExtraText] = useState("");
   const multiFolderInputRef = useRef(null);
   const [draggingId, setDraggingId] = useState(null);
   const [dropInfo, setDropInfo] = useState(null);
@@ -15182,7 +15509,7 @@ function DMS({ storagePath, onChangeFolder }) {
     // snapshot from before those folders existed, so its diff-and-merge
     // step at the end would never find them and any doc references
     // pointed at them would silently vanish instead of attaching.
-    { skipDuplicates = false, routeMode = "year-month", baseTreeOverride = null } = {}
+    { skipDuplicates = false, routeMode = "year-month", baseTreeOverride = null, extraText = "" } = {}
   ) => {
     console.log(`[DMS] uploadFilesToNode called, target=${targetNodeId}, files=${files.length}, mode=${routeMode}`);
     if (!files.length) return;
@@ -15190,19 +15517,29 @@ function DMS({ storagePath, onChangeFolder }) {
     // Duplicate detection — skipped when caller already handled it (dialog response).
     // Uses name+size only (no hash) to avoid reading all files into memory upfront,
     // which would cause memory pressure and break GPS extraction for large folder uploads.
+    // Grouped by size (not a flat name+size Set) because a previously-uploaded
+    // photo may be stored under its date-prefixed name (see the auto date
+    // prefix below) rather than its own raw name — matching by suffix
+    // ("...-IMG_1234.jpg" ends with "IMG_1234.jpg") still catches that case.
     if (!skipDuplicates) {
       setUploadStatus({ done: 0, total: files.length, phase: "检查重复" });
-      const nameSizeSet = new Set(docIndex.map((e) => `${e.name}::${e.size}`));
+      const bySize = new Map();
+      for (const e of docIndex) {
+        if (!bySize.has(e.size)) bySize.set(e.size, []);
+        bySize.get(e.size).push(e);
+      }
       const duplicates = [];
       for (const file of files) {
-        if (nameSizeSet.has(`${file.name}::${file.size}`)) {
-          const existing = docIndex.find((e) => e.name === file.name && e.size === file.size);
+        const existing = (bySize.get(file.size) || []).find(
+          (e) => e.name === file.name || e.name.endsWith(`-${file.name}`)
+        );
+        if (existing) {
           duplicates.push({ file, existing });
         }
       }
       if (duplicates.length > 0) {
         setUploadStatus(null);
-        setDupDialog({ duplicates, allFiles: files, targetNodeId });
+        setDupDialog({ duplicates, allFiles: files, targetNodeId, extraText });
         return;
       }
     }
@@ -15270,6 +15607,27 @@ function DMS({ storagePath, onChangeFolder }) {
       const photoDate = _isPhoto ? await readPhotoDate(file) : _isVideo ? await readVideoDate(file) : null;
       if (photoDate) console.log(`[DMS] ${_isVideo ? "Video" : "Photo"} date: ${photoDate.year}/${photoDate.month} lat=${photoDate.lat} lon=${photoDate.lon} for ${file.name}`);
 
+      // Auto-prefix the photo/video's own capture date (YYYY-MM-DD) onto its
+      // name at upload time -- both the tree entry and the physical file on
+      // disk get this name, since it's what's sent to saveDocument() below.
+      // photoDate.day reuses the same EXIF/mvhd read already done above for
+      // year/month folder routing, just with the day kept instead of
+      // discarded, so this costs nothing extra. Skipped if the name is
+      // already prefixed that way (e.g. re-uploading a previously-renamed file).
+      //
+      // extraText (opt-in, from the "Upload folder" dialog) is stitched in
+      // right after the date when there is one, or at the very front of the
+      // name when there isn't -- see uploadFilesToNode's options.
+      let uploadName = file.name;
+      const capturedDate = photoDate && photoDate.day
+        ? `${photoDate.year}-${photoDate.month}-${photoDate.day}` : null;
+      const safeExtraText = extraText ? extraText.replace(/[\\/:*?"<>|]/g, "").trim() : "";
+      if (capturedDate && !file.name.startsWith(capturedDate)) {
+        uploadName = safeExtraText ? `${capturedDate}-${safeExtraText}-${file.name}` : `${capturedDate}-${file.name}`;
+      } else if (!capturedDate && safeExtraText) {
+        uploadName = `${safeExtraText}-${file.name}`;
+      }
+
       // For photos and videos, create year/month subfolders under the designated
       // photo root (or the upload target folder if no root is set), unless
       // uploading to current folder.
@@ -15289,7 +15647,7 @@ function DMS({ storagePath, onChangeFolder }) {
       const targetNodeSn = (findNode(workingTree, finalNodeId)?.sn || "").trim();
 
       const doc = {
-        id: docId, name: file.name, mime: file.type || "application/octet-stream",
+        id: docId, name: uploadName, mime: file.type || "application/octet-stream",
         size: file.size, uploadedAt: new Date().toISOString(),
         file, nodeId: finalNodeId, routeMode, metadata: {},
         ...(photoDate ? {
@@ -15316,7 +15674,7 @@ function DMS({ storagePath, onChangeFolder }) {
 
       const newEntry = {
         id: docId,
-        name: file.name,
+        name: uploadName,
         mime: file.type,
         size: file.size,
         uploadedAt: doc.uploadedAt,
@@ -15335,12 +15693,20 @@ function DMS({ storagePath, onChangeFolder }) {
           docDateRaw: uploadResult.detectedDateRaw || "",
           docDateSource: "auto",
           docDateVerified: false,
+        // No text-scanned date, but the photo/video's own capture date is
+        // known (same source as the filename prefix above) -- camera/mvhd
+        // metadata is trustworthy enough to record straight away, unlike
+        // the OCR guess above, so this skips the review dialog.
+        } : capturedDate ? {
+          docDate: capturedDate,
+          docDateSource: "exif",
+          docDateVerified: true,
         } : {}),
       };
       newIndexEntries.push(newEntry);
       if (uploadResult.detectedDate) {
         pendingDateVerification.push({
-          id: docId, name: file.name,
+          id: docId, name: uploadName,
           docDate: uploadResult.detectedDate, docDateRaw: uploadResult.detectedDateRaw || "",
         });
       }
@@ -15395,8 +15761,16 @@ function DMS({ storagePath, onChangeFolder }) {
 
       const finalTree = mergeTreeAdditions(baseTree, workingTree, freshTreeResp.tree);
       const finalIndex = [...freshIndex, ...newIndexEntries];
-      await persistTree(finalTree);
+      // Save docIndex first, tree second (same order as unlinkDocFromNode /
+      // unlinkDocsFromNodeBulk below): if the second save fails partway, we
+      // want the surviving state to be "docIndex knows about the doc but no
+      // folder links to it yet" rather than "a folder links to a doc that
+      // has no docIndex entry" -- the latter renders as invisible, uncounted
+      // documents that look identical to files never uploaded at all (see
+      // delete_node's originalNodeId fallback in dms_server.py, which only
+      // covers the direction docIndex → tree, not tree → docIndex).
       await persistIndex(finalIndex);
+      await persistTree(finalTree);
       console.log("[DMS] ✓ Upload complete");
       if (pendingDateVerification.length > 0) {
         setVerifyDatesQueue(pendingDateVerification);
@@ -15459,7 +15833,7 @@ function DMS({ storagePath, onChangeFolder }) {
   // uploads every file into its resolved folder — grouped by folder so
   // uploadFilesToNode's own tree/index merge runs once per distinct
   // folder rather than once per file.
-  const runMirroredUpload = async (mirroredTree, fileNodeId, files) => {
+  const runMirroredUpload = async (mirroredTree, fileNodeId, files, extraText = "") => {
     if (!files.length) return;
     await persistTree(mirroredTree);
     const groups = new Map(); // nodeId -> File[]
@@ -15470,7 +15844,7 @@ function DMS({ storagePath, onChangeFolder }) {
     }
     for (const [nodeId, groupFiles] of groups) {
       await uploadFilesToNode(nodeId, groupFiles, {
-        skipDuplicates: true, routeMode: "current-folder", baseTreeOverride: mirroredTree,
+        skipDuplicates: true, routeMode: "current-folder", baseTreeOverride: mirroredTree, extraText,
       });
     }
   };
@@ -15481,7 +15855,7 @@ function DMS({ storagePath, onChangeFolder }) {
   // used here, since this upload is split across several per-folder calls
   // afterward and would otherwise show one dialog per folder instead of one
   // for the whole operation).
-  const uploadFilesMirroringSubfolders = async (baseNodeId, files, keepTopLevel = false) => {
+  const uploadFilesMirroringSubfolders = async (baseNodeId, files, keepTopLevel = false, extraText = "") => {
     if (!files.length) return;
     if (!baseNodeId) {
       alert(t("请先在装配树中点击选择一个文件夹。", "Please click to select a folder in the assembly tree first."));
@@ -15500,11 +15874,11 @@ function DMS({ storagePath, onChangeFolder }) {
     const [mirroredTree, fileNodeId] = resolveMirroredTargets(tree, baseNodeId, files, keepTopLevel);
 
     if (duplicates.length > 0) {
-      setDupDialog({ duplicates, allFiles: files, targetNodeId: baseNodeId, mirror: { tree: mirroredTree, fileNodeId } });
+      setDupDialog({ duplicates, allFiles: files, targetNodeId: baseNodeId, mirror: { tree: mirroredTree, fileNodeId, extraText } });
       return;
     }
 
-    await runMirroredUpload(mirroredTree, fileNodeId, files);
+    await runMirroredUpload(mirroredTree, fileNodeId, files, extraText);
   };
 
   // "Upload file" — the OS file picker (no `accept` filter, so every
@@ -15534,8 +15908,8 @@ function DMS({ storagePath, onChangeFolder }) {
   const openMultiFolderDialog = () => {
     if (!selectedNode) { alert(t("请先在装配树中点击选择一个文件夹。", "Please click to select a folder in the assembly tree first.")); return; }
     setPendingFolderFiles([]);
-    setMirrorSubfolders(false);
-    setKeepSourceTree(false);
+    setFolderUploadMode("year-month");
+    setFolderUploadExtraText("");
     setFolderPickerOpen(true);
   };
 
@@ -15563,22 +15937,25 @@ function DMS({ storagePath, onChangeFolder }) {
   const handleMultiFolderUpload = async () => {
     const allFiles = pendingFolderFiles.flatMap((f) => f.files);
     if (!allFiles.length) return;
-    const useMirror = mirrorSubfolders;
-    const useKeepSourceTree = keepSourceTree;
+    const mode = folderUploadMode;
+    const extraText = folderUploadExtraText.trim();
     setFolderPickerOpen(false);
     setPendingFolderFiles([]);
-    setMirrorSubfolders(false);
-    setKeepSourceTree(false);
+    setFolderUploadMode("year-month");
+    setFolderUploadExtraText("");
     try {
-      if (useKeepSourceTree) {
+      if (mode === "keep-tree") {
         // Reproduce the picked folder(s) verbatim under the current node:
         // the source folder itself becomes a new child folder, with every
         // subfolder and file recreated at the same relative path.
-        await uploadFilesMirroringSubfolders(selectedId, allFiles, true);
-      } else if (useMirror) {
-        await uploadFilesMirroringSubfolders(selectedId, allFiles);
+        await uploadFilesMirroringSubfolders(selectedId, allFiles, true, extraText);
+      } else if (mode === "mirror") {
+        await uploadFilesMirroringSubfolders(selectedId, allFiles, false, extraText);
       } else {
-        await uploadFilesToNode(selectedId, allFiles);
+        // "year-month" (default): every file from every picked folder and
+        // subfolder is routed by date into year/month folders, creating
+        // them under the current node if they don't exist yet.
+        await uploadFilesToNode(selectedId, allFiles, { extraText });
       }
     } catch (err) {
       console.error("[DMS] ✗ Multi-folder upload error:", err);
@@ -16166,33 +16543,40 @@ function DMS({ storagePath, onChangeFolder }) {
 
   const linkDocToNode = (docId, nodeId) => linkDocsToNode([docId], nodeId);
 
-  // Drag-and-drop move: relinks a document from the folder it was dragged
-  // out of to the folder it was dropped on. Also repoints its canonical
-  // node (originalNodeId) at the target, so the server's file-sync — which
-  // runs after every tree save — relocates the physical file on disk into
-  // the target folder's directory too, mirroring how dragging a folder
-  // moves its whole directory.
-  const moveDocToNode = async (docId, fromNodeId, toNodeId) => {
-    if (!docId || !fromNodeId || !toNodeId || fromNodeId === toNodeId) return;
+  // Drag-and-drop move: relinks a document (or, when several checkboxes are
+  // checked and one of them is dragged, all of them at once) from the folder
+  // it was dragged out of to the folder it was dropped on. Also repoints its
+  // canonical node (originalNodeId) at the target, so the server's file-sync
+  // — which runs after every tree save — relocates the physical file on disk
+  // into the target folder's directory too, mirroring how dragging a folder
+  // moves its whole directory. `docIdOrIds` accepts a single id (the common
+  // case) or an array, so both call shapes share one atomic tree/index save
+  // instead of looping a single-doc move and racing multiple saves.
+  const moveDocToNode = async (docIdOrIds, fromNodeId, toNodeId) => {
+    const docIds = Array.isArray(docIdOrIds) ? docIdOrIds : [docIdOrIds];
+    if (docIds.length === 0 || !fromNodeId || !toNodeId || fromNodeId === toNodeId) return;
     const fromNode = findNode(tree, fromNodeId);
     const toNode = findNode(tree, toNodeId);
     if (!fromNode || !toNode) return;
-    if (!(fromNode.documents || []).some((d) => d.id === docId)) return;
+    const movable = new Set(
+      (fromNode.documents || []).map((d) => d.id).filter((id) => docIds.includes(id))
+    );
+    if (movable.size === 0) return;
 
     let newTree = updateNodeInTree(tree, fromNodeId, (n) => ({
       ...n,
-      documents: (n.documents || []).filter((d) => d.id !== docId),
+      documents: (n.documents || []).filter((d) => !movable.has(d.id)),
     }));
-    newTree = updateNodeInTree(newTree, toNodeId, (n) =>
-      (n.documents || []).some((d) => d.id === docId)
-        ? n
-        : { ...n, documents: [...(n.documents || []), { id: docId }] }
-    );
+    newTree = updateNodeInTree(newTree, toNodeId, (n) => {
+      const existing = new Set((n.documents || []).map((d) => d.id));
+      const toAdd = [...movable].filter((id) => !existing.has(id));
+      return toAdd.length === 0 ? n : { ...n, documents: [...(n.documents || []), ...toAdd.map((id) => ({ id }))] };
+    });
 
     // Save the docIndex change first so the server's file-sync (triggered
     // by the tree save right after) reads the already-updated originalNodeId.
     const newIndex = docIndex.map((e) =>
-      e.id === docId ? { ...e, originalNodeId: toNodeId } : e
+      movable.has(e.id) ? { ...e, originalNodeId: toNodeId } : e
     );
     await persistIndex(newIndex);
     await persistTree(newTree);
@@ -17166,6 +17550,13 @@ function DMS({ storagePath, onChangeFolder }) {
                       <Layers size={12} /> {t("合并文档", "Merge documents")}
                     </button>
                     <button
+                      onClick={() => setShowConvertToPdfModal(true)}
+                      className="text-sm px-3 py-1.5 border border-stone-300 hover:bg-amber-50 hover:border-amber-400 text-stone-700 rounded cursor-pointer flex items-center gap-1.5"
+                      title={t("将此文件夹中的文档分别转换为独立的 PDF 文件，原始文件移至「已删除文件」", "Convert the documents in this folder into individual PDF files; originals are moved to “Deleted files”")}
+                    >
+                      <FileText size={12} /> {t("转换为 PDF", "Convert to PDF")}
+                    </button>
+                    <button
                       onClick={async () => {
                         try {
                           const clipItems = await navigator.clipboard.read();
@@ -17553,8 +17944,21 @@ function DMS({ storagePath, onChangeFolder }) {
                           n.has(doc.id) ? n.delete(doc.id) : n.add(doc.id);
                           return n;
                         })}
-                        isDragging={draggingDocId === doc.id}
-                        onDragStart={() => handleDocDragStart(doc.id, selectedId)}
+                        isDragging={Array.isArray(draggingDocId) ? draggingDocId.includes(doc.id) : draggingDocId === doc.id}
+                        onDragStart={() => {
+                          // Dragging a checked card while several are checked
+                          // moves the whole checked set; dragging any other
+                          // card (or a checked one when it's the only one
+                          // checked) moves just that document.
+                          const activeSelectedIds = isRecycleBinNode ? recycleSelectedIds
+                            : dupeSelectMode ? dupeSelectedIds
+                            : aiFillSelectMode ? aiFillSelectedIds
+                            : downloadSelectedIds;
+                          const dragIds = activeSelectedIds.has(doc.id) && activeSelectedIds.size > 1
+                            ? Array.from(activeSelectedIds)
+                            : doc.id;
+                          handleDocDragStart(dragIds, selectedId);
+                        }}
                         onDragEnd={handleDocDragEnd}
                         isLastWorked={lastWorkedDocId === doc.id}
                         onMarkWorked={() => setLastWorkedDocId(doc.id)}
@@ -17911,7 +18315,7 @@ function DMS({ storagePath, onChangeFolder }) {
       />
 
       {folderPickerOpen && (
-        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center" onClick={(e) => { if (e.target === e.currentTarget) { setFolderPickerOpen(false); setPendingFolderFiles([]); setMirrorSubfolders(false); setKeepSourceTree(false); } }}>
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center" onClick={(e) => { if (e.target === e.currentTarget) { setFolderPickerOpen(false); setPendingFolderFiles([]); setFolderUploadMode("year-month"); setFolderUploadExtraText(""); } }}>
           <div className="bg-white rounded-lg shadow-xl p-6 w-96 flex flex-col gap-4">
             <h3 className="font-semibold text-base text-stone-800">{t("上传多个文件夹", "Upload multiple folders")}</h3>
             <div className="min-h-[80px] space-y-1.5">
@@ -17931,12 +18335,27 @@ function DMS({ storagePath, onChangeFolder }) {
               {t("+ 添加文件夹", "+ Add folder")}
               <input ref={multiFolderInputRef} type="file" webkitdirectory="" multiple onChange={handleMultiFolderPickerChange} className="hidden" />
             </label>
-            <label className={`flex items-start gap-2 text-sm border border-stone-200 rounded px-3 py-2 bg-stone-50 ${keepSourceTree ? "opacity-40 cursor-not-allowed" : "text-stone-700 cursor-pointer"}`}>
+            <label className="flex items-start gap-2 text-sm text-stone-700 border border-stone-200 rounded px-3 py-2 bg-stone-50 cursor-pointer">
               <input
-                type="checkbox"
-                checked={mirrorSubfolders && !keepSourceTree}
-                disabled={keepSourceTree}
-                onChange={(e) => setMirrorSubfolders(e.target.checked)}
+                type="radio"
+                name="folderUploadMode"
+                checked={folderUploadMode === "year-month"}
+                onChange={() => setFolderUploadMode("year-month")}
+                className="accent-amber-600 mt-0.5"
+              />
+              <span>
+                {t("按年/月文件夹上传（含所有子文件夹中的文件）", "Sort into year/month folders (including files in subfolders)")}
+                <span className="block text-[12px] text-stone-600 mt-0.5">
+                  {t("每个文件夹（含其子文件夹）中的所有文件都按日期归入年/月文件夹；年/月文件夹不存在时会自动创建，不保留来源文件夹结构。", "Every file in each picked folder — including its subfolders — is routed by date into year/month folders, which are created here if they don't already exist. The source folder structure is not kept.")}
+                </span>
+              </span>
+            </label>
+            <label className="flex items-start gap-2 text-sm text-stone-700 border border-stone-200 rounded px-3 py-2 bg-stone-50 cursor-pointer">
+              <input
+                type="radio"
+                name="folderUploadMode"
+                checked={folderUploadMode === "mirror"}
+                onChange={() => setFolderUploadMode("mirror")}
                 className="accent-amber-600 mt-0.5"
               />
               <span>
@@ -17948,9 +18367,10 @@ function DMS({ storagePath, onChangeFolder }) {
             </label>
             <label className="flex items-start gap-2 text-sm text-stone-700 border border-stone-200 rounded px-3 py-2 bg-stone-50 cursor-pointer">
               <input
-                type="checkbox"
-                checked={keepSourceTree}
-                onChange={(e) => setKeepSourceTree(e.target.checked)}
+                type="radio"
+                name="folderUploadMode"
+                checked={folderUploadMode === "keep-tree"}
+                onChange={() => setFolderUploadMode("keep-tree")}
                 className="accent-amber-600 mt-0.5"
               />
               <span>
@@ -17960,8 +18380,21 @@ function DMS({ storagePath, onChangeFolder }) {
                 </span>
               </span>
             </label>
+            <label className="flex flex-col gap-1 text-sm text-stone-700 border border-stone-200 rounded px-3 py-2 bg-stone-50">
+              {t("在文件名中添加文字（可选）", "Add text to filenames (optional)")}
+              <input
+                type="text"
+                value={folderUploadExtraText}
+                onChange={(e) => setFolderUploadExtraText(e.target.value)}
+                placeholder={t("留空则不添加", "Leave blank to add nothing")}
+                className="text-sm px-2 py-1 border border-stone-300 rounded focus:outline-none focus:border-amber-500"
+              />
+              <span className="text-[12px] text-stone-600">
+                {t("有日期时添加在日期之后，例如 2026-09-17-文字-原文件名；没有日期时添加在文件名最前面。", "Placed right after the date when there is one (e.g. 2026-09-17-text-original name), or at the very front of the name when there isn't.")}
+              </span>
+            </label>
             <div className="flex justify-end gap-2">
-              <button onClick={() => { setFolderPickerOpen(false); setPendingFolderFiles([]); setMirrorSubfolders(false); setKeepSourceTree(false); }} className="text-sm px-3 py-1.5 rounded border border-stone-300 hover:bg-stone-50 text-stone-700">{t("取消", "Cancel")}</button>
+              <button onClick={() => { setFolderPickerOpen(false); setPendingFolderFiles([]); setFolderUploadMode("year-month"); setFolderUploadExtraText(""); }} className="text-sm px-3 py-1.5 rounded border border-stone-300 hover:bg-stone-50 text-stone-700">{t("取消", "Cancel")}</button>
               <button
                 onClick={handleMultiFolderUpload}
                 disabled={pendingFolderFiles.length === 0}
@@ -18347,16 +18780,16 @@ function DMS({ storagePath, onChangeFolder }) {
           getPathFor={(id) => getNodePathFrom(tree, id)}
           onCancel={() => setDupDialog(null)}
           onUploadAll={() => {
-            const { allFiles, targetNodeId, mirror } = dupDialog;
+            const { allFiles, targetNodeId, mirror, extraText } = dupDialog;
             setDupDialog(null);
             if (mirror) {
-              runMirroredUpload(mirror.tree, mirror.fileNodeId, allFiles);
+              runMirroredUpload(mirror.tree, mirror.fileNodeId, allFiles, mirror.extraText);
             } else {
-              uploadFilesToNode(targetNodeId, allFiles, { skipDuplicates: true });
+              uploadFilesToNode(targetNodeId, allFiles, { skipDuplicates: true, extraText });
             }
           }}
           onLink={async () => {
-            const { duplicates, allFiles, targetNodeId, mirror } = dupDialog;
+            const { duplicates, allFiles, targetNodeId, mirror, extraText } = dupDialog;
             setDupDialog(null);
 
             if (mirror) {
@@ -18385,7 +18818,7 @@ function DMS({ storagePath, onChangeFolder }) {
                 }
                 for (const [nid, groupFiles] of groups) {
                   await uploadFilesToNode(nid, groupFiles, {
-                    skipDuplicates: true, routeMode: "current-folder", baseTreeOverride: newTree,
+                    skipDuplicates: true, routeMode: "current-folder", baseTreeOverride: newTree, extraText: mirror.extraText,
                   });
                 }
               }
@@ -18425,17 +18858,17 @@ function DMS({ storagePath, onChangeFolder }) {
             // Upload any non-duplicate files normally
             const nonDups = allFiles.filter((f) => !duplicates.some((d) => d.file === f));
             if (nonDups.length) {
-              uploadFilesToNode(targetNodeId, nonDups, { skipDuplicates: true });
+              uploadFilesToNode(targetNodeId, nonDups, { skipDuplicates: true, extraText });
             }
           }}
           onSkip={() => {
-            const { duplicates, allFiles, targetNodeId, mirror } = dupDialog;
+            const { duplicates, allFiles, targetNodeId, mirror, extraText } = dupDialog;
             setDupDialog(null);
             const nonDups = allFiles.filter((f) => !duplicates.some((d) => d.file === f));
             if (mirror) {
-              runMirroredUpload(mirror.tree, mirror.fileNodeId, nonDups);
+              runMirroredUpload(mirror.tree, mirror.fileNodeId, nonDups, mirror.extraText);
             } else {
-              uploadFilesToNode(targetNodeId, nonDups, { skipDuplicates: true });
+              uploadFilesToNode(targetNodeId, nonDups, { skipDuplicates: true, extraText });
             }
           }}
         />
@@ -18449,6 +18882,21 @@ function DMS({ storagePath, onChangeFolder }) {
           onClose={() => setShowCombineModal(false)}
           onSaved={async () => {
             setShowCombineModal(false);
+            const r = await StorageAdapter.getTree();
+            if (r.tree) setTree(r.tree);
+            const idx = await StorageAdapter.listDocumentIndex();
+            setDocIndex(idx);
+          }}
+        />
+      )}
+
+      {showConvertToPdfModal && selectedNode && (
+        <ConvertToPdfModal
+          node={selectedNode}
+          docIndex={docIndex}
+          formatBytes={formatBytes}
+          onClose={() => setShowConvertToPdfModal(false)}
+          onSaved={async () => {
             const r = await StorageAdapter.getTree();
             if (r.tree) setTree(r.tree);
             const idx = await StorageAdapter.listDocumentIndex();

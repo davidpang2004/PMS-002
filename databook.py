@@ -156,12 +156,16 @@ def _path_for_node(tree: dict, node_id: str) -> str:
 def _doc_path(docs_dir: Path, doc_id: str) -> Path | None:
     """Find the on-disk file for a given DOC ID.
 
-    Files are stored as '<DOC-ID>__<original-name>.<ext>' inside per-node
-    subdirectories of docs_dir (see dms_server._migrate_flat_docs), so this
-    must search recursively — matching the rglob pattern used by every doc
-    resolution site in dms_server.py — rather than globbing docs_dir itself.
+    Files are stored as '<original-name>+<DOC-ID>.<ext>' inside per-node
+    subdirectories of docs_dir (see dms_server._doc_filename); older files
+    predating that layout are still named '<DOC-ID>__<original-name>.<ext>'
+    and are never renamed to match. Matching the DOC-ID anywhere in the name
+    -- the same rglob pattern used by every doc resolution site in
+    dms_server.py, see _find_doc_files there -- finds a file under either
+    layout, so this must search recursively rather than globbing docs_dir
+    itself.
     """
-    matches = list(docs_dir.rglob(f"{doc_id}__*")) or list(docs_dir.rglob(f"{doc_id}*"))
+    matches = list(docs_dir.rglob(f"*{doc_id}*"))
     return matches[0] if matches else None
 
 
@@ -189,19 +193,25 @@ _IMAGE_EXTS = {
 }
 
 
-def _downscaled_jpeg_reader(img_path: Path, max_dim: int = _MAX_EMBED_DIM) -> "ImageReader":
+def _downscaled_jpeg_reader(img_path: Path, max_dim: "int | None" = _MAX_EMBED_DIM) -> "ImageReader":
     """Open an image, downscale it to fit within max_dim x max_dim (no
     upscaling — small images pass through unchanged), and return an
     ImageReader wrapping a re-encoded JPEG. reportlab embeds an already-JPEG
     source as-is (no further re-compression), so this is what actually keeps
     the output PDF small — resizing alone wouldn't help if reportlab still
-    stored the result as a raw/deflate pixel array."""
+    stored the result as a raw/deflate pixel array.
+
+    max_dim=None skips the resize (re-encodes at the image's original pixel
+    size) -- used by the single-file "Convert to PDF" action, which has no
+    multi-photo size budget to protect but still must not hand reportlab a
+    raw bitmap, or file size balloons 10-20x with the resolution unchanged."""
     with Image.open(img_path) as im:
         im = im.convert("RGB")
         iw, ih = im.size
-        scale = min(1.0, max_dim / max(iw, ih))
-        if scale < 1.0:
-            im = im.resize((max(1, round(iw * scale)), max(1, round(ih * scale))), Image.LANCZOS)
+        if max_dim is not None:
+            scale = min(1.0, max_dim / max(iw, ih))
+            if scale < 1.0:
+                im = im.resize((max(1, round(iw * scale)), max(1, round(ih * scale))), Image.LANCZOS)
         buf = io.BytesIO()
         im.save(buf, format="JPEG", quality=_EMBED_JPEG_QUALITY, optimize=True)
         buf.seek(0)
@@ -312,6 +322,66 @@ def build_front_page_pdf_bytes(file_bytes: bytes, mime: str, filename: str = "")
 
     raise ValueError(
         f"Unsupported front page file type ({mime or name or 'unknown'}). "
+        "Please provide a PDF or image file — export Word/Pages documents to PDF first."
+    )
+
+
+def build_convert_to_pdf_bytes(doc_path: Path, mime: str, filename: str = "") -> bytes:
+    """Convert a single source file into standalone PDF bytes for the
+    folder's "Convert to PDF" action (each selected file becomes its own
+    PDF, unlike the databook merge below). Per product decision, images are
+    downscaled through the same _MAX_EMBED_DIM cap the merge feature uses,
+    so a converted file lands in the same few-hundred-KB range as a merged
+    one instead of ballooning to full sensor resolution (several MB per
+    phone photo).
+
+    Still routes images through _downscaled_jpeg_reader rather than handing
+    reportlab the raw decoded bitmap the way build_front_page_pdf_bytes
+    does: reportlab embeds whatever pixel data it's given, and an
+    uncompressed/deflate pixel array is 10-20x the size of the same image
+    as JPEG. Raises ValueError for unsupported file types.
+    """
+    mime = (mime or "").lower()
+    name = (filename or "").lower()
+    is_pdf = mime == "application/pdf" or name.endswith(".pdf")
+    is_image = mime.startswith("image/") or name.endswith((
+        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".webp", ".heic", ".heif",
+    ))
+
+    if is_pdf:
+        file_bytes = doc_path.read_bytes()
+        try:
+            reader = PdfReader(io.BytesIO(file_bytes))
+            if len(reader.pages) == 0:
+                raise ValueError("the PDF has no pages")
+            reader.close()
+        except Exception as e:
+            raise ValueError(f"Could not read PDF: {e}")
+        return file_bytes
+
+    if is_image:
+        _ensure_heif_support()
+        try:
+            img_reader = _downscaled_jpeg_reader(doc_path)
+            iw, ih = img_reader.getSize()
+            scale = min(PAGE_W / iw, PAGE_H / ih)
+            draw_w, draw_h = iw * scale, ih * scale
+            buf = io.BytesIO()
+            c = canvas.Canvas(buf, pagesize=letter)
+            c.drawImage(
+                img_reader,
+                (PAGE_W - draw_w) / 2, (PAGE_H - draw_h) / 2,
+                width=draw_w, height=draw_h,
+                preserveAspectRatio=True, anchor="c",
+            )
+            c.showPage()
+            c.save()
+        except Exception as e:
+            raise ValueError(f"Could not read image: {e}")
+        return buf.getvalue()
+
+    raise ValueError(
+        f"Unsupported file type ({mime or name or 'unknown'}). "
         "Please provide a PDF or image file — export Word/Pages documents to PDF first."
     )
 

@@ -1031,6 +1031,26 @@ class LauncherWindow:
                 status_var.set("Generate a link first.")
                 status_lbl.config(fg=WARN)
                 return
+
+            # Windows only registers a handler for the "sms:" URI scheme when
+            # Phone Link has an Android phone linked with message sync on --
+            # it has no messaging support for a linked iPhone at all. With no
+            # handler, Start-Process silently falls back to opening the
+            # default browser instead of Phone Link, which looks like the
+            # button did nothing useful. Check the registry first so we can
+            # explain why instead of doing that.
+            import winreg
+            try:
+                winreg.QueryValue(winreg.HKEY_CLASSES_ROOT, r"sms\shell\open\command")
+            except FileNotFoundError:
+                status_var.set(
+                    "Windows has no app registered to send SMS. Phone Link only supports "
+                    "this with a linked Android phone (not iPhone). Use \"Send via WeChat\" "
+                    "or \"Copy URL\" instead."
+                )
+                status_lbl.config(fg="#dc2626")
+                return
+
             import urllib.parse as _urlparse, subprocess as _sp
             normalised = phone if phone.startswith("+") else "+" + phone
             message = f"文件上传链接：\n{generated_url[0]}"
