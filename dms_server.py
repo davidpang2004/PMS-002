@@ -252,6 +252,50 @@ def _reserve_doc_slots(idx: dict, count: int = 1) -> bool:
     return True
 
 
+_SNAPSHOT_DIRNAME = ".snapshots"
+_SNAPSHOT_INTERVAL_SECONDS = 600   # at most one snapshot every 10 minutes
+_SNAPSHOT_RETENTION = 200          # keep this many most-recent snapshots
+
+
+def _snapshot_index_before_write(index_path: Path) -> None:
+    """Copy the current on-disk index.json into <storage_root>/.snapshots/
+    before it gets overwritten.
+
+    write_index()'s atomic temp-file+replace only protects against a torn
+    write landing on disk; it does nothing for a *bad* write -- a logic
+    bug, or an accidental bulk delete in the tree editor -- silently
+    overwriting good data with no way back. This keeps a rolling history
+    of prior states to recover from, restored with
+    scripts/restore-index-snapshot.py.
+
+    Throttled to once per _SNAPSHOT_INTERVAL_SECONDS (checked via the
+    newest snapshot's mtime, so it survives server restarts with no extra
+    state) since every keystroke on an editable field triggers its own
+    write_index() call and snapshotting each one would flood the
+    directory for no recovery benefit.
+    """
+    if not index_path.exists():
+        return
+    snap_dir = index_path.parent / _SNAPSHOT_DIRNAME
+    try:
+        prior = sorted(snap_dir.glob("index-*.json")) if snap_dir.exists() else []
+        if prior and _time.time() - prior[-1].stat().st_mtime < _SNAPSHOT_INTERVAL_SECONDS:
+            return
+        snap_dir.mkdir(parents=True, exist_ok=True)
+        # Microsecond precision, not just seconds, so two writes landing in
+        # the same wall-clock second (easily hit with the throttle disabled
+        # or set very low) don't collide on the same filename and silently
+        # skip the second snapshot.
+        dest = snap_dir / f"index-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}.json"
+        if not dest.exists():
+            shutil.copy2(index_path, dest)
+        all_snaps = sorted(snap_dir.glob("index-*.json"))
+        for stale in all_snaps[:-_SNAPSHOT_RETENTION]:
+            stale.unlink(missing_ok=True)
+    except OSError:
+        pass  # snapshotting is best-effort; never block a real save on it
+
+
 def write_index(idx: dict) -> None:
     """Write index.json atomically.
 
@@ -273,6 +317,7 @@ def write_index(idx: dict) -> None:
     if not p:
         raise RuntimeError("Storage path is not configured")
     p.parent.mkdir(parents=True, exist_ok=True)
+    _snapshot_index_before_write(p)
     tmp = p.with_suffix(f".json.tmp-{secrets.token_hex(4)}")
     try:
         tmp.write_text(json.dumps(idx, indent=2))
