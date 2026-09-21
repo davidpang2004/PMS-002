@@ -3606,20 +3606,26 @@ def post_doc():
         f"valid={_valid_date} route={route_mode!r} node={node_id!r} base={photo_base_node_id!r}"
     )
     tree = idx.get("tree")
-    out_dir = _route_upload_out_dir(
-        docs_dir, tree, node_id, is_photo or is_video, _valid_date, route_mode,
-        photo_year, photo_month, photo_base_node_id,
-    )
+    try:
+        # _route_upload_out_dir (and the _get_node_docs_dir /
+        # _photo_year_month_dir helpers it can call into) create the
+        # destination folder with mkdir() along the way -- also previously
+        # unguarded, and a real (if previously invisible) failure mode:
+        # a folder upload mirroring a deep source directory tree can push
+        # a path past the OS's path-length limit, or land somewhere the
+        # user doesn't have write access to.
+        out_dir = _route_upload_out_dir(
+            docs_dir, tree, node_id, is_photo or is_video, _valid_date, route_mode,
+            photo_year, photo_month, photo_base_node_id,
+        )
+    except OSError as e:
+        return jsonify({"error": f"Could not create destination folder: {e}"}), 500
 
     out_path = out_dir / _doc_filename(doc_id, safe_name)
     if file_data is not None:
         try:
             out_path.write_bytes(file_data)
         except OSError as e:
-            # A real (if previously invisible) failure mode: a folder
-            # upload mirroring a deep source directory tree can push a
-            # path past the OS's path-length limit, or land in a folder
-            # the user doesn't have write access to -- either raises here.
             # Previously uncaught, so the client saw an opaque 500 with no
             # actionable message; return one instead of crashing the request.
             return jsonify({"error": f"Could not save file to disk: {e}"}), 500
@@ -3759,10 +3765,16 @@ def post_doc_stream():
         f"valid={_valid_date} route={route_mode!r} node={node_id!r} base={photo_base_node_id!r}"
     )
     tree = idx.get("tree")
-    out_dir = _route_upload_out_dir(
-        docs_dir, tree, node_id, is_photo or is_video, _valid_date, route_mode,
-        photo_year, photo_month, photo_base_node_id,
-    )
+    try:
+        # See the matching try/except in post_doc -- mkdir() along the way
+        # (in _route_upload_out_dir or the helpers it calls) was also
+        # previously unguarded.
+        out_dir = _route_upload_out_dir(
+            docs_dir, tree, node_id, is_photo or is_video, _valid_date, route_mode,
+            photo_year, photo_month, photo_base_node_id,
+        )
+    except OSError as e:
+        return jsonify({"error": f"Could not create destination folder: {e}"}), 500
 
     out_path = out_dir / _doc_filename(doc_id, safe_name)
     tmp_path = out_path.with_name(out_path.name + ".part")

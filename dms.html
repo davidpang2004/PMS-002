@@ -1255,6 +1255,18 @@ const isInlinePreviewable = (meta) => {
   return false;
 };
 
+// macOS creates hidden "._<name>" resource-fork sidecar files (AppleDouble
+// format) alongside every real file when copying through a non-HFS+/APFS
+// volume -- an SD card, a USB/external drive formatted FAT32/exFAT, a
+// network share -- extremely common for a folder of camera photos. They're
+// never real content, but neither the webkitdirectory folder picker nor
+// drag-and-drop's directory walk filters hidden files, so uploading one as
+// if it were a real photo/document feeds garbage bytes into the same EXIF/
+// GPS/OCR parsing a real file goes through.
+const isJunkUploadFileName = (name) =>
+  [".ds_store", "thumbs.db", "desktop.ini"].includes((name || "").toLowerCase())
+  || name.startsWith("._");
+
 /* =============================================================================
  * DRAG-AND-DROP FOLDER READING
  * =============================================================================
@@ -15918,10 +15930,9 @@ function DMS({ storagePath, onChangeFolder }) {
   // every file in the whole tree (each File's webkitRelativePath reflects
   // its nested path). The only filtering here is OS junk files — every real
   // file type (not just photos) is kept.
-  const junkFileNames = new Set([".ds_store", "thumbs.db", "desktop.ini"]);
   const handleMultiFolderPickerChange = (e) => {
     const allFiles = Array.from(e.target.files || []);
-    const files = allFiles.filter((f) => !junkFileNames.has(f.name.toLowerCase()));
+    const files = allFiles.filter((f) => !isJunkUploadFileName(f.name));
     e.target.value = "";
     if (!files.length) { alert(t("所选文件夹中未找到文件。", "No files were found in the selected folder.")); return; }
     const folderName = files[0].webkitRelativePath.split("/")[0] || t("未知文件夹", "Unknown folder");
@@ -16023,8 +16034,7 @@ function DMS({ storagePath, onChangeFolder }) {
         // At least one dropped item was a real folder -- route it through the
         // same "Upload folder" confirmation dialog the picker button uses, so
         // the user still gets to choose whether subfolders are mirrored.
-        const junkFileNames = new Set([".ds_store", "thumbs.db", "desktop.ini"]);
-        const clean = files.filter((f) => !junkFileNames.has(f.name.toLowerCase()));
+        const clean = files.filter((f) => !isJunkUploadFileName(f.name));
         if (!clean.length) {
           alert(t("所选文件夹中未找到文件。", "No files were found in the selected folder."));
           return;

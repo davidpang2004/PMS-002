@@ -1,21 +1,30 @@
-"""Regression coverage for a real user-reported bug: folder uploads
-(which mirror a source directory's full nested structure, producing much
-deeper on-disk paths than picking one already-open folder) occasionally
-failed with an opaque HTTP 500, while re-uploading the same file singly
-worked. Tracing both upload routes found the actual gap: the disk-write
-step in post_doc (for photos, a bare `out_path.write_bytes(...)` with no
-try/except at all) and post_doc_stream (a temp-file-then-replace pattern
-that caught its own exception only to re-raise it) both let any OSError
-(disk full, permission denied, or -- the leading theory here -- a path
-that exceeds the OS's length limit once a deep mirrored folder structure
-is involved) propagate uncaught, producing an unhelpful generic 500.
+"""Regression coverage for a real user-reported bug: uploading a folder
+via "Sort into year/month folders (including files in subfolders)"
+occasionally failed a few files out of a large batch with an error
+recalled as "500", while re-uploading the same file singly worked.
 
-Both routes now catch OSError from the write step and return a clean
-{"error": "Could not save file to disk: <reason>"} response instead of
-crashing -- these tests simulate that failure (mocking the write itself,
-since portably forcing a *real* OS path-length error isn't practical) and
-confirm the clean-error behavior plus that no stray .part temp file is
-left behind.
+Tracing both upload routes found several previously-unguarded spots where
+an OSError could propagate uncaught into an opaque HTTP 500 with no
+actionable message: the disk-write step itself (post_doc's photo branch
+had no try/except at all; post_doc's non-photo branch and post_doc_stream
+caught their own exception only to re-raise it), and separately the
+destination-folder creation step (_route_upload_out_dir and the helpers
+it calls -- _get_node_docs_dir, _photo_year_month_dir -- each do their
+own unguarded mkdir()). All of these are now caught and turned into a
+clean {"error": "..."} response instead of crashing.
+
+Note: the original "deep mirrored folder path" theory (year/month mode
+recreating the whole source subfolder tree) turned out not to fit this
+report -- year-month mode flattens everything into shared year/month
+folders, it doesn't mirror subfolder depth, and the user confirmed the
+source folder was on local disk, not a cloud-sync placeholder. The exact
+per-file trigger for "a few files out of many" is still not 100% confirmed
+-- these fixes make whatever it is fail cleanly and informatively instead
+of crashing, so the next occurrence's error message should pin it down.
+
+These tests simulate the failures (mocking the write/mkdir calls, since
+portably forcing a *real* OS error isn't practical) and confirm the
+clean-error behavior plus that no stray .part temp file is left behind.
 
 Isolates CONFIG_PATH + the storage path so nothing touches the real
 ~/.pms_dms_config.json or a live storage folder.
@@ -44,6 +53,27 @@ def _tree_with_folder():
 
 
 class PostDocWriteFailureTests(unittest.TestCase):
+    def test_destination_folder_creation_failure_returns_clean_error(self):
+        """_route_upload_out_dir (and _get_node_docs_dir/_photo_year_month_dir
+        underneath it) create the destination folder with an unguarded
+        mkdir() along the way -- separate from the write step covered by
+        the other tests here, and just as capable of raising an uncaught
+        OSError."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _isolate(Path(tmpdir))
+            dms_server.write_index({"tree": _tree_with_folder(), "docIndex": []})
+            client = dms_server.app.test_client()
+
+            with patch.object(dms_server, "_route_upload_out_dir", side_effect=OSError("Permission denied")):
+                resp = client.post("/api/docs", data={
+                    "file": (io.BytesIO(b"plain text"), "notes.txt"),
+                    "doc_id": "DOC-0", "node_id": "NODE-A",
+                }, content_type="multipart/form-data")
+
+            self.assertEqual(resp.status_code, 500)
+            body = resp.get_json()
+            self.assertIn("Could not create destination folder", body["error"])
+
     def test_photo_write_failure_returns_clean_error_not_a_crash(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             _isolate(Path(tmpdir))
