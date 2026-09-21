@@ -1,9 +1,9 @@
-"""Documents a real bug found while writing Tier 2 tests for
-combine_to_folder: _find_doc_files() (dms_server.py) resolves a doc_id to
-its on-disk file via `docs_dir.rglob(f"*{doc_id}*")` -- a plain substring
-search, not an exact-token match. If one document's id happens to be a
+"""Regression coverage for a real bug found while writing Tier 2 tests for
+combine_to_folder: _find_doc_files() used to resolve a doc_id to its
+on-disk file via `docs_dir.rglob(f"*{doc_id}*")` -- a plain substring
+search, not an exact-token match. If one document's id happened to be a
 literal substring of another document's on-disk filename, the wrong file
-gets returned. In combine_to_folder this was observed to grab a freshly
+was returned. In combine_to_folder this was observed to grab a freshly
 merged PDF instead of the intended source document and soft-delete the
 wrong file into the recycle bin.
 
@@ -11,20 +11,21 @@ With the app's own real id formats -- client genDocId() in dms.html
 ("DOC-" + yyyymmdd + "-" + 6-char base36) and the server's own "DOC-" +
 yyyymmdd + "-" + token_hex(4) -- two ids from the SAME generator are
 always the same fixed length, so a substring match between two of them
-reduces to exact equality (never a real collision). The risk is a
+used to reduce to exact equality (never a real collision). The risk was a
 same-day CLIENT id (19 chars) being a coincidental substring of a
 same-day SERVER-generated id (21 chars, as combine-to-folder/convert-to-
 pdf/plot-snapshot/etc. all produce) or vice versa -- both share the
-"DOC-YYYYMMDD-" prefix, so it takes only a 6-character coincidental match
+"DOC-YYYYMMDD-" prefix, so it only took a 6-character coincidental match
 at the right offset, not a full-id coincidence. Low probability with
-today's id formats, but the underlying match is not actually bounded by
-anything, so this is a latent correctness bug, not a hypothetical one --
-this test reproduces it directly against _find_doc_files() rather than
-relying on getting lucky/unlucky with random ids in a route-level test.
+today's id formats, but the match wasn't actually bounded by anything, so
+this was a latent correctness bug, not a hypothetical one.
 
-Not treated as fixed here -- _find_doc_files/_doc_id_from_filename are
-used by ~20 call sites (see the doc-filename-layout refactor), so
-tightening the match is a deliberate follow-up, not a drive-by change.
+Fixed 2026-09-20: _find_doc_files now requires _doc_id_from_filename(f.name)
+== doc_id exactly (still narrowing with the cheap substring glob first,
+since most files in a large library contain no candidate at all). This
+test locks that fix in place -- it reproduces the collision directly
+against _find_doc_files rather than relying on getting lucky/unlucky with
+random ids in a route-level test.
 
 Isolates CONFIG_PATH + the storage path so nothing touches the real
 ~/.pms_dms_config.json or a live storage folder.
@@ -45,9 +46,9 @@ def _isolate(tmp_path: Path) -> Path:
 
 
 class FindDocFilesIdCollisionTests(unittest.TestCase):
-    def test_short_id_that_is_a_prefix_of_a_longer_id_can_match_the_wrong_file(self):
+    def test_short_id_that_is_a_prefix_of_a_longer_id_resolves_only_its_own_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            storage_root = _isolate(Path(tmpdir))
+            _isolate(Path(tmpdir))
             docs_dir = dms_server.get_docs_dir()
 
             # A same-day client-style id ("DOC-2" is a stand-in for a full
@@ -64,14 +65,27 @@ class FindDocFilesIdCollisionTests(unittest.TestCase):
             unrelated.write_bytes(b"a completely different document")
 
             matches = dms_server._find_doc_files(docs_dir, short_id)
+            self.assertEqual(matches, [wanted])
 
-            # KNOWN BUG: both files match the substring search, so callers
-            # taking matches[0] (delete_doc, rename_doc_file,
-            # combine_to_folder's recycle-bin move, ...) can silently act
-            # on the wrong document. This assertion documents the current
-            # (broken) behavior; flip it to assertEqual(matches, [wanted])
-            # once _find_doc_files is tightened to an exact-token match.
-            self.assertEqual(len(matches), 2)
+            other_matches = dms_server._find_doc_files(docs_dir, colliding_long_id)
+            self.assertEqual(other_matches, [unrelated])
+
+    def test_legacy_prefix_layout_id_collision_also_resolves_correctly(self):
+        """Same property under the older "DOC-ID__name.ext" on-disk layout
+        (pre-dating the name+DOC-ID suffix format -- see _doc_filename)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _isolate(Path(tmpdir))
+            docs_dir = dms_server.get_docs_dir()
+
+            short_id = "DOC-2"
+            colliding_long_id = "DOC-20260920-B34D7C88"
+            wanted = docs_dir / f"{short_id}__wanted.pdf"
+            wanted.write_bytes(b"legacy-format file this id actually names")
+            unrelated = docs_dir / f"{colliding_long_id}__unrelated.pdf"
+            unrelated.write_bytes(b"a completely different legacy-format document")
+
+            matches = dms_server._find_doc_files(docs_dir, short_id)
+            self.assertEqual(matches, [wanted])
 
 
 if __name__ == "__main__":

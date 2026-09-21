@@ -421,13 +421,27 @@ def _doc_filename(doc_id: str, safe_name: str) -> str:
 
 
 def _find_doc_files(docs_dir: Path, doc_id: str) -> list:
-    """Locate the on-disk file(s) for doc_id. Matches the DOC-ID anywhere in
-    the filename -- this one lookup transparently supports every on-disk
-    layout a document may have been saved under (current "name+DOC-ID.ext"
-    suffix, or the older "DOC-ID__name.ext" prefix), since a DOC-ID is a
-    long, effectively-unique token wherever it appears in the name. See
-    _doc_filename for how new files are named."""
-    return list(docs_dir.rglob(f"*{doc_id}*"))
+    """Locate the on-disk file(s) for doc_id, under either on-disk layout
+    (current "name+DOC-ID.ext" suffix, or the older "DOC-ID__name.ext"
+    prefix -- see _doc_filename for how new files are named).
+
+    Requires an *exact* match on the id token parsed out by
+    _doc_id_from_filename, not a plain substring test. A bare
+    `rglob(f"*{doc_id}*")` would also match any file whose name merely
+    *contains* doc_id as a substring -- e.g. a short/legacy id that
+    happens to be a prefix of a longer, unrelated id (client ids are
+    19 chars, server-generated ones 21, both sharing a "DOC-YYYYMMDD-"
+    prefix, so this isn't just a theoretical edge case) -- which can
+    resolve a delete/rename/move onto the wrong document. Still narrows
+    with the cheap substring glob first, since most files in a large
+    library contain no candidate at all, before paying for the exact
+    comparison only on the few that do."""
+    if not doc_id:
+        return []
+    return [
+        f for f in docs_dir.rglob(f"*{doc_id}*")
+        if f.is_file() and _doc_id_from_filename(f.name) == doc_id
+    ]
 
 
 def _doc_display_name_in_use(docs_dir: Path, display_name: str) -> bool:
@@ -1125,7 +1139,7 @@ def _migrate_flat_docs() -> None:
         node_id = entry.get("originalNodeId") or ""
         if not doc_id or not node_id:
             continue
-        match = next((f for f in flat_files if doc_id in f.name), None)
+        match = next((f for f in flat_files if _doc_id_from_filename(f.name) == doc_id), None)
         if not match:
             continue
         parts = _get_node_path_parts(tree, node_id)
