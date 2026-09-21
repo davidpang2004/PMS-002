@@ -3613,7 +3613,16 @@ def post_doc():
 
     out_path = out_dir / _doc_filename(doc_id, safe_name)
     if file_data is not None:
-        out_path.write_bytes(file_data)
+        try:
+            out_path.write_bytes(file_data)
+        except OSError as e:
+            # A real (if previously invisible) failure mode: a folder
+            # upload mirroring a deep source directory tree can push a
+            # path past the OS's path-length limit, or land in a folder
+            # the user doesn't have write access to -- either raises here.
+            # Previously uncaught, so the client saw an opaque 500 with no
+            # actionable message; return one instead of crashing the request.
+            return jsonify({"error": f"Could not save file to disk: {e}"}), 500
     else:
         # Stream straight from the upload (Werkzeug's own spooled temp file)
         # to a .part file in fixed-size chunks -- bounded memory use no
@@ -3624,6 +3633,9 @@ def post_doc():
         try:
             f.save(tmp_path, buffer_size=4 * 1024 * 1024)
             tmp_path.replace(out_path)
+        except OSError as e:
+            tmp_path.unlink(missing_ok=True)
+            return jsonify({"error": f"Could not save file to disk: {e}"}), 500
         except Exception:
             tmp_path.unlink(missing_ok=True)
             raise
@@ -3758,6 +3770,12 @@ def post_doc_stream():
         with open(tmp_path, "wb") as out_fh:
             shutil.copyfileobj(request.stream, out_fh, 4 * 1024 * 1024)
         tmp_path.replace(out_path)
+    except OSError as e:
+        # See the matching fix in post_doc -- a deep mirrored-folder-upload
+        # path can exceed the OS path-length limit, or land somewhere not
+        # writable; previously an uncaught 500 with no actionable message.
+        tmp_path.unlink(missing_ok=True)
+        return jsonify({"error": f"Could not save file to disk: {e}"}), 500
     except Exception:
         tmp_path.unlink(missing_ok=True)
         raise
