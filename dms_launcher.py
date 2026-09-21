@@ -44,6 +44,38 @@ os.environ["DMS_RESOURCE_DIR"] = str(resource_path())
 
 
 # ---------------------------------------------------------------------------
+# Crash/diagnostic logging — a --windowed PyInstaller build has no console,
+# so every existing print("[DMS] ...") statement throughout dms_server.py
+# and any uncaught exception (including one in a background thread, e.g.
+# put_tree's _background_sync, which no per-request error handler ever
+# sees) previously vanished silently instead of being visible anywhere.
+# Redirecting stdout/stderr to a file makes all of that visible after the
+# fact -- ask the user to check/send %USERPROFILE%\DMS-server.log (or
+# ~/DMS-server.log on Mac) when something goes wrong with no on-screen
+# detail. Only done for the frozen build; running from source already has
+# a real terminal to watch live.
+# ---------------------------------------------------------------------------
+if getattr(sys, "frozen", False):
+    try:
+        _log_path = Path.home() / "DMS-server.log"
+        _log_fh = open(_log_path, "a", buffering=1, encoding="utf-8", errors="replace")
+        sys.stdout = _log_fh
+        sys.stderr = _log_fh
+        print(f"\n=== DMS starting {time.strftime('%Y-%m-%d %H:%M:%S')} (pid={os.getpid()}) ===")
+
+        def _log_uncaught(exc_type, exc_value, exc_tb):
+            import traceback
+            traceback.print_exception(exc_type, exc_value, exc_tb, file=sys.stderr)
+
+        sys.excepthook = _log_uncaught
+        threading.excepthook = lambda args: _log_uncaught(
+            args.exc_type, args.exc_value, args.exc_traceback
+        )
+    except OSError:
+        pass  # best-effort -- never block startup over a log file we can't open
+
+
+# ---------------------------------------------------------------------------
 # Trial period check — runs before anything else starts
 # ---------------------------------------------------------------------------
 _TRIAL_CONFIG = Path.home() / ".pms_dms_trial.json"
