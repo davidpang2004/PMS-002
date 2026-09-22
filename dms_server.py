@@ -7845,6 +7845,254 @@ def export_project_selected():
                      mimetype="application/octet-stream")
 
 
+def _gen_node_id() -> str:
+    return f"NODE-{secrets.token_hex(3).upper()}"
+
+
+def _gen_doc_id() -> str:
+    return "DOC-" + datetime.now().strftime("%Y%m%d") + "-" + secrets.token_hex(4).upper()
+
+
+def _gen_login_id() -> str:
+    return f"LOGIN-{secrets.token_hex(4).upper()}"
+
+
+def _count_docs_in_subtree(node: dict) -> int:
+    n = len(node.get("documents") or [])
+    for child in (node.get("children") or []):
+        n += _count_docs_in_subtree(child)
+    return n
+
+
+def _merge_project_into(target_idx: dict, target_docs_dir: Path,
+                         source_idx: dict, source_docs_dir: Path,
+                         dry_run: bool) -> dict:
+    """Merge source_idx (an already-loaded index.json from another DMS
+    project folder) into target_idx, in place. Used by /api/project/combine
+    to fold several separate "sub-project" storage folders into one.
+
+    Matching walks each project's tree by *name*, starting at the root's own
+    children -- the root node itself is never matched against anything (its
+    name is just that project's own label), only reused as-is. Wherever a
+    child name matches an existing target node at the same position, the two
+    are merged (recursing the same way); wherever it doesn't, the whole
+    source subtree is copied in as a new node. Every node/document copied in
+    gets a brand-new id -- never the source's own -- so there's no chance of
+    an id collision with the target or with an earlier source in the same
+    batch. A document that's linked into more than one source folder (same
+    doc id under multiple nodes) is only copied once; every later reference
+    points at that same new copy via doc_id_map.
+
+    "Not Show in Tree" (the recycle bin -- see NOT_SHOW_FOLDER_NAME) is
+    skipped wherever it appears: documents a sub-project's own user already
+    deleted don't come back in the merged project.
+
+    Within a matched folder, a source document is skipped as a duplicate
+    when the target folder already has a document with the same name AND
+    size -- the same heuristic uploadFilesToNode's own duplicate-detection
+    dialog uses client-side.
+
+    copy_jobs (the actual `shutil.copy2` calls) are only ever queued, never
+    executed here -- the caller runs them, and only when not dry_run, which
+    is what makes a dry run touch zero bytes on disk while still returning
+    accurate counts (the tree/docIndex mutation above still happens either
+    way, but the caller discards target_idx afterwards instead of persisting
+    it when dry_run is set).
+    """
+    summary = {
+        "folders_matched": 0,
+        "folders_added": 0,
+        "docs_copied": 0,
+        "docs_skipped_duplicate": 0,
+        "docs_skipped_recycle_bin": 0,
+        "logins_merged": 0,
+    }
+    copy_jobs: list[tuple[Path, Path]] = []
+    doc_id_map: dict[str, str] = {}
+    node_id_map: dict[str, str] = {}  # source node id -> target node id (matched or newly created)
+
+    source_doc_by_id = {d["id"]: d for d in (source_idx.get("docIndex") or []) if d.get("id")}
+    target_doc_index = target_idx.setdefault("docIndex", [])
+    # O(1) duplicate-name/size lookups instead of rescanning the whole
+    # (potentially huge, ever-growing) target_doc_index per source document.
+    target_doc_by_id: dict[str, dict] = {d["id"]: d for d in target_doc_index if d.get("id")}
+
+    # One directory walk for the whole merge instead of one rglob() per
+    # document -- _find_doc_files did docs_dir.rglob(f"*{doc_id}*") on every
+    # call, so copying N documents out of a source folder with N files on
+    # disk cost O(N^2) directory scans. Mirrors _find_doc_files' own exact-id
+    # matching (via _doc_id_from_filename), just computed once up front.
+    source_files_by_id: dict[str, list[Path]] = {}
+    if source_docs_dir.is_dir():
+        for f in source_docs_dir.rglob("*"):
+            if f.is_file():
+                source_files_by_id.setdefault(_doc_id_from_filename(f.name), []).append(f)
+
+    def is_duplicate(target_node: dict, name: str, size) -> bool:
+        for ref in (target_node.get("documents") or []):
+            entry = target_doc_by_id.get(ref.get("id"))
+            if entry and entry.get("name") == name and entry.get("size") == size:
+                return True
+        return False
+
+    def dest_path_for(target_parts: list, doc_id: str, safe_name: str) -> Path:
+        out_dir = target_docs_dir.joinpath(*target_parts) if target_parts else target_docs_dir
+        return out_dir / _doc_filename(doc_id, safe_name)
+
+    def merge_documents(target_node: dict, source_node: dict, target_parts: list):
+        for ref in (source_node.get("documents") or []):
+            src_doc_id = ref.get("id")
+            entry = source_doc_by_id.get(src_doc_id)
+            if not entry:
+                continue
+            if src_doc_id in doc_id_map:
+                new_id = doc_id_map[src_doc_id]
+                if not any(d.get("id") == new_id for d in (target_node.get("documents") or [])):
+                    target_node.setdefault("documents", []).append({"id": new_id})
+                continue
+            name = entry.get("name", "")
+            size = entry.get("size")
+            if is_duplicate(target_node, name, size):
+                summary["docs_skipped_duplicate"] += 1
+                continue
+            matches = source_files_by_id.get(src_doc_id)
+            if not matches:
+                continue  # index entry with no on-disk file left to copy
+            new_id = _gen_doc_id()
+            doc_id_map[src_doc_id] = new_id
+            safe_name = _safe_filename_part(name or matches[0].name)
+            dest = dest_path_for(target_parts, new_id, safe_name)
+            if not dry_run:
+                copy_jobs.append((matches[0], dest))
+            new_entry = {**entry, "id": new_id, "originalNodeId": target_node["id"]}
+            target_doc_index.append(new_entry)
+            target_doc_by_id[new_id] = new_entry
+            target_node.setdefault("documents", []).append({"id": new_id})
+            summary["docs_copied"] += 1
+
+    def merge_logins(target_node: dict, source_node: dict):
+        src_logins = source_node.get("logins") or []
+        if not src_logins:
+            return
+        merged = list(target_node.get("logins") or [])
+        existing_ids = {l.get("id") for l in merged}
+        for login in src_logins:
+            new_login = dict(login)
+            if not new_login.get("id") or new_login["id"] in existing_ids:
+                new_login["id"] = _gen_login_id()
+            merged.append(new_login)
+            existing_ids.add(new_login["id"])
+            summary["logins_merged"] += 1
+        target_node["logins"] = merged
+
+    def merge_node(target_node: dict, source_node: dict, target_parts: list):
+        if source_node.get("id"):
+            node_id_map[source_node["id"]] = target_node["id"]
+        if not target_node.get("description") and source_node.get("description"):
+            target_node["description"] = source_node["description"]
+        if not target_node.get("sn") and source_node.get("sn"):
+            target_node["sn"] = source_node["sn"]
+        merge_logins(target_node, source_node)
+        merge_documents(target_node, source_node, target_parts)
+
+        target_children = target_node.setdefault("children", [])
+        by_name = {c.get("name"): c for c in target_children}
+        for child in (source_node.get("children") or []):
+            if child.get("name") == NOT_SHOW_FOLDER_NAME:
+                summary["docs_skipped_recycle_bin"] += _count_docs_in_subtree(child)
+                continue
+            match = by_name.get(child.get("name"))
+            if match is None:
+                match = {"id": _gen_node_id(), "name": child.get("name"), "children": [], "documents": []}
+                target_children.append(match)
+                by_name[match["name"]] = match
+                summary["folders_added"] += 1
+            else:
+                summary["folders_matched"] += 1
+            child_parts = target_parts + [_safe_folder_name(match.get("name") or match.get("id") or "node")]
+            merge_node(match, child, child_parts)
+
+    source_root = source_idx.get("tree")
+    if source_root:
+        root_parts = [_safe_folder_name(target_idx["tree"].get("name") or target_idx["tree"].get("id") or "node")]
+        merge_node(target_idx["tree"], source_root, root_parts)
+
+    target_idx["keyParameters"] = normalize_key_parameters(
+        list(target_idx.get("keyParameters") or []) + list(source_idx.get("keyParameters") or [])
+    )
+    mapped_photo_root = node_id_map.get(source_idx.get("photoRootNodeId") or "")
+    if not target_idx.get("photoRootNodeId") and mapped_photo_root:
+        target_idx["photoRootNodeId"] = mapped_photo_root
+    target_idx["totalDocsUploaded"] = target_idx.get("totalDocsUploaded", 0) + summary["docs_copied"]
+
+    if not dry_run:
+        for src_file, dest in copy_jobs:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_file, dest)
+
+    return summary
+
+
+@app.route("/api/project/combine", methods=["POST"])
+def combine_project():
+    """Merge another DMS project's folder tree/documents into the currently
+    active project (the "target"). See _merge_project_into for the matching/
+    copy semantics. Never modifies or deletes anything in the source project
+    -- only reads from it and copies into the target.
+
+    Body JSON: { "source_path": "<abs path to another project's storage
+    folder>", "dry_run": bool }. dry_run computes and returns the same
+    summary counts without copying any file or writing index.json, so the UI
+    can preview a merge before committing to it.
+    """
+    target_root = get_storage_root()
+    if not target_root:
+        return jsonify({"error": "No active project folder. Open or create a project first."}), 400
+
+    data = request.get_json(silent=True) or {}
+    source_path = (data.get("source_path") or "").strip()
+    dry_run = bool(data.get("dry_run"))
+    if not source_path:
+        return jsonify({"error": "Missing 'source_path'"}), 400
+
+    try:
+        source_root = Path(source_path).expanduser().resolve()
+    except OSError as e:
+        return jsonify({"error": f"Invalid source path: {e}"}), 400
+
+    if not source_root.is_dir():
+        return jsonify({"error": f"Not a folder: {source_root}"}), 400
+    source_index_path = source_root / "index.json"
+    if not source_index_path.exists():
+        return jsonify({"error": f"No index.json found in {source_root} -- is this a DMS project folder?"}), 400
+    if source_root == target_root:
+        return jsonify({"error": "Source and target are the same project."}), 400
+    if source_root in target_root.parents or target_root in source_root.parents:
+        return jsonify({"error": "Source and target folders can't be nested inside one another."}), 400
+
+    try:
+        source_idx = json.loads(source_index_path.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        return jsonify({"error": f"Could not read source index.json: {e}"}), 400
+
+    idx = read_index()
+    if not idx.get("tree"):
+        return jsonify({"error": "The current project has no folder tree yet."}), 400
+
+    source_docs_dir = source_root / "docs"
+    target_docs_dir = get_docs_dir()
+
+    summary = _merge_project_into(idx, target_docs_dir, source_idx, source_docs_dir, dry_run)
+
+    if not dry_run:
+        try:
+            write_index(idx)
+        except OSError as e:
+            return jsonify({"error": f"Could not save merged index: {e}"}), 500
+
+    return jsonify({"ok": True, "dry_run": dry_run, "summary": summary})
+
+
 def _decrypt_uploaded_dms(raw: bytes, password: str):
     """Given the raw bytes of an uploaded .dms file, resolve it to plain zip
     bytes, decrypting first if it's password-protected (see
