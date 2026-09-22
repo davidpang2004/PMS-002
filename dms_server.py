@@ -52,7 +52,7 @@ from urllib.parse import quote as _url_quote
 try:
     from flask import (
         Flask, request, jsonify, send_file, send_from_directory,
-        abort, Response, redirect,
+        abort, Response, redirect, Request,
     )
 except ImportError:
     print("ERROR: Flask is not installed.")
@@ -333,7 +333,22 @@ def write_index(idx: dict) -> None:
     tmp = p.with_suffix(f".json.tmp-{secrets.token_hex(4)}")
     try:
         tmp.write_text(json.dumps(idx, indent=2))
-        os.replace(tmp, p)
+        # os.replace() is atomic, but on Windows it also requires that no
+        # other handle to the destination be open without FILE_SHARE_DELETE --
+        # a antivirus real-time scan or another overlapping write_index()
+        # call (a burst of uploads each persisting after every file, or
+        # several edits firing PUT /api/tree back to back) can briefly hold
+        # such a handle, failing the rename with PermissionError/WinError 5.
+        # That lock is transient, so a short retry clears it; seen for real
+        # as a "500" on ~1 file out of a 200+ photo batch upload on Windows.
+        for attempt in range(6):
+            try:
+                os.replace(tmp, p)
+                break
+            except PermissionError:
+                if attempt == 5:
+                    raise
+                _time.sleep(0.05 * (2 ** attempt))
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -1654,7 +1669,39 @@ def build_tree_order(nodes: dict, root: str) -> list:
 # ---------------------------------------------------------------------------
 # Flask application
 # ---------------------------------------------------------------------------
+class _StorageDriveRequest(Request):
+    """Buffer multipart file uploads on the storage drive, not the OS temp drive.
+
+    Flask/Werkzeug's default _get_file_stream() spools any multipart upload
+    over 500KB (i.e. every real file) to a SpooledTemporaryFile on the OS's
+    default temp directory (tempfile.gettempdir(), e.g. C:\\Users\\...\\Temp
+    on Windows) *before* our own route code ever runs -- regardless of how
+    much free space the user's actual chosen storage drive has. A user who
+    picked a roomy dedicated drive for storage (very common for a large photo
+    library) can still hit an uncatchable "No space left on device" from deep
+    inside Werkzeug's own request parsing if their OS drive happens to be low
+    on space -- seen for real: a sub-200MB video failed with a bare "Failed
+    to fetch" (the connection dying before any of our exception handling in
+    post_doc ever ran) while the storage drive itself had 1.3 TB free.
+    Overriding this hook redirects that buffering to a folder on the same
+    drive the file is actually being saved to, removing the OS drive's free
+    space as a factor entirely -- for every multipart upload route, present
+    and future, no matter which drive is configured as storage.
+    """
+
+    def _get_file_stream(self, total_content_length, content_type, filename=None, content_length=None):
+        try:
+            root = get_storage_root()
+            tmp_dir = root / ".upload_tmp" if root else None
+            if tmp_dir:
+                tmp_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            tmp_dir = None  # fall back to the OS default rather than fail the upload
+        return tempfile.SpooledTemporaryFile(max_size=1024 * 500, mode="rb+", dir=tmp_dir)
+
+
 app = Flask(__name__)
+app.request_class = _StorageDriveRequest  # see class def above — keeps multipart upload buffering off the OS drive
 app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024 * 1024  # 20 GB per upload — was 4 GB, too
 # small for full-length class-recording videos (some run 6-10+ GB). A request over this cap
 # gets its connection aborted mid-stream rather than a clean HTTP error, which the browser
@@ -3560,7 +3607,10 @@ def post_doc():
             "error": f"Document upload limit reached ({_get_max_documents()} total).",
             "code": "upload_limit_reached",
         }), 403
-    write_index(idx)
+    try:
+        write_index(idx)
+    except OSError as e:
+        return jsonify({"error": f"Could not update document index: {e}"}), 500
 
     mime = f.mimetype or "application/octet-stream"
     # Improve MIME from file extension if browser sent generic type
@@ -3741,7 +3791,10 @@ def post_doc_stream():
             "error": f"Document upload limit reached ({_get_max_documents()} total).",
             "code": "upload_limit_reached",
         }), 403
-    write_index(idx)
+    try:
+        write_index(idx)
+    except OSError as e:
+        return jsonify({"error": f"Could not update document index: {e}"}), 500
 
     mime = mimetypes.guess_type(orig_name)[0] or "application/octet-stream"
     ext = ext_for(mime, orig_name)

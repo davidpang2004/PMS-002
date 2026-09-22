@@ -7931,6 +7931,627 @@ const PlotPopoutApp = ({ storageKey }) => {
   );
 };
 
+// Popped-out icon/thumbnail grid for one folder -- opened by the "Pop out"
+// button next to the grid/list toggle (see DMS component) via localStorage +
+// a `?popout=grid` URL, the same handoff PlotPopoutApp uses above. Unlike the
+// chart popout (a one-shot snapshot), this window keeps polling the server
+// for the folder's current documents, since browsing/adding photos while
+// this window sits on another monitor is the whole point of popping it out.
+const GridPopoutApp = ({ storageKey }) => {
+  const [meta, setMeta] = useState(null); // { nodeId, nodeName, lang }
+  const [missing, setMissing] = useState(false);
+  const [tree, setTree] = useState(null);
+  const [docIndex, setDocIndex] = useState([]);
+  // Thumbnail size + sort order share the same localStorage keys the main
+  // window's toolbar uses, so a preference set in either place applies to
+  // both -- these are "how I like to browse", not per-window state.
+  const [thumbSize, setThumbSize] = useState(() => {
+    try {
+      const saved = localStorage.getItem("dms:grid-thumb-size");
+      if (saved === "small" || saved === "large" || saved === "xlarge") return saved;
+    } catch {}
+    return "large";
+  });
+  const [docSortBy, setDocSortBy] = useState(() => {
+    try {
+      const saved = localStorage.getItem("dms:doc-sort-by");
+      if (["name", "docDate", "dueDate", "uploadedAt"].includes(saved)) return saved;
+    } catch {}
+    return "name";
+  });
+  const [lightboxDoc, setLightboxDoc] = useState(null);
+  const [selectMode, setSelectMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState(new Set());
+  const [downloadDialog, setDownloadDialog] = useState(null); // { path, reveal, busy, error }
+  const [downloadFolderBrowserOpen, setDownloadFolderBrowserOpen] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [renamePrefixDialog, setRenamePrefixDialog] = useState(null); // { prefix, busy, error }
+
+  useEffect(() => {
+    try { localStorage.setItem("dms:grid-thumb-size", thumbSize); } catch {}
+  }, [thumbSize]);
+  useEffect(() => {
+    try { localStorage.setItem("dms:doc-sort-by", docSortBy); } catch {}
+  }, [docSortBy]);
+
+  useEffect(() => {
+    try {
+      const raw = storageKey && localStorage.getItem(storageKey);
+      if (!raw) { setMissing(true); return; }
+      const parsed = JSON.parse(raw);
+      setMeta(parsed);
+      // One-time handoff -- clear it now so it doesn't linger in
+      // localStorage indefinitely once this window has read it.
+      localStorage.removeItem(storageKey);
+    } catch (e) {
+      setMissing(true);
+    }
+  }, [storageKey]);
+
+  const refresh = useCallback(async () => {
+    if (!meta) return;
+    try {
+      const [treeResp, idx] = await Promise.all([
+        StorageAdapter.getTree(),
+        StorageAdapter.listDocumentIndex(),
+      ]);
+      setTree(treeResp.tree);
+      setDocIndex(idx);
+      const node = findNode(treeResp.tree, meta.nodeId);
+      if (node && node.name && node.name !== meta.nodeName) {
+        setMeta((m) => (m ? { ...m, nodeName: node.name } : m));
+      }
+    } catch (e) {
+      console.error("[DMS] popout grid refresh failed:", e);
+    }
+  }, [meta && meta.nodeId]);
+
+  useEffect(() => {
+    if (!meta) return;
+    refresh();
+    const id = setInterval(refresh, 4000);
+    return () => clearInterval(id);
+  }, [meta && meta.nodeId, refresh]);
+
+  useEffect(() => {
+    if (meta) document.title = `${meta.nodeName || "DMS"} — ${meta.lang === "en" ? "Icons" : "图标视图"}`;
+  }, [meta && meta.nodeName, meta && meta.lang]);
+
+  const langCtxValue = useMemo(() => ({
+    lang: meta?.lang || "zh",
+    t: (zh, en) => (meta?.lang === "en" ? en : zh),
+    setLang: () => {},
+  }), [meta && meta.lang]);
+
+  // Re-sort the folder's (already A-Z) document list by the chosen field --
+  // mirrors sortDocsForDisplay in the main DMS component's toolbar exactly,
+  // so the two windows behave identically.
+  const sortDocsForDisplay = (docsList, sortBy) => {
+    if (sortBy === "name") return docsList;
+    const fieldFor = {
+      docDate: (d) => d.docDate || "",
+      dueDate: (d) => d.dueDate || "",
+      uploadedAt: (d) => d.uploadedAt || "",
+    }[sortBy];
+    if (!fieldFor) return docsList;
+    const ascending = sortBy === "dueDate";
+    return [...docsList].sort((a, b) => {
+      const va = fieldFor(a), vb = fieldFor(b);
+      if (!va && !vb) return 0;
+      if (!va) return 1;
+      if (!vb) return -1;
+      return ascending ? va.localeCompare(vb) : vb.localeCompare(va);
+    });
+  };
+
+  const node = tree && meta ? findNode(tree, meta.nodeId) : null;
+
+  const docs = useMemo(() => {
+    if (!node) return [];
+    const idxMap = new Map(docIndex.map((d) => [d.id, d]));
+    const base = (node.documents || [])
+      .map((ref) => idxMap.get(ref.id))
+      .filter(Boolean)
+      .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }));
+    return sortDocsForDisplay(base, docSortBy);
+  }, [node, docIndex, docSortBy]);
+
+  // Drop selections for documents that vanished from this view (deleted,
+  // moved out, etc. -- possibly from the main window) on the next refresh.
+  useEffect(() => {
+    setSelectedIds((prev) => {
+      if (prev.size === 0) return prev;
+      const validIds = new Set(docs.map((d) => d.id));
+      let changed = false;
+      const next = new Set();
+      prev.forEach((id) => { if (validIds.has(id)) next.add(id); else changed = true; });
+      return changed ? next : prev;
+    });
+  }, [docs]);
+
+  const toggleSelect = (docId) => {
+    setSelectedIds((prev) => {
+      const n = new Set(prev);
+      n.has(docId) ? n.delete(docId) : n.add(docId);
+      return n;
+    });
+  };
+
+  const openDownloadDialog = async () => {
+    let defaultPath = "";
+    try {
+      const r = await StorageAdapter.getDefaultDownloadFolder();
+      defaultPath = r.path || "";
+    } catch {}
+    setDownloadDialog({ path: defaultPath, reveal: true, busy: false, error: "" });
+  };
+
+  const confirmDownloadSelected = async () => {
+    const docIds = Array.from(selectedIds);
+    if (!docIds.length || !downloadDialog) return;
+    setDownloadDialog((d) => ({ ...d, busy: true, error: "" }));
+    try {
+      const res = await StorageAdapter.downloadDocsToFolder(docIds, downloadDialog.path, downloadDialog.reveal);
+      setDownloadDialog(null);
+      setSelectMode(false);
+      setSelectedIds(new Set());
+      alert(langCtxValue.t(
+        `已将 ${res.count} 份文档下载至：\n${res.folder}` + (res.skipped?.length ? `\n\n${res.skipped.length} 份未找到，已跳过。` : ""),
+        `Downloaded ${res.count} document(s) to:\n${res.folder}` + (res.skipped?.length ? `\n\n${res.skipped.length} could not be found and were skipped.` : "")
+      ));
+    } catch (e) {
+      setDownloadDialog((d) => ({ ...d, busy: false, error: e.message || String(e) }));
+    }
+  };
+
+  // Strip characters that are illegal in a filename on Windows/macOS/Linux --
+  // mirrors sanitizeForFilename in the main DMS component (used there by the
+  // date+location batch rename); the prefix here lands on the actual file on
+  // disk too, so it needs the same guard.
+  const sanitizeForFilename = (s) => (s || "").replace(/[\\/:*?"<>|]/g, "").trim();
+
+  // Where the prefix lands in a filename: right after a leading YYYY-MM-DD
+  // (so "2026-09-21-beach.jpg" + "Trip-" becomes "2026-09-21Trip--beach.jpg"
+  // -- the date stays intact and sorts/reads the same way), otherwise at the
+  // very front of the name.
+  const insertPrefix = (name, prefix) => {
+    const m = name.match(/^(\d{4}-\d{2}-\d{2})(.*)$/);
+    return m ? m[1] + prefix + m[2] : prefix + name;
+  };
+
+  // Add a user-typed prefix to every selected document's filename. Renames
+  // the file on disk first, one at a time (StorageAdapter.renameDocFile --
+  // the same endpoint the main window's inline rename uses), then persists
+  // whichever renames actually succeeded into docIndex in one save -- so a
+  // failure partway through never leaves the display name and the on-disk
+  // file disagreeing for the ones that did rename.
+  const confirmRenamePrefix = async () => {
+    const ids = Array.from(selectedIds);
+    const prefix = sanitizeForFilename(renamePrefixDialog?.prefix || "");
+    if (!ids.length || !prefix || !renamePrefixDialog) return;
+    setRenamePrefixDialog((d) => ({ ...d, busy: true, error: "" }));
+
+    const idxMap = new Map(docIndex.map((d) => [d.id, d]));
+    const renamed = [];
+    let error = null;
+    for (const id of ids) {
+      const doc = idxMap.get(id);
+      if (!doc) continue;
+      const newName = insertPrefix(doc.name, prefix);
+      try {
+        await StorageAdapter.renameDocFile(id, newName);
+        renamed.push({ id, newName });
+      } catch (e) {
+        error = langCtxValue.t(`重命名 "${doc.name}" 失败：`, `Failed to rename "${doc.name}": `) + (e.message || String(e));
+        break;
+      }
+    }
+
+    if (renamed.length) {
+      const renameMap = new Map(renamed.map((r) => [r.id, r.newName]));
+      const newIndex = docIndex.map((entry) => (renameMap.has(entry.id) ? { ...entry, name: renameMap.get(entry.id) } : entry));
+      await StorageAdapter.saveDocumentIndex(newIndex);
+    }
+    await refresh();
+
+    if (error) {
+      setRenamePrefixDialog((d) => ({ ...d, busy: false, error }));
+      return;
+    }
+    setRenamePrefixDialog(null);
+    setSelectMode(false);
+    setSelectedIds(new Set());
+  };
+
+  // Bulk "remove from folder" -- mirrors unlinkDocsFromNodeBulk in the main
+  // DMS component exactly (same recycle-bin-on-last-ref, same "Suspected
+  // duplicates" full-delete override) so a delete here behaves identically
+  // to one issued from the main window, just recomputed from this window's
+  // own fetched tree/docIndex rather than shared React state.
+  const NOT_SHOW_FOLDER = "Not Show in Tree";
+  const DUPE_REVIEW_PARENT_NAMES = new Set(["疑似重复照片", "Suspected duplicates"]);
+
+  const getOrCreateNotShowNode = (currentTree) => {
+    const existing = (currentTree.children || []).find((c) => c.name === NOT_SHOW_FOLDER);
+    if (existing) return [currentTree, existing.id];
+    const newId = genNodeId();
+    const newNode = { id: newId, name: NOT_SHOW_FOLDER, children: [], documents: [] };
+    const updated = { ...currentTree, children: [...(currentTree.children || []), newNode] };
+    return [updated, newId];
+  };
+
+  const stripDocsFromAllNodes = (root, idSet) => ({
+    ...root,
+    documents: (root.documents || []).filter((d) => !idSet.has(d.id)),
+    children: (root.children || []).map((c) => stripDocsFromAllNodes(c, idSet)),
+  });
+
+  const deleteSelected = async () => {
+    if (!tree || !meta) return;
+    const ids = Array.from(selectedIds);
+    if (!ids.length) return;
+    const idSet = new Set(ids);
+
+    const refMap = new Map(); // docId -> nodeId[]
+    (function walk(n) {
+      for (const d of (n.documents || [])) {
+        if (!d || !d.id) continue;
+        if (!refMap.has(d.id)) refMap.set(d.id, []);
+        refMap.get(d.id).push(n.id);
+      }
+      (n.children || []).forEach(walk);
+    })(tree);
+
+    const parent = findParentNode(tree, meta.nodeId);
+    const forceFullDelete = !!parent && DUPE_REVIEW_PARENT_NAMES.has(parent.name);
+
+    const actualLinkedElsewhereCount = ids.filter(
+      (id) => (refMap.get(id) || []).filter((n) => n !== meta.nodeId).length > 0
+    ).length;
+    const lastRefIds = forceFullDelete
+      ? ids
+      : ids.filter((id) => (refMap.get(id) || []).filter((n) => n !== meta.nodeId).length === 0);
+    const linkedElsewhereCount = ids.length - lastRefIds.length;
+
+    let confirmMsg;
+    if (forceFullDelete && actualLinkedElsewhereCount > 0) {
+      confirmMsg = langCtxValue.t(
+        `确定删除选中的 ${ids.length} 份文档？\n\n这是"疑似重复照片"审查文件夹 — 删除会移除这些文档的所有链接（包括原文件夹），并将其移至根目录下的"${NOT_SHOW_FOLDER}"文件夹，文件保留在磁盘上。`,
+        `Delete the selected ${ids.length} document(s)?\n\nThis is a "Suspected duplicates" review folder — deleting here removes every link to these documents (including their original folders) and moves them to the "${NOT_SHOW_FOLDER}" folder at the root; the files stay on disk.`
+      );
+    } else if (linkedElsewhereCount === 0) {
+      confirmMsg = langCtxValue.t(
+        `确定从此文件夹移除选中的 ${ids.length} 份文档？\n\n文档将被移至根目录下的"${NOT_SHOW_FOLDER}"文件夹，文件保留在磁盘上。`,
+        `Remove the selected ${ids.length} document(s) from this folder?\n\nThey'll be moved to the "${NOT_SHOW_FOLDER}" folder at the root; the files stay on disk.`
+      );
+    } else if (lastRefIds.length === 0) {
+      confirmMsg = langCtxValue.t(
+        `确定移除选中的 ${ids.length} 份文档在此文件夹的链接？\n\n这些文档仍链接至其他文件夹，文件不会从磁盘删除。`,
+        `Remove the selected ${ids.length} document(s)' links from this folder?\n\nThey're still linked to other folders; the files won't be deleted from disk.`
+      );
+    } else {
+      confirmMsg = langCtxValue.t(
+        `确定从此文件夹移除选中的 ${ids.length} 份文档？\n\n其中 ${lastRefIds.length} 份无其他链接，将移至"${NOT_SHOW_FOLDER}"文件夹；其余 ${linkedElsewhereCount} 份仍链接至其他文件夹，仅移除此处的链接。`,
+        `Remove the selected ${ids.length} document(s) from this folder?\n\n${lastRefIds.length} have no other links and will move to the "${NOT_SHOW_FOLDER}" folder; the remaining ${linkedElsewhereCount} are still linked elsewhere and will only lose this folder's link.`
+      );
+    }
+    if (!confirm(confirmMsg)) return;
+
+    setDeleting(true);
+    try {
+      let workingTree = forceFullDelete
+        ? stripDocsFromAllNodes(tree, idSet)
+        : updateNodeInTree(tree, meta.nodeId, (n) => ({
+            ...n,
+            documents: (n.documents || []).filter((d) => !idSet.has(d.id)),
+          }));
+
+      let updatedIndex = docIndex;
+      if (lastRefIds.length > 0) {
+        const lastRefSet = new Set(lastRefIds);
+        let notShowId;
+        [workingTree, notShowId] = getOrCreateNotShowNode(workingTree);
+        workingTree = updateNodeInTree(workingTree, notShowId, (n) => ({
+          ...n,
+          documents: [...(n.documents || []), ...lastRefIds.map((id) => ({ id }))],
+        }));
+        updatedIndex = docIndex.map((e) => (lastRefSet.has(e.id) ? { ...e, originalNodeId: notShowId } : e));
+        await StorageAdapter.saveDocumentIndex(updatedIndex);
+      }
+
+      await StorageAdapter.saveTree(workingTree);
+      setSelectMode(false);
+      setSelectedIds(new Set());
+      await refresh();
+    } catch (e) {
+      alert(langCtxValue.t("删除失败：", "Delete failed: ") + (e.message || String(e)));
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  if (missing) {
+    return (
+      <div className="h-full flex items-center justify-center text-base text-stone-700 p-6 text-center">
+        This window has expired — go back to DMS and use "Pop out" again to open a fresh one.
+      </div>
+    );
+  }
+  if (!meta) return null;
+
+  const isHeic = (d) => d.mime === "image/heic" || d.mime === "image/heif" ||
+    (d.name || "").split(".").pop().toLowerCase() === "heic" || (d.name || "").split(".").pop().toLowerCase() === "heif";
+
+  return (
+    <LangContext.Provider value={langCtxValue}>
+      <div className="h-full flex flex-col bg-stone-50">
+        <div className="px-4 py-2.5 border-b border-stone-200 shrink-0 flex items-center justify-between gap-3 flex-wrap">
+          <div className="min-w-0">
+            <div className="text-[12px] tracking-[0.2em] uppercase text-stone-700">{langCtxValue.t("图标视图", "Icon view")}</div>
+            <h1 className="text-base font-semibold text-stone-900 truncate">{meta.nodeName}</h1>
+          </div>
+          <div className="flex items-center gap-2 flex-wrap">
+            {docs.length > 1 && (
+              <select
+                value={docSortBy}
+                onChange={(e) => setDocSortBy(e.target.value)}
+                title={langCtxValue.t("选择文档列表的排序方式", "Choose how the document list is ordered")}
+                className="text-[13px] border border-stone-300 rounded px-1.5 py-1 bg-white hover:border-amber-400 focus:outline-none focus:border-amber-500"
+              >
+                <option value="name">{langCtxValue.t("名称 (A–Z)", "Name (A–Z)")}</option>
+                <option value="docDate">{langCtxValue.t("日期（元数据）", "Date (metadata)")}</option>
+                <option value="dueDate">{langCtxValue.t("到期日（元数据）", "Due (metadata)")}</option>
+                <option value="uploadedAt">{langCtxValue.t("修改日期", "Date modified")}</option>
+              </select>
+            )}
+            <div className="flex items-center border border-stone-300 rounded overflow-hidden shrink-0">
+              <button
+                onClick={() => setThumbSize("small")}
+                className={"px-2 py-1 text-[12px] " + (thumbSize === "small" ? "bg-stone-700 text-white" : "bg-white text-stone-600 hover:bg-stone-100")}
+              >{langCtxValue.t("小图标", "Small")}</button>
+              <button
+                onClick={() => setThumbSize("large")}
+                className={"px-2 py-1 text-[12px] border-l border-stone-300 " + (thumbSize === "large" ? "bg-stone-700 text-white" : "bg-white text-stone-600 hover:bg-stone-100")}
+              >{langCtxValue.t("大图标", "Large")}</button>
+              <button
+                onClick={() => setThumbSize("xlarge")}
+                className={"px-2 py-1 text-[12px] border-l border-stone-300 " + (thumbSize === "xlarge" ? "bg-stone-700 text-white" : "bg-white text-stone-600 hover:bg-stone-100")}
+              >{langCtxValue.t("超大图标", "Extra Large")}</button>
+            </div>
+            {!selectMode ? (
+              <button
+                onClick={() => { setSelectMode(true); setSelectedIds(new Set()); }}
+                className="text-sm px-2.5 py-1 border border-stone-300 hover:bg-amber-50 hover:border-amber-400 text-stone-700 rounded flex items-center gap-1.5 shrink-0"
+              >
+                <CheckSquare size={12} /> {langCtxValue.t("多选", "Select")}
+              </button>
+            ) : (
+              <button
+                onClick={() => { setSelectMode(false); setSelectedIds(new Set()); }}
+                className="text-sm px-2.5 py-1 border border-stone-300 hover:bg-stone-100 text-stone-700 rounded flex items-center gap-1.5 shrink-0"
+              >
+                <X size={12} /> {langCtxValue.t("取消", "Cancel")}
+              </button>
+            )}
+          </div>
+        </div>
+
+        {selectMode && (
+          <div className="flex items-center gap-2 px-4 py-2 border-b border-stone-200 bg-stone-100 flex-wrap">
+            <button
+              onClick={() => setSelectedIds(new Set(docs.map((d) => d.id)))}
+              className="text-sm px-2.5 py-1 border border-stone-300 hover:bg-amber-50 hover:border-amber-400 text-stone-700 rounded"
+            >{langCtxValue.t("全选", "Select all")}</button>
+            <button
+              onClick={() => setSelectedIds(new Set())}
+              className="text-sm px-2.5 py-1 border border-stone-300 hover:bg-stone-100 text-stone-700 rounded"
+            >{langCtxValue.t("清除", "Clear")}</button>
+            <span className="text-[13px] text-stone-700">
+              {langCtxValue.t(`已选 ${selectedIds.size} / ${docs.length}`, `${selectedIds.size} / ${docs.length} selected`)}
+            </span>
+            <button
+              onClick={() => setRenamePrefixDialog({ prefix: "", busy: false, error: "" })}
+              disabled={selectedIds.size === 0}
+              className="ml-auto text-sm px-2.5 py-1 border border-teal-300 hover:bg-teal-50 hover:border-teal-400 text-teal-700 rounded flex items-center gap-1.5 disabled:opacity-40"
+              title={langCtxValue.t("在选中文档的文件名前添加一段文字", "Add a text string to the front of the selected documents' filenames")}
+            >
+              <Tag size={12} /> {langCtxValue.t("加前缀", "Add prefix")} ({selectedIds.size})
+            </button>
+            <button
+              onClick={openDownloadDialog}
+              disabled={selectedIds.size === 0}
+              className="text-sm px-2.5 py-1 border border-amber-400 bg-amber-50 hover:bg-amber-100 text-amber-700 rounded flex items-center gap-1.5 disabled:opacity-40"
+            >
+              <Download size={12} /> {langCtxValue.t("下载", "Download")} ({selectedIds.size})
+            </button>
+            <button
+              onClick={deleteSelected}
+              disabled={selectedIds.size === 0 || deleting}
+              className="text-sm px-2.5 py-1 border border-red-400 bg-red-50 hover:bg-red-100 text-red-700 rounded flex items-center gap-1.5 disabled:opacity-40"
+            >
+              <Trash2 size={12} /> {deleting ? langCtxValue.t("删除中…", "Deleting…") : langCtxValue.t("删除", "Delete")} ({selectedIds.size})
+            </button>
+          </div>
+        )}
+
+        <div className="flex-1 min-h-0 overflow-auto p-3">
+          {docs.length === 0 ? (
+            <div className="text-base text-stone-600 text-center py-10">
+              {langCtxValue.t("此文件夹暂无文档", "No documents in this folder")}
+            </div>
+          ) : (
+            <div
+              className="grid gap-3"
+              style={{ gridTemplateColumns: `repeat(auto-fill, minmax(${thumbSize === "xlarge" ? 340 : thumbSize === "large" ? 200 : 110}px, 1fr))` }}
+            >
+              {docs.map((doc) => (
+                <DocumentGridTile
+                  key={doc.id}
+                  doc={doc}
+                  badgeSize={thumbSize === "small" ? "small" : "large"}
+                  selectMode={selectMode}
+                  selected={selectedIds.has(doc.id)}
+                  onToggleSelect={() => toggleSelect(doc.id)}
+                  onOpen={() => {
+                    if (selectMode) { toggleSelect(doc.id); return; }
+                    if (doc.mime?.startsWith("image/")) setLightboxDoc(doc);
+                    else fetch(`/api/docs/${doc.id}/open`, { method: "POST" });
+                  }}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+      {lightboxDoc && (
+        <div
+          className="fixed inset-0 bg-black/85 flex items-center justify-center z-50 p-6"
+          onClick={() => setLightboxDoc(null)}
+        >
+          <img
+            src={`${API_BASE}/api/docs/${lightboxDoc.id}${isHeic(lightboxDoc) ? "/preview" : ""}`}
+            alt={lightboxDoc.name}
+            className="max-w-full max-h-full object-contain"
+            onClick={(e) => e.stopPropagation()}
+          />
+          <button
+            onClick={() => setLightboxDoc(null)}
+            className="absolute top-4 right-4 text-white bg-black/50 hover:bg-black/70 rounded-full p-2"
+          >
+            <X size={20} />
+          </button>
+        </div>
+      )}
+
+      {downloadDialog && (
+        <div
+          className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center"
+          onClick={(e) => { if (e.target === e.currentTarget && !downloadDialog.busy) setDownloadDialog(null); }}
+        >
+          <div className="bg-white rounded-lg shadow-xl p-6 w-[28rem] flex flex-col gap-3">
+            <h3 className="font-semibold text-base text-stone-800">
+              {langCtxValue.t(`下载 ${selectedIds.size} 份文档`, `Download ${selectedIds.size} document(s)`)}
+            </h3>
+            <label className="text-sm text-stone-700">
+              {langCtxValue.t("保存至文件夹", "Save to folder")}
+              <div className="mt-1 flex gap-1.5">
+                <input
+                  type="text"
+                  value={downloadDialog.path}
+                  onChange={(e) => setDownloadDialog((d) => ({ ...d, path: e.target.value }))}
+                  placeholder={langCtxValue.t("例如：/Users/你/Downloads", "e.g. /Users/you/Downloads")}
+                  className="flex-1 min-w-0 text-sm px-2 py-1.5 border border-stone-300 rounded font-mono"
+                />
+                <button
+                  type="button"
+                  onClick={() => setDownloadFolderBrowserOpen(true)}
+                  className="shrink-0 flex items-center gap-1 text-sm px-2.5 py-1.5 border border-stone-300 rounded hover:bg-stone-50 text-stone-700"
+                >
+                  <FolderOpen size={12} /> {langCtxValue.t("浏览…", "Browse…")}
+                </button>
+              </div>
+            </label>
+            <button
+              onClick={openDownloadDialog}
+              className="self-start text-[13px] text-amber-700 hover:underline"
+            >
+              {langCtxValue.t("使用默认「下载」文件夹", "Use default Downloads folder")}
+            </button>
+            <label className="flex items-center gap-2 text-sm text-stone-700">
+              <input
+                type="checkbox"
+                checked={downloadDialog.reveal}
+                onChange={(e) => setDownloadDialog((d) => ({ ...d, reveal: e.target.checked }))}
+                className="accent-amber-600"
+              />
+              {langCtxValue.t("下载完成后打开该文件夹", "Open the folder after downloading")}
+            </label>
+            {downloadDialog.error && (
+              <div className="text-sm text-red-600 bg-red-50 border border-red-200 rounded px-2 py-1.5">{downloadDialog.error}</div>
+            )}
+            <div className="flex justify-end gap-2 mt-1">
+              <button
+                onClick={() => setDownloadDialog(null)}
+                disabled={downloadDialog.busy}
+                className="text-sm px-3 py-1.5 rounded border border-stone-300 hover:bg-stone-50 text-stone-700 disabled:opacity-40"
+              >{langCtxValue.t("取消", "Cancel")}</button>
+              <button
+                onClick={confirmDownloadSelected}
+                disabled={downloadDialog.busy || !downloadDialog.path.trim()}
+                className="text-sm px-3 py-1.5 rounded bg-amber-600 hover:bg-amber-700 text-white disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5"
+              >
+                <Download size={12} /> {downloadDialog.busy ? langCtxValue.t("下载中…", "Downloading…") : langCtxValue.t("下载", "Download")}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {downloadFolderBrowserOpen && (
+        <FolderBrowserModal
+          startPath={downloadDialog?.path || ""}
+          onClose={() => setDownloadFolderBrowserOpen(false)}
+          onSelect={(path) => {
+            setDownloadDialog((d) => ({ ...d, path }));
+            setDownloadFolderBrowserOpen(false);
+          }}
+        />
+      )}
+
+      {renamePrefixDialog && (
+        <div
+          className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center"
+          onClick={(e) => { if (e.target === e.currentTarget && !renamePrefixDialog.busy) setRenamePrefixDialog(null); }}
+        >
+          <div className="bg-white rounded-lg shadow-xl p-6 w-[26rem] flex flex-col gap-3">
+            <h3 className="font-semibold text-base text-stone-800">
+              {langCtxValue.t(`为 ${selectedIds.size} 份文档加前缀`, `Add a prefix to ${selectedIds.size} document(s)`)}
+            </h3>
+            <label className="text-sm text-stone-700">
+              {langCtxValue.t("前缀文字", "Prefix text")}
+              <input
+                type="text"
+                autoFocus
+                value={renamePrefixDialog.prefix}
+                onChange={(e) => setRenamePrefixDialog((d) => ({ ...d, prefix: e.target.value }))}
+                placeholder={langCtxValue.t("例如：2026家庭旅游-", "e.g. 2026-Trip-")}
+                className="mt-1 w-full text-sm px-2 py-1.5 border border-stone-300 rounded font-mono"
+              />
+            </label>
+            {(() => {
+              const firstDoc = docs.find((d) => selectedIds.has(d.id));
+              const cleanPrefix = sanitizeForFilename(renamePrefixDialog.prefix);
+              return firstDoc ? (
+                <div className="text-[12px] text-stone-600 truncate">
+                  {langCtxValue.t("示例：", "Example: ")}
+                  <span className="font-mono">{insertPrefix(firstDoc.name, cleanPrefix || "…")}</span>
+                </div>
+              ) : null;
+            })()}
+            {renamePrefixDialog.error && (
+              <div className="text-sm text-red-600 bg-red-50 border border-red-200 rounded px-2 py-1.5">{renamePrefixDialog.error}</div>
+            )}
+            <div className="flex justify-end gap-2 mt-1">
+              <button
+                onClick={() => setRenamePrefixDialog(null)}
+                disabled={renamePrefixDialog.busy}
+                className="text-sm px-3 py-1.5 rounded border border-stone-300 hover:bg-stone-50 text-stone-700 disabled:opacity-40"
+              >{langCtxValue.t("取消", "Cancel")}</button>
+              <button
+                onClick={confirmRenamePrefix}
+                disabled={renamePrefixDialog.busy || !sanitizeForFilename(renamePrefixDialog.prefix)}
+                className="text-sm px-3 py-1.5 rounded bg-teal-600 hover:bg-teal-700 text-white disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5"
+              >
+                <Tag size={12} /> {renamePrefixDialog.busy ? langCtxValue.t("重命名中…", "Renaming…") : langCtxValue.t("应用", "Apply")}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </LangContext.Provider>
+  );
+};
+
 /* =============================================================================
  * UI: COMBINE FOLDER MODAL
  * =============================================================================
@@ -15559,15 +16180,82 @@ function DMS({ storagePath, onChangeFolder }) {
     const filesToProcess = files;
     if (!filesToProcess.length) { setUploadStatus(null); return; }
     // snapshot at the start of this (possibly long) upload
-    const baseTree = baseTreeOverride || tree;
     let workingTree = baseTreeOverride || tree;
-    const newIndexEntries = [];
     // Docs whose date was auto-detected from their own text during this
     // upload -- surfaced in a single review dialog once the upload finishes
     // so the user gets a chance to verify/correct them (see docDate).
     const pendingDateVerification = [];
     setUploadStatus({ done: 0, total: filesToProcess.length, phase: "上传" });
     const failedFiles = [];
+
+    // Periodic checkpointing -- link+index each file's already-saved-to-disk
+    // upload into the tree/docIndex every CHECKPOINT_FILES files (or
+    // CHECKPOINT_MS, whichever comes first) instead of only once at the very
+    // end. A batch of hundreds/thousands of files can run for a long time;
+    // without this, closing the app, a dropped connection, or the machine
+    // sleeping partway through meant every file uploaded so far was saved to
+    // disk (saveDocument below persists each one individually) but never
+    // attached to a folder or added to docIndex -- invisible and, worse,
+    // re-uploading the same folder later would re-upload everything from
+    // scratch since duplicate detection above only looks at docIndex.
+    // Checkpointing keeps docIndex caught up as the batch runs, so an
+    // interrupted upload only ever loses the files since the last
+    // checkpoint, and re-selecting the same folder afterwards hits the
+    // existing duplicate-detection dialog, which already offers to skip
+    // files already in the library and upload only the rest.
+    const CHECKPOINT_FILES = 25;
+    const CHECKPOINT_MS = 10000;
+    let checkpointBaseTree = workingTree;
+    let pendingIndexEntries = [];
+    let filesSinceCheckpoint = 0;
+    let lastCheckpointAt = Date.now();
+
+    // Re-fetches the latest server tree/index and merges in only what's
+    // accumulated since the last successful checkpoint (mirrors the final
+    // save's own re-fetch-and-merge, done here potentially many times per
+    // upload instead of once). Leaves pendingIndexEntries/checkpointBaseTree
+    // untouched on failure so the same additions are retried -- with
+    // whatever else has piled up by then -- at the next checkpoint.
+    const commitCheckpoint = async () => {
+      if (!pendingIndexEntries.length) return true;
+      let freshTreeResp = null, freshIndex = null, fetchError = null;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          [freshTreeResp, freshIndex] = await Promise.all([
+            StorageAdapter.getTree(),
+            StorageAdapter.listDocumentIndex(),
+          ]);
+          fetchError = null;
+          break;
+        } catch (e) {
+          fetchError = e;
+          console.warn(`[DMS] Checkpoint re-fetch failed (attempt ${attempt}/3)`, e);
+          if (attempt < 3) await new Promise((r) => setTimeout(r, 1000 * attempt));
+        }
+      }
+      if (fetchError || !freshTreeResp?.tree || !freshIndex) {
+        console.warn("[DMS] Checkpoint skipped -- couldn't verify the latest tree/index; will retry at the next checkpoint.", fetchError);
+        return false;
+      }
+      const mergedTree = mergeTreeAdditions(checkpointBaseTree, workingTree, freshTreeResp.tree);
+      const mergedIndex = [...freshIndex, ...pendingIndexEntries];
+      const linkedCount = pendingIndexEntries.length;
+      await persistIndex(mergedIndex);
+      await persistTree(mergedTree);
+      checkpointBaseTree = mergedTree;
+      pendingIndexEntries = [];
+      filesSinceCheckpoint = 0;
+      lastCheckpointAt = Date.now();
+      console.log(`[DMS] Checkpoint committed (${linkedCount} file(s) linked)`);
+      return true;
+    };
+
+    const maybeCheckpoint = async () => {
+      filesSinceCheckpoint++;
+      if (filesSinceCheckpoint >= CHECKPOINT_FILES || Date.now() - lastCheckpointAt >= CHECKPOINT_MS) {
+        await commitCheckpoint();
+      }
+    };
 
     for (const file of filesToProcess) {
       const docId = genDocId();
@@ -15676,6 +16364,7 @@ function DMS({ storagePath, onChangeFolder }) {
         console.error("[DMS] ✗ saveDocument failed:", e);
         failedFiles.push(`${file.name} — ${e.message || e}`);
         setUploadStatus((s) => s ? { ...s, done: s.done + 1 } : s);
+        await maybeCheckpoint();
         continue;
       }
 
@@ -15715,7 +16404,7 @@ function DMS({ storagePath, onChangeFolder }) {
           docDateVerified: true,
         } : {}),
       };
-      newIndexEntries.push(newEntry);
+      pendingIndexEntries.push(newEntry);
       if (uploadResult.detectedDate) {
         pendingDateVerification.push({
           id: docId, name: uploadName,
@@ -15723,66 +16412,29 @@ function DMS({ storagePath, onChangeFolder }) {
         });
       }
       setUploadStatus((s) => s ? { ...s, done: s.done + 1 } : s);
+      await maybeCheckpoint();
     }
     try {
-      console.log("[DMS] Persisting updated tree and index ...");
-      // Re-fetch the latest tree/index right before the final save and merge
-      // in only what this upload actually added. A large upload can run for
-      // minutes, and `tree`/`docIndex` were snapshotted at the start — if the
-      // user creates a folder (or another action edits the index) while the
-      // upload is still running, blindly persisting the stale snapshot would
-      // silently overwrite (and delete) that concurrent change.
-      //
-      // This re-fetch is retried a few times before giving up — and if it
-      // never succeeds, this function now ABORTS the save entirely instead
-      // of falling back to `workingTree` (the local snapshot from the
-      // *start* of the upload, before this file existed). That fallback used
-      // to silently PUT the whole array over the server's copy; if the
-      // snapshot itself was incomplete (e.g. this upload started before the
-      // initial tree/index fetch on page load had finished), that overwrite
-      // could silently wipe out hundreds of unrelated documents' metadata —
-      // which is exactly what happened once. The uploaded files themselves
-      // are already safely saved to disk at this point either way (each file
-      // was persisted individually above, via saveDocument) — aborting here
-      // only means they aren't linked into the folder tree/index yet; nothing
-      // that already existed is ever at risk of being overwritten.
-      let freshTreeResp = null, freshIndex = null, fetchError = null;
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        try {
-          [freshTreeResp, freshIndex] = await Promise.all([
-            StorageAdapter.getTree(),
-            StorageAdapter.listDocumentIndex(),
-          ]);
-          fetchError = null;
-          break;
-        } catch (e) {
-          fetchError = e;
-          console.warn(`[DMS] Re-fetch before final save failed (attempt ${attempt}/3)`, e);
-          if (attempt < 3) await new Promise((r) => setTimeout(r, 1000 * attempt));
-        }
-      }
-
-      if (fetchError || !freshTreeResp?.tree || !freshIndex) {
-        console.error("[DMS] ✗ Could not verify the latest tree/index after 3 attempts — aborting the save to avoid overwriting other data.", fetchError);
+      console.log("[DMS] Persisting remaining checkpoint...");
+      // Commit whatever's accumulated since the last mid-loop checkpoint
+      // (same re-fetch-and-merge logic, retried a few times before giving
+      // up -- see commitCheckpoint above and its comment on why a failed
+      // re-fetch aborts the save rather than falling back to a stale local
+      // snapshot). The files themselves are already safely saved to disk
+      // either way (each was persisted individually above, via
+      // saveDocument) -- a failure here only means the most recent handful
+      // aren't linked into the folder tree/index yet; every earlier
+      // checkpoint's files already are, and nothing that already existed on
+      // the server is ever at risk of being overwritten.
+      const committed = await commitCheckpoint();
+      if (!committed && pendingIndexEntries.length > 0) {
+        console.error("[DMS] ✗ Could not verify the latest tree/index — the last batch wasn't linked.", pendingIndexEntries.length);
         alert(t(
-          `${filesToProcess.length - failedFiles.length} 个文件已保存到磁盘，但因无法确认最新的索引状态，本次未能将它们关联到文件夹中（未覆盖任何现有数据）。请稍后重新上传这些文件以完成关联。`,
-          `${filesToProcess.length - failedFiles.length} file(s) were saved to disk, but couldn't be linked into the folder tree because the latest index state couldn't be verified (no existing data was overwritten). Please try uploading these files again shortly to finish linking them.`
+          `${pendingIndexEntries.length} 个文件已保存到磁盘，但因无法确认最新的索引状态，本次未能将它们关联到文件夹中（本次上传中已完成关联的文件不受影响）。请稍后重新上传本文件夹以完成剩余文件——已关联的文件会被自动跳过。`,
+          `${pendingIndexEntries.length} file(s) were saved to disk, but couldn't be linked into the folder because the latest index state couldn't be verified (files already linked earlier in this upload are unaffected). Please upload this folder again shortly to finish the rest — already-linked files will be skipped automatically.`
         ));
         return;
       }
-
-      const finalTree = mergeTreeAdditions(baseTree, workingTree, freshTreeResp.tree);
-      const finalIndex = [...freshIndex, ...newIndexEntries];
-      // Save docIndex first, tree second (same order as unlinkDocFromNode /
-      // unlinkDocsFromNodeBulk below): if the second save fails partway, we
-      // want the surviving state to be "docIndex knows about the doc but no
-      // folder links to it yet" rather than "a folder links to a doc that
-      // has no docIndex entry" -- the latter renders as invisible, uncounted
-      // documents that look identical to files never uploaded at all (see
-      // delete_node's originalNodeId fallback in dms_server.py, which only
-      // covers the direction docIndex → tree, not tree → docIndex).
-      await persistIndex(finalIndex);
-      await persistTree(finalTree);
       console.log("[DMS] ✓ Upload complete");
       if (pendingDateVerification.length > 0) {
         setVerifyDatesQueue(pendingDateVerification);
@@ -17690,6 +18342,38 @@ function DMS({ storagePath, onChangeFolder }) {
                         >{t("大图标", "Large")}</button>
                       </div>
                     )}
+                    {docViewMode === "grid" && (
+                      <button
+                        onClick={() => {
+                          if (!selectedId) return;
+                          const key = `dms_grid_popout_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+                          const payload = {
+                            nodeId: selectedId,
+                            nodeName: selectedNode ? selectedNode.name : "",
+                            lang,
+                          };
+                          try {
+                            localStorage.setItem(key, JSON.stringify(payload));
+                          } catch (e) {
+                            alert(t("无法打开新窗口（浏览器存储不可用）。", "Couldn't open a new window (browser storage unavailable)."));
+                            return;
+                          }
+                          const w = window.open(
+                            `${location.pathname}?popout=grid&key=${encodeURIComponent(key)}`,
+                            `dms_grid_${selectedId}`,
+                            "popup,width=900,height=700,menubar=no,toolbar=no,location=no,status=no"
+                          );
+                          if (!w) {
+                            try { localStorage.removeItem(key); } catch (e) {}
+                            alert(t("弹出窗口被浏览器拦截，请允许本站的弹出窗口后重试。", "The pop-up was blocked by the browser — please allow pop-ups for this site and try again."));
+                          }
+                        }}
+                        title={t("在独立窗口中打开图标视图 -- 可拖到另一个显示器，也可随意调整大小", "Open the icon view in its own window — drag it to another monitor and resize it freely")}
+                        className="text-sm px-2 py-1 border border-stone-300 hover:bg-amber-50 hover:border-amber-400 text-stone-700 rounded flex items-center gap-1.5 shrink-0"
+                      >
+                        <ExternalLink size={12} /> {t("弹出", "Pop out")}
+                      </button>
+                    )}
                     <div className="ml-auto flex items-center border border-stone-300 rounded overflow-hidden shrink-0">
                       <button
                         onClick={() => setDocViewMode("list")}
@@ -19088,14 +19772,18 @@ function DMS({ storagePath, onChangeFolder }) {
   );
 }
 
-// A `?popout=plot&key=...` URL (opened by FolderPlotDialog's "pop out"
-// button, see popOut() there) renders just the standalone chart window
-// instead of the full app -- this is a separate top-level browser window,
-// not part of the main app's UI tree.
+// A `?popout=plot&key=...` or `?popout=grid&key=...` URL (opened by
+// FolderPlotDialog's "pop out" button / the icon-grid's "Pop out" button)
+// renders just that standalone window -- chart or photo/document grid --
+// instead of the full app. Each is a separate top-level browser window, not
+// part of the main app's UI tree, so it can be dragged to another monitor
+// and resized with the OS/browser's own window chrome.
 const _popoutParams = new URLSearchParams(location.search);
 const root = ReactDOM.createRoot(document.getElementById("root"));
 if (_popoutParams.get("popout") === "plot") {
   root.render(<PlotPopoutApp storageKey={_popoutParams.get("key") || ""} />);
+} else if (_popoutParams.get("popout") === "grid") {
+  root.render(<GridPopoutApp storageKey={_popoutParams.get("key") || ""} />);
 } else {
   root.render(<Root />);
 }
