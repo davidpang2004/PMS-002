@@ -40,6 +40,7 @@ import tempfile
 import threading as _threading
 import webbrowser
 import zipfile
+import concurrent.futures as _cf
 from datetime import datetime
 from pathlib import Path
 from threading import Timer, Lock as _Lock
@@ -492,7 +493,7 @@ def _safe_folder_name(name: str) -> str:
     return (safe[:60] if len(safe) > 60 else safe) or "node"
 
 
-def _reverse_geocode(lat: float, lon: float) -> "str | None":
+def _reverse_geocode_network(lat: float, lon: float) -> "str | None":
     """Return a concise location string for lat/lon via Nominatim, or raw coords on failure."""
     try:
         import urllib.request, json as _json, ssl
@@ -521,6 +522,155 @@ def _reverse_geocode(lat: float, lon: float) -> "str | None":
         print(f"[DMS] geocode failed ({lat:.4f},{lon:.4f}): {e}")
         # Fall back to raw coordinates so something is always saved
         return f"{lat:.5f}, {lon:.5f}"
+
+
+# _reverse_geocode() used to call _reverse_geocode_network() directly, right
+# inside the upload request handler -- a synchronous Nominatim round trip
+# (up to the 6s timeout above) on the critical path of every single GPS
+# photo upload. A folder of phone photos is almost always GPS-tagged and
+# almost always clustered into a handful of real-world locations (a trip,
+# an event), so a multi-hundred-photo upload paid that same network wait
+# over and over for what's usually the same few spots.
+#
+# That was later bounded to a 2s wait per new location instead of the full
+# 6s, via cache resolved names by a coarse (~111m) rounded coordinate so
+# only the first photo at a given location ever calls out to Nominatim.
+# But for a big import (hundreds of photos spread across dozens of distinct
+# places) even a 2s bound adds up -- every *first* photo at a new spot
+# still blocked its own upload request.
+#
+# Uploads no longer wait on geocoding at all: _reverse_geocode_and_patch()
+# fires the (cached, deduped) lookup in the background and, once it
+# resolves, queues the doc's metadata.Location for a background flush that
+# patches it into index.json by doc_id. Flushing is batched (every
+# _LOCATION_FLUSH_INTERVAL_SECONDS) rather than done per-photo so a big
+# import with dozens of newly-resolved locations costs one index write
+# every few seconds instead of one per photo. Cache and in-flight requests
+# are process-lifetime only (no disk persistence) -- deliberately simple,
+# and irrelevant across a restart.
+_GEOCODE_CACHE: dict = {}
+_GEOCODE_INFLIGHT: dict = {}
+_GEOCODE_LOCK = _Lock()
+_GEOCODE_EXECUTOR = _cf.ThreadPoolExecutor(max_workers=4, thread_name_prefix="geocode")
+
+
+def _geocode_cache_key(lat: float, lon: float) -> tuple:
+    return (round(lat, 3), round(lon, 3))  # ~111m grid
+
+
+# doc_id -> [location_text, attempts]. A doc_id can be queued before the doc
+# itself has landed in index.json (e.g. post_doc's response reaches the
+# client and the "create doc" call it triggers hasn't been saved yet) -- see
+# _flush_location_patches, which retries those up to _LOCATION_PATCH_MAX_ATTEMPTS
+# flushes so an abandoned upload doesn't sit in the queue forever.
+_LOCATION_PATCH_LOCK = _Lock()
+_LOCATION_PATCH_QUEUE: dict = {}
+_LOCATION_PATCH_MAX_ATTEMPTS = 20
+_LOCATION_FLUSH_INTERVAL_SECONDS = 5.0
+
+
+def _queue_location_patch(doc_id: str, location: str) -> None:
+    if not location:
+        return
+    with _LOCATION_PATCH_LOCK:
+        _LOCATION_PATCH_QUEUE[doc_id] = [location, 0]
+
+
+def _reverse_geocode_and_patch(doc_id: str, lat: float, lon: float) -> None:
+    """Resolve lat/lon to a place name in the background and queue it to be
+    patched into the doc's metadata once known. Never blocks the caller --
+    see the block comment above this section."""
+    key = _geocode_cache_key(lat, lon)
+    submitted = False
+    with _GEOCODE_LOCK:
+        if key in _GEOCODE_CACHE:
+            result = _GEOCODE_CACHE[key]
+            future = None
+        else:
+            future = _GEOCODE_INFLIGHT.get(key)
+            if future is None:
+                future = _GEOCODE_EXECUTOR.submit(_reverse_geocode_network, lat, lon)
+                _GEOCODE_INFLIGHT[key] = future
+                submitted = True
+
+    # add_done_callback() runs its callback IMMEDIATELY, in the calling
+    # thread, if the future has already finished by the time it's
+    # registered -- a real race here, not just a theoretical one (a photo's
+    # network lookup can fail instantly with no route to host, and tests
+    # mock it to return synchronously). Registering it while still holding
+    # _GEOCODE_LOCK let that immediate call re-enter the same non-reentrant
+    # lock from _store_result below and deadlock the calling thread against
+    # itself -- both add_done_callback calls happen only after the `with`
+    # block above has released the lock.
+    if future is None:
+        _queue_location_patch(doc_id, result)
+        return
+
+    if submitted:
+        def _store_result(f, key=key):
+            try:
+                r = f.result()
+            except Exception:
+                r = None
+            with _GEOCODE_LOCK:
+                _GEOCODE_CACHE[key] = r
+                _GEOCODE_INFLIGHT.pop(key, None)
+
+        future.add_done_callback(_store_result)
+
+    def _on_done(f, doc_id=doc_id):
+        try:
+            r = f.result()
+        except Exception:
+            r = None
+        if r:
+            _queue_location_patch(doc_id, r)
+
+    future.add_done_callback(_on_done)
+
+
+def _flush_location_patches() -> None:
+    """Merge resolved GPS->place-name lookups into index.json, batching
+    however many finished geocoding since the last flush into one write."""
+    with _LOCATION_PATCH_LOCK:
+        if not _LOCATION_PATCH_QUEUE:
+            return
+        pending = dict(_LOCATION_PATCH_QUEUE)
+        _LOCATION_PATCH_QUEUE.clear()
+
+    idx = read_index()
+    by_id = {d.get("id"): d for d in idx.get("docIndex", [])}
+    changed = False
+    still_pending = {}
+    for doc_id, (location, attempts) in pending.items():
+        doc = by_id.get(doc_id)
+        if doc is None:
+            if attempts + 1 < _LOCATION_PATCH_MAX_ATTEMPTS:
+                still_pending[doc_id] = [location, attempts + 1]
+            continue
+        if not doc.get("metadata", {}).get("Location", {}).get("actual"):
+            doc.setdefault("metadata", {})["Location"] = {"design": "", "actual": location}
+            changed = True
+
+    if changed:
+        write_index(idx)
+
+    if still_pending:
+        with _LOCATION_PATCH_LOCK:
+            for doc_id, val in still_pending.items():
+                _LOCATION_PATCH_QUEUE.setdefault(doc_id, val)
+
+
+def _location_patch_flush_loop() -> None:
+    while True:
+        _time.sleep(_LOCATION_FLUSH_INTERVAL_SECONDS)
+        try:
+            _flush_location_patches()
+        except Exception as e:
+            print(f"[DMS] location-patch flush failed: {e}")
+
+
+_threading.Thread(target=_location_patch_flush_loop, daemon=True, name="location-patch-flush").start()
 
 
 def _read_photo_gps(data: bytes) -> "tuple[float, float] | tuple[None, None]":
@@ -2595,16 +2745,12 @@ def mobile_upload():
         data = f.read()
         is_photo = _is_photo_file(ext, mime)
         photo_year, photo_month = (None, None)
-        location = None
         gps_lat, gps_lon = None, None
         if is_photo:
             photo_year, photo_month = _read_photo_date(data, mime)
             gps_lat, gps_lon = _read_photo_gps(data)
             if gps_lat is not None:
-                try:
-                    location = _reverse_geocode(gps_lat, gps_lon)
-                except Exception:
-                    pass
+                _reverse_geocode_and_patch(doc_id, gps_lat, gps_lon)
 
         if is_photo and _valid_photo_year_month(photo_year, photo_month):
             # Auto-route into Year/Month subfolders under the upload base —
@@ -2651,7 +2797,8 @@ def mobile_upload():
             "size": out_path.stat().st_size,
             "uploadedAt": datetime.utcnow().isoformat() + "Z",
             "originalNodeId": attach_node_id or None,
-            "metadata": {"Location": {"design": "", "actual": location}} if location else {},
+            # No "metadata.Location" here -- it's patched in later by the
+            # background geocode flush (see _reverse_geocode_and_patch above).
             **({"lat": gps_lat, "lon": gps_lon} if gps_lat is not None else {}),
         }
         pending_doc_entries.append(doc_entry)
@@ -2900,7 +3047,15 @@ def get_settings():
     cfg = load_config()
     root = get_storage_root()
     info = {
-        "storage_path": cfg.get("storage_path", ""),
+        # A pinned instance (opened via "Open another project in a new
+        # window" / a CLI project path -- see _storage_path_override) must
+        # report ITS OWN project here, not the shared config's -- that
+        # belongs to whichever *other*, unpinned instance last saved it,
+        # which is a different project entirely. Falling back to cfg here
+        # for a pinned instance is exactly the bug that made the "change
+        # storage path" dialog (SettingsScreen's initial-setup prefill) show
+        # a stale, unrelated project's path instead of this instance's own.
+        "storage_path": _storage_path_override or cfg.get("storage_path", ""),
         "resolved_path": str(root) if root else "",
         "configured": bool(root),
         "exists": bool(root and root.exists()),
@@ -3585,6 +3740,11 @@ def _scan_uploaded_doc_date(out_path, orig_name):
 @app.route("/api/docs", methods=["POST"])
 def post_doc():
     """Upload a document. Expects multipart form: file=<binary>, doc_id=<DOC-ID>."""
+    # Per-phase timings, printed to the server log (DMS-server.log in the
+    # packaged build) once the file is saved -- the only way to tell, after
+    # the fact, whether a slow batch upload is spending its time reading the
+    # index, writing to the (possibly external) storage drive, or elsewhere.
+    _t_start = _time.monotonic()
     docs_dir = get_docs_dir()
     if not docs_dir:
         return jsonify({"error": "Storage path not configured"}), 503
@@ -3601,16 +3761,28 @@ def post_doc():
 
     node_id = request.form.get("node_id", "").strip() or None
 
+    _t_idx = _time.monotonic()
     idx = read_index()
+    _t_idx = _time.monotonic() - _t_idx
     if not _reserve_doc_slots(idx, 1):
         return jsonify({
             "error": f"Document upload limit reached ({_get_max_documents()} total).",
             "code": "upload_limit_reached",
         }), 403
-    try:
-        write_index(idx)
-    except OSError as e:
-        return jsonify({"error": f"Could not update document index: {e}"}), 500
+    # _reserve_doc_slots() only actually mutates idx (bumping
+    # totalDocsUploaded) when a document quota is active. Most builds ship
+    # with MAX_DOCUMENTS = 0 (unlimited), so without this guard every single
+    # file in a batch upload paid for a full read-modify-write of the whole
+    # index.json (tree + entire docIndex) here for no reason -- before the
+    # file's own bytes are even saved. That's pure overhead in the common
+    # case, and a real source of Windows slowness: write_index()'s
+    # os.replace() retries (up to ~1.6s of backoff) whenever antivirus
+    # real-time scanning is holding a lock on the file, once per upload.
+    if _get_max_documents():
+        try:
+            write_index(idx)
+        except OSError as e:
+            return jsonify({"error": f"Could not update document index: {e}"}), 500
 
     mime = f.mimetype or "application/octet-stream"
     # Improve MIME from file extension if browser sent generic type
@@ -3672,6 +3844,7 @@ def post_doc():
         return jsonify({"error": f"Could not create destination folder: {e}"}), 500
 
     out_path = out_dir / _doc_filename(doc_id, safe_name)
+    _t_write = _time.monotonic()
     if file_data is not None:
         try:
             out_path.write_bytes(file_data)
@@ -3695,6 +3868,7 @@ def post_doc():
         except Exception:
             tmp_path.unlink(missing_ok=True)
             raise
+    _t_write = _time.monotonic() - _t_write
 
     # Scan the document's own text for a date (for the "parameter vs. time"
     # plot feature) so the client can propose it as the document's date right
@@ -3718,14 +3892,10 @@ def post_doc():
     else:
         detected_date, detected_date_raw, detected_date_confidence = _scan_uploaded_doc_date(out_path, orig_name)
 
-    location = None
     gps_lat, gps_lon = None, None
     if photo_lat and photo_lon:
         try:
             gps_lat, gps_lon = float(photo_lat), float(photo_lon)
-            location = _reverse_geocode(gps_lat, gps_lon)
-            if location:
-                print(f"[DMS] GPS location: {location}")
         except (ValueError, Exception):
             pass
     if gps_lat is None and is_photo:
@@ -3736,15 +3906,18 @@ def post_doc():
         lat, lon = _read_photo_gps(file_data)
         if lat is not None:
             gps_lat, gps_lon = lat, lon
-            try:
-                location = _reverse_geocode(lat, lon)
-                if location:
-                    print(f"[DMS] GPS location (server fallback): {location}")
-            except Exception:
-                pass
+    if gps_lat is not None:
+        # Resolved in the background and patched into the doc's metadata
+        # later by doc_id -- never blocks this response. See
+        # _reverse_geocode_and_patch.
+        _reverse_geocode_and_patch(doc_id, gps_lat, gps_lon)
 
+    print(
+        f"[DMS] upload saved: {orig_name!r} total={_time.monotonic() - _t_start:.2f}s "
+        f"index_read={_t_idx:.2f}s disk_write={_t_write:.2f}s"
+    )
     return jsonify({"ok": True, "filename": out_path.name, "size": out_path.stat().st_size,
-                    "path": str(out_path), "location": location,
+                    "path": str(out_path),
                     "lat": gps_lat, "lon": gps_lon,
                     "detectedDate": detected_date, "detectedDateRaw": detected_date_raw,
                     "detectedDateConfidence": detected_date_confidence})
@@ -3791,10 +3964,13 @@ def post_doc_stream():
             "error": f"Document upload limit reached ({_get_max_documents()} total).",
             "code": "upload_limit_reached",
         }), 403
-    try:
-        write_index(idx)
-    except OSError as e:
-        return jsonify({"error": f"Could not update document index: {e}"}), 500
+    # See the matching comment in post_doc() above -- skip the whole-index
+    # write when there's no quota to persist.
+    if _get_max_documents():
+        try:
+            write_index(idx)
+        except OSError as e:
+            return jsonify({"error": f"Could not update document index: {e}"}), 500
 
     mime = mimetypes.guess_type(orig_name)[0] or "application/octet-stream"
     ext = ext_for(mime, orig_name)
@@ -3854,19 +4030,20 @@ def post_doc_stream():
     else:
         detected_date, detected_date_raw, detected_date_confidence = _scan_uploaded_doc_date(out_path, orig_name)
 
-    location = None
     gps_lat, gps_lon = None, None
     if photo_lat and photo_lon:
         try:
             gps_lat, gps_lon = float(photo_lat), float(photo_lon)
-            location = _reverse_geocode(gps_lat, gps_lon)
-            if location:
-                print(f"[DMS] GPS location: {location}")
         except (ValueError, Exception):
             pass
+    if gps_lat is not None:
+        # Resolved in the background and patched into the doc's metadata
+        # later by doc_id -- never blocks this response. See
+        # _reverse_geocode_and_patch.
+        _reverse_geocode_and_patch(doc_id, gps_lat, gps_lon)
 
     return jsonify({"ok": True, "filename": out_path.name, "size": out_path.stat().st_size,
-                    "path": str(out_path), "location": location,
+                    "path": str(out_path),
                     "lat": gps_lat, "lon": gps_lon,
                     "detectedDate": detected_date, "detectedDateRaw": detected_date_raw,
                     "detectedDateConfidence": detected_date_confidence})
@@ -8670,13 +8847,15 @@ def import_zip_docs():
 
                 _photo_exts = {"jpg","jpeg","png","heic","heif","tif","tiff","webp","gif","bmp"}
                 _is_photo = ext in _photo_exts or mime.startswith("image/")
-                location = None
                 gps_lat, gps_lon = None, None
                 if _is_photo:
                     lat, lon = _read_photo_gps(data)
                     if lat is not None:
                         gps_lat, gps_lon = lat, lon
-                        location = _reverse_geocode(lat, lon)
+                        # Resolved in the background and patched into the
+                        # doc's metadata later by doc_id -- never blocks
+                        # this import. See _reverse_geocode_and_patch.
+                        _reverse_geocode_and_patch(doc_id, lat, lon)
                 out_dir = _get_node_docs_dir(node["id"], idx.get("tree")) or docs_dir
                 target_node = node
 
@@ -8692,7 +8871,9 @@ def import_zip_docs():
                     "size": len(data),
                     "uploadedAt": datetime.now().isoformat() + "Z",
                     "originalNodeId": target_node["id"],
-                    "metadata": {"Location": {"design": "", "actual": location}} if location else {},
+                    # No "metadata.Location" here -- it's patched in later by
+                    # the background geocode flush (see
+                    # _reverse_geocode_and_patch above).
                     **({"lat": gps_lat, "lon": gps_lon} if gps_lat is not None else {}),
                     "sn": folder_name,
                 })

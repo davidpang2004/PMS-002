@@ -277,6 +277,143 @@ def _resolve_default_project_path() -> str:
         return ""
 
 
+def _create_blank_project(target: Path) -> None:
+    """Create a fresh, empty DMS project folder for the startup chooser's
+    "New project" option. Mirrors dms_server's /api/project/new (kept as a
+    small duplicate rather than importing dms_server, same reason as
+    _resolve_default_project_path): the folder must be new or empty, and it
+    gets a real empty index.json -- without one the web app treats the
+    project as first-run and seeds the sample demo data."""
+    import json
+    import secrets
+    target = target.expanduser().resolve()
+    if target.exists() and (not target.is_dir() or any(target.iterdir())):
+        raise ValueError(
+            f"文件夹不是空的 / This folder is not empty:\n{target}\n\n"
+            "新项目必须使用空的（或尚不存在的）文件夹。\n"
+            "A new project needs an empty (or not-yet-existing) folder."
+        )
+    (target / "docs").mkdir(parents=True, exist_ok=True)
+    (target / "index.json").write_text(json.dumps({
+        "tree": {
+            "id": "NODE-" + secrets.token_hex(3).upper(),
+            "name": "New Project",
+            "description": "",
+            "children": [],
+            "documents": [],
+        },
+        "docIndex": [],
+        "keyParameters": [],
+    }, indent=2))
+
+
+def _prompt_startup_project_choice(default_path: str) -> str:
+    """Ask the user, before anything else starts, which project to open:
+    the last one that was closed, or a different one picked from disk.
+
+    Runs on the same "resolve everything before touching Flask" footing as
+    the single-instance guard right below this -- a plain double-click
+    launch (no CLI project argument) used to silently reopen whatever
+    storage_path happened to be in the shared config; this makes that an
+    explicit choice instead.
+
+    Returns the resolved project path, or "" if the user closed the window
+    without picking either option -- the caller treats that as "don't
+    launch anything" and exits.
+    """
+    import tkinter.filedialog as _fd
+    import tkinter.messagebox as _mb
+
+    default_ok = bool(default_path) and Path(default_path).is_dir()
+    chosen: list[str] = []
+
+    root = tk.Tk()
+    root.title("QCDMS")
+    root.resizable(False, False)
+    BG, FG, SUB = "#fafaf9", "#1c1917", "#78716c"
+    root.configure(bg=BG)
+
+    tk.Label(
+        root, text="质量文件管理系统 QC Document Management System (QCDMS)",
+        font=("Helvetica", 13, "bold"), bg=BG, fg=FG,
+    ).pack(anchor="w", padx=20, pady=(16, 2))
+    tk.Label(
+        root, text="要打开哪个项目？ Which project would you like to open?",
+        font=("Helvetica", 10), bg=BG, fg=SUB,
+    ).pack(anchor="w", padx=20, pady=(0, 14))
+
+    body = tk.Frame(root, bg=BG)
+    body.pack(fill="x", padx=20, pady=(0, 18))
+
+    def _pick_continue():
+        chosen.append(default_path)
+        root.destroy()
+
+    def _pick_select():
+        picked = _fd.askdirectory(
+            title="选择 DMS 项目文件夹 / Select a DMS project folder",
+            initialdir=default_path if default_ok else str(Path.home()),
+            parent=root,
+        )
+        if picked:
+            chosen.append(picked)
+            root.destroy()
+        # Empty selection (user hit Cancel in the OS picker) leaves this
+        # chooser window open so they can try again or pick "Continue".
+
+    def _pick_new():
+        # A save-style dialog lets the user choose where the project goes
+        # *and* type its folder name in one step; the folder itself is
+        # created by _create_blank_project below.
+        picked = _fd.asksaveasfilename(
+            title="新建项目：输入项目文件夹名称 / New project: name the project folder",
+            initialdir=str(Path(default_path).parent) if default_ok else str(Path.home()),
+            initialfile="New Project",
+            parent=root,
+        )
+        if not picked:
+            return  # cancelled -- keep the chooser open
+        try:
+            _create_blank_project(Path(picked))
+        except (OSError, ValueError) as e:
+            _mb.showerror("无法新建项目 / Cannot create project", str(e), parent=root)
+            return
+        chosen.append(picked)
+        root.destroy()
+
+    tk.Button(
+        body, text="继续上次的项目 / Continue with last project", command=_pick_continue,
+        relief="groove", padx=14, pady=8, cursor="hand2", anchor="w",
+        state="normal" if default_ok else "disabled",
+    ).pack(fill="x")
+    tk.Label(
+        body, text=default_path if default_ok else "没有找到上次的项目 / No previous project found",
+        font=("Helvetica", 9), bg=BG, fg=SUB, anchor="w", justify="left",
+        wraplength=420,
+    ).pack(fill="x", pady=(2, 12))
+
+    tk.Button(
+        body, text="选择项目… / Select a project…", command=_pick_select,
+        relief="groove", padx=14, pady=8, cursor="hand2", anchor="w",
+    ).pack(fill="x", pady=(0, 12))
+
+    tk.Button(
+        body, text="新建项目… / New project…", command=_pick_new,
+        relief="groove", padx=14, pady=8, cursor="hand2", anchor="w",
+    ).pack(fill="x")
+    tk.Label(
+        body, text="将创建一个新的空白项目文件夹 / Creates a new, empty project folder",
+        font=("Helvetica", 9), bg=BG, fg=SUB, anchor="w", justify="left",
+        wraplength=420,
+    ).pack(fill="x", pady=(2, 0))
+
+    root.protocol("WM_DELETE_WINDOW", root.destroy)
+    root.eval("tk::PlaceWindow . center")
+    root.mainloop()
+
+    return chosen[0] if chosen else ""
+
+
 def get_all_local_ips() -> list[tuple[str, str]]:
     """Return list of (ip, interface_name) for all active non-loopback interfaces.
 
@@ -371,8 +508,16 @@ _cli_forced_port = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit
 if _cli_project_path:
     _resolved_target = str(Path(_cli_project_path).expanduser().resolve())
 else:
+    # Plain double-click launch (DMS.app / DMS.exe, no project argument) --
+    # ask rather than silently reopening whatever was last open. A CLI path
+    # (dev-mode invocation, or a sibling instance spawned via
+    # spawn_or_focus_instance() for "open another project") always skips
+    # this and goes straight to that path.
     _default_path = _resolve_default_project_path()
-    _resolved_target = str(Path(_default_path).expanduser().resolve()) if _default_path else ""
+    _picked_path = _prompt_startup_project_choice(_default_path)
+    if not _picked_path:
+        os._exit(0)  # chooser window closed without a choice -- nothing to launch
+    _resolved_target = str(Path(_picked_path).expanduser().resolve())
 
 _instances = _prune_dead_instances(_load_instances())
 _existing_instance = _instances.get(_resolved_target) if _resolved_target else None
@@ -624,12 +769,14 @@ end tell
 from dms_server import app  # noqa: E402
 import dms_server as _dms_server  # noqa: E402
 
-# If a project folder was passed as a command-line argument (either a plain
-# dev-mode invocation or a sibling instance spawned via
-# spawn_or_focus_instance() below), use it as the storage root for this
-# instance only -- does not touch the shared CONFIG_PATH. _resolved_target
-# was already computed above, before Flask was imported.
-if _cli_project_path:
+# Pin this instance to the project resolved above -- CLI argument (dev-mode
+# invocation, or a sibling instance spawned via spawn_or_focus_instance()),
+# or the user's own choice from _prompt_startup_project_choice(). Does not
+# touch the shared CONFIG_PATH itself (see set_storage_path() in
+# dms_server.py); that's written on quit instead (see LauncherWindow._quit),
+# so "last closed wins" reflects whatever project this instance actually
+# ran with, whether or not it matched the config's storage_path at launch.
+if _resolved_target:
     if not Path(_resolved_target).exists():
         Path(_resolved_target).mkdir(parents=True, exist_ok=True)
     _dms_server._storage_path_override = _resolved_target
@@ -743,7 +890,7 @@ time.sleep(0.5)
 class LauncherWindow:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        _title = f"QCDMS — {Path(_cli_project_path).name}" if _cli_project_path else "QCDMS"
+        _title = f"QCDMS — {Path(_resolved_target).name}" if _resolved_target else "QCDMS"
         self.root.title(_title)
         self.root.resizable(False, False)
 
@@ -1154,6 +1301,27 @@ class LauncherWindow:
             _dms_server._auto_backup()
         except Exception:
             pass
+
+        # Remember this project as the one to reopen on the next plain
+        # launch (double-click DMS.app/.exe, no project argument) -- "last
+        # closed wins", regardless of whether this instance was the very
+        # first one opened or a later "open another project" window.
+        # set_storage_path() (dms_server.py) deliberately does NOT do this
+        # for a pinned instance -- it only updates its own in-memory
+        # pointer, specifically so switching projects *while running
+        # alongside a sibling* can't silently redirect that sibling. That
+        # concern doesn't apply here: this instance is exiting for good, so
+        # writing its own resolved path straight into the shared config is
+        # safe and is exactly what makes the *next* plain launch resume
+        # wherever the user actually left off, instead of always reopening
+        # whichever project happened to be configured first.
+        if _resolved_target:
+            try:
+                _cfg = _dms_server.load_config()
+                _cfg["storage_path"] = _resolved_target
+                _dms_server.save_config(_cfg)
+            except Exception:
+                pass
 
         # Remove this instance from the multi-instance registry so the next
         # launch (or "open another project" from a sibling) doesn't try to
