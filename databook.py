@@ -715,6 +715,385 @@ def build_databook(
 
 
 # ---------------------------------------------------------------------------
+# Word (.docx) databook — auto-organized from a single folder selection, as
+# opposed to build_databook's manual per-document tree-checkbox selection.
+# Every subfolder under the chosen node becomes a nested chapter (numbered
+# "1", "1.1", "1.1.1", ...), documents keep the order they already have on
+# their node, and each document is immediately followed by its own free-text
+# note (doc.description), unlabeled -- it usually reads as a caption/story
+# about the photo rather than a formal field, and is omitted when empty.
+# PDF source documents
+# are rasterized page-by-page via PyMuPDF (optional, same library already
+# used for scanned-PDF OCR in pdf_extraction.py) since Word can't embed a
+# live PDF page; without it a document gets a placeholder note instead of
+# failing the whole build. python-docx itself is imported lazily inside
+# build_databook_docx so the rest of this module (and the existing PDF
+# databook) keeps working even where python-docx isn't installed.
+# ---------------------------------------------------------------------------
+_DOCX_CONTENT_W_IN = 7.0   # 8.5in page - 0.75in margins each side
+_DOCX_CONTENT_H_IN = 9.5   # 11in page  - 0.75in margins each side
+_DOCX_EASTASIAN_FONT = "Microsoft YaHei"  # CJK fallback; substituted automatically
+                                          # by Word/LibreOffice where absent
+
+
+def _pdf_pages_to_images(pdf_source, dpi: int = 150) -> list:
+    """Rasterize every page of a PDF (a Path, or raw bytes) into PNG bytes via
+    PyMuPDF. Returns [(png_bytes, width_px, height_px), ...]. Raises
+    ImportError if PyMuPDF isn't installed -- callers fall back to a
+    placeholder note rather than failing the whole databook."""
+    import fitz  # PyMuPDF
+    if isinstance(pdf_source, (bytes, bytearray)):
+        doc = fitz.open(stream=bytes(pdf_source), filetype="pdf")
+    else:
+        doc = fitz.open(str(pdf_source))
+    try:
+        out = []
+        for page in doc:
+            pix = page.get_pixmap(dpi=dpi)
+            out.append((pix.tobytes("png"), pix.width, pix.height))
+        return out
+    finally:
+        doc.close()
+
+
+def _image_bytes_for_docx(img_path: Path, max_dim: int = _MAX_EMBED_DIM):
+    """Downscale + re-encode an image for embedding (see _downscaled_jpeg_reader
+    for why re-encoding as JPEG matters for output size). Returns
+    (jpeg_bytes, width_px, height_px)."""
+    with Image.open(img_path) as im:
+        im = im.convert("RGB")
+        iw, ih = im.size
+        scale = min(1.0, max_dim / max(iw, ih))
+        if scale < 1.0:
+            im = im.resize((max(1, round(iw * scale)), max(1, round(ih * scale))), Image.LANCZOS)
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=_EMBED_JPEG_QUALITY, optimize=True)
+        return buf.getvalue(), im.size[0], im.size[1]
+
+
+def _add_centered_picture(document, img_bytes: bytes, iw: int, ih: int,
+                          max_w_in: float = _DOCX_CONTENT_W_IN,
+                          max_h_in: float = _DOCX_CONTENT_H_IN):
+    """Insert an image as its own centered paragraph, scaled to fit within
+    the content box (preserving aspect, never upscaled beyond the box)."""
+    from docx.shared import Inches
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    aspect = iw / (ih or 1)
+    box_aspect = max_w_in / max_h_in
+    if aspect > box_aspect:
+        w_in, h_in = max_w_in, max_w_in / aspect
+    else:
+        h_in, w_in = max_h_in, max_h_in * aspect
+    document.add_picture(io.BytesIO(img_bytes), width=Inches(w_in), height=Inches(h_in))
+    document.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+
+def _set_letter_page_docx(document):
+    from docx.shared import Inches
+    section = document.sections[0]
+    section.page_width = Inches(8.5)
+    section.page_height = Inches(11)
+    section.left_margin = section.right_margin = Inches(0.75)
+    section.top_margin = section.bottom_margin = Inches(0.75)
+
+
+def _set_cjk_fonts_docx(document):
+    """Point Normal/Title/Heading styles at a CJK-capable east-Asian font so
+    Chinese text renders correctly; readers without that exact font installed
+    get Word/LibreOffice's automatic font substitution, same as any other
+    missing-font case."""
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+
+    def apply(style):
+        rpr = style.element.get_or_add_rPr()
+        rFonts = rpr.find(qn("w:rFonts"))
+        if rFonts is None:
+            rFonts = OxmlElement("w:rFonts")
+            rpr.append(rFonts)
+        rFonts.set(qn("w:eastAsia"), _DOCX_EASTASIAN_FONT)
+
+    for name in ("Normal", "Title", "Heading 1", "Heading 2", "Heading 3"):
+        try:
+            apply(document.styles[name])
+        except KeyError:
+            pass
+
+
+def _emit_toc_docx(document):
+    """A real Word TOC field (not a static list) driven off Heading 1-3
+    styles, so it stays accurate if the reader edits the document later.
+    Marked to auto-update on open (see the w:updateFields setting in
+    build_databook_docx) -- otherwise Word shows the placeholder text below
+    until the reader manually updates the field."""
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    from docx.shared import Pt
+
+    p = document.add_paragraph()
+    r = p.add_run("Table of Contents")
+    r.bold = True
+    r.font.size = Pt(20)
+    document.add_paragraph()
+
+    field_p = document.add_paragraph()
+    run = field_p.add_run()
+    fld_begin = OxmlElement("w:fldChar")
+    fld_begin.set(qn("w:fldCharType"), "begin")
+    instr = OxmlElement("w:instrText")
+    instr.set(qn("xml:space"), "preserve")
+    instr.text = 'TOC \\o "1-3" \\h \\z \\u'
+    fld_sep = OxmlElement("w:fldChar")
+    fld_sep.set(qn("w:fldCharType"), "separate")
+    placeholder = OxmlElement("w:t")
+    placeholder.text = "Right-click here and choose “Update Field” to build the table of contents."
+    fld_end = OxmlElement("w:fldChar")
+    fld_end.set(qn("w:fldCharType"), "end")
+    for el in (fld_begin, instr, fld_sep, placeholder, fld_end):
+        run._r.append(el)
+
+
+def _emit_title_page_docx(document, title: str, subtitle: str, root: dict):
+    from docx.shared import Pt, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    kicker = document.add_paragraph()
+    kicker.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    kr = kicker.add_run("ENGINEERING DATABOOK")
+    kr.bold = True
+    kr.font.size = Pt(9)
+    kr.font.color.rgb = RGBColor(0xb4, 0x53, 0x09)
+
+    h = document.add_heading(title or "Untitled", level=0)
+    h.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    if subtitle:
+        sp = document.add_paragraph()
+        sp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        sr = sp.add_run(subtitle)
+        sr.font.size = Pt(13)
+        sr.font.color.rgb = RGBColor(0x78, 0x71, 0x6c)
+
+    meta = document.add_paragraph()
+    meta.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    meta.add_run(f"Generated {datetime.now().strftime('%B %d, %Y at %H:%M')}").font.size = Pt(10)
+
+    def count_docs(n):
+        c = len(n.get("documents") or [])
+        for ch in (n.get("children") or []):
+            c += count_docs(ch)
+        return c
+
+    chapters = root.get("children") or []
+    total_docs = len(root.get("documents") or []) + sum(count_docs(c) for c in chapters)
+    counts = document.add_paragraph()
+    counts.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    counts.add_run(
+        f"{len(chapters)} chapter{'' if len(chapters) == 1 else 's'} · "
+        f"{total_docs} document{'' if total_docs == 1 else 's'}"
+    ).font.size = Pt(10)
+
+
+def _emit_chapter_heading_docx(document, node: dict, number_prefix: str, level: int):
+    style_level = min(max(level, 1), 3)
+    document.add_heading(f"{number_prefix}  {node.get('name') or '(unnamed folder)'}", level=style_level)
+    desc = (node.get("description") or "").strip()
+    if desc:
+        dp = document.add_paragraph()
+        dp.add_run(desc).italic = True
+
+
+def _emit_document_docx(document, doc: dict, docs_dir: Path, new_page):
+    """Render one document: bold name/SN line, then its content (image /
+    rasterized PDF pages / a placeholder note), then the document's own
+    free-text note (doc.description) as a plain paragraph -- no "Description:"
+    label, since this text is typically a caption/story about the photo
+    rather than a formal description field. Omitted entirely when empty."""
+    doc_sn = (doc.get("sn") or "").strip()
+    label = f"{doc_sn} · {doc.get('name', '(unnamed document)')}" if doc_sn else doc.get("name", "(unnamed document)")
+    p = document.add_paragraph()
+    run = p.add_run(label)
+    run.bold = True
+    from docx.shared import Pt
+    run.font.size = Pt(12)
+
+    doc_path = _doc_path(docs_dir, doc["id"])
+    if doc_path is None:
+        document.add_paragraph().add_run("⚠ File not found on disk").italic = True
+    else:
+        mime = (doc.get("mime") or "").lower()
+        ext = (doc_path.suffix or Path(doc.get("name") or "").suffix).lower().lstrip(".")
+        is_pdf = mime == "application/pdf" or (not mime.startswith("image/") and ext == "pdf")
+        is_image = mime.startswith("image/") or (not is_pdf and ext in _IMAGE_EXTS)
+        if is_pdf:
+            try:
+                pages = _pdf_pages_to_images(doc_path)
+                for i, (png, iw, ih) in enumerate(pages):
+                    if i > 0:
+                        new_page()
+                    _add_centered_picture(document, png, iw, ih)
+            except ImportError:
+                document.add_paragraph().add_run(
+                    "[PDF preview unavailable — install PyMuPDF ('pip install PyMuPDF') "
+                    "to include rendered PDF pages in this databook.]"
+                ).italic = True
+            except Exception as e:
+                document.add_paragraph().add_run(f"⚠ Could not render PDF: {e}").italic = True
+        elif is_image:
+            try:
+                img_bytes, iw, ih = _image_bytes_for_docx(doc_path)
+                _add_centered_picture(document, img_bytes, iw, ih)
+            except Exception as e:
+                document.add_paragraph().add_run(f"⚠ Could not render image: {e}").italic = True
+        else:
+            document.add_paragraph().add_run(
+                f"[File type not previewable in this format: .{ext or 'unknown'}]"
+            ).italic = True
+
+    desc = (doc.get("description") or "").strip()
+    if desc:
+        document.add_paragraph(desc)
+
+
+def _emit_cover_file_docx(document, cov: dict, new_page):
+    """cov: {"bytes": raw file bytes, "mime": str, "filename": str}."""
+    mime = (cov.get("mime") or "").lower()
+    name = (cov.get("filename") or "").lower()
+    file_bytes = cov.get("bytes") or b""
+    is_pdf = mime == "application/pdf" or name.endswith(".pdf")
+    is_image = mime.startswith("image/") or name.endswith((
+        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".webp", ".heic", ".heif",
+    ))
+    if is_pdf:
+        try:
+            pages = _pdf_pages_to_images(file_bytes)
+            for i, (png, iw, ih) in enumerate(pages):
+                if i > 0:
+                    new_page()
+                _add_centered_picture(document, png, iw, ih)
+        except ImportError:
+            document.add_paragraph().add_run(
+                "[Cover PDF could not be rendered — install PyMuPDF.]"
+            ).italic = True
+        except Exception as e:
+            document.add_paragraph().add_run(f"⚠ Could not render cover PDF: {e}").italic = True
+        return
+    if is_image:
+        try:
+            with Image.open(io.BytesIO(file_bytes)) as im:
+                im = im.convert("RGB")
+                iw, ih = im.size
+                buf = io.BytesIO()
+                im.save(buf, format="JPEG", quality=_EMBED_JPEG_QUALITY, optimize=True)
+                _add_centered_picture(document, buf.getvalue(), iw, ih)
+        except Exception as e:
+            document.add_paragraph().add_run(f"⚠ Could not render cover image: {e}").italic = True
+        return
+    document.add_paragraph().add_run(
+        f"[Unsupported cover file type: {mime or name or 'unknown'}]"
+    ).italic = True
+
+
+def build_databook_docx(
+    node_id: str,
+    tree: dict,
+    doc_index: list,
+    docs_dir: Path,
+    title: str = "",
+    subtitle: str = "",
+    cover_pages=None,
+) -> bytes:
+    """
+    Build an auto-organized Word databook from a single folder (node_id):
+      - one or more user-supplied cover pages (images/PDFs), or a single
+        blank page when none are given;
+      - a title page and a live table-of-contents field;
+      - every subfolder under node_id becomes a nested chapter, numbered
+        "1", "1.1", "1.1.1", ... in tree order;
+      - documents keep their existing order on each node;
+      - each document is followed by its own free-text note (unlabeled,
+        omitted when the document has none).
+
+    cover_pages: optional ordered list of {"bytes", "mime", "filename"}.
+    Raises ImportError if python-docx isn't installed, ValueError if node_id
+    doesn't resolve or the folder has nothing to include.
+    """
+    from docx import Document  # raises ImportError here if not installed
+
+    _ensure_heif_support()
+    docs_by_id = {d["id"]: d for d in doc_index}
+    root = _find_node(tree, node_id)
+    if not root:
+        raise ValueError("Selected folder was not found in the project tree.")
+
+    document = Document()
+    _set_letter_page_docx(document)
+    _set_cjk_fonts_docx(document)
+
+    state = {"first": True}
+
+    def new_page():
+        if state["first"]:
+            state["first"] = False
+        else:
+            document.add_page_break()
+
+    # ---- Cover page(s) -- blank (page 1 left empty) when none supplied ----
+    new_page()
+    if cover_pages:
+        for i, cov in enumerate(cover_pages):
+            if i > 0:
+                new_page()
+            _emit_cover_file_docx(document, cov, new_page)
+
+    # ---- Title page ----
+    new_page()
+    _emit_title_page_docx(document, title or "Engineering Databook", subtitle, root)
+
+    # ---- Table of contents ----
+    new_page()
+    _emit_toc_docx(document)
+
+    # ---- Documents attached directly to the selected folder (unnumbered,
+    # ahead of the first chapter) ----
+    root_docs = [docs_by_id[r["id"]] for r in (root.get("documents") or []) if r.get("id") in docs_by_id]
+    for doc in root_docs:
+        new_page()
+        _emit_document_docx(document, doc, docs_dir, new_page)
+
+    # ---- Chapters: one per subfolder, recursively nested ----
+    def emit_chapter(node, number_prefix, level):
+        new_page()
+        _emit_chapter_heading_docx(document, node, number_prefix, level)
+        node_docs = [docs_by_id[r["id"]] for r in (node.get("documents") or []) if r.get("id") in docs_by_id]
+        for doc in node_docs:
+            new_page()
+            _emit_document_docx(document, doc, docs_dir, new_page)
+        for i, child in enumerate(node.get("children") or [], start=1):
+            emit_chapter(child, f"{number_prefix}.{i}", level + 1)
+
+    chapters = root.get("children") or []
+    for i, child in enumerate(chapters, start=1):
+        emit_chapter(child, str(i), 1)
+
+    if not root_docs and not chapters:
+        raise ValueError("The selected folder has no documents or subfolders to include.")
+
+    # Ask Word to recompute the TOC field automatically when the file is
+    # opened, instead of relying on the reader to right-click "Update Field".
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    settings = document.settings.element
+    update_fields = OxmlElement("w:updateFields")
+    update_fields.set(qn("w:val"), "true")
+    settings.append(update_fields)
+
+    buf = io.BytesIO()
+    document.save(buf)
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
 # Per-document AI Q&A log — rendered as a PDF (see /api/docs/<id>/ask in
 # dms_server.py). Unlike the merged-document flow above, this has no source
 # PDF to merge; it's a plain platypus document, closer to _build_cover_pdf.

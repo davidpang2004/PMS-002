@@ -19,7 +19,7 @@ Important:
     on a Mac. There's no cross-compilation.
 
 Prerequisites:
-    pip install pyinstaller flask pypdf reportlab Pillow openpyxl
+    pip install pyinstaller flask pypdf reportlab Pillow openpyxl python-docx
 
 How users install the result:
     Mac:     drag DMS.app to /Applications
@@ -81,7 +81,7 @@ def ensure_venv():
         [str(venv_python), "-m", "pip", "install", "--quiet", "--upgrade",
          "pip", "pyinstaller", "flask", "waitress", "pypdf", "reportlab", "Pillow",
          "pillow-heif", "PyMuPDF", "qrcode", "numpy", "cryptography", "google-genai",
-         "openpyxl", "pyzbar"],
+         "openpyxl", "pyzbar", "python-docx"],
         check=True,
     )
 
@@ -124,6 +124,7 @@ def check_dependencies():
         "PIL": "Pillow",
         "cryptography": "cryptography",
         "openpyxl": "openpyxl",
+        "docx": "python-docx",
     }
     missing = []
     for import_name, pkg_name in required.items():
@@ -347,7 +348,7 @@ def build_pyinstaller_command() -> list[str]:
     # because it copies every .py/.html/data file and Python maps them all.
     for pkg in ("flask", "werkzeug", "jinja2", "click", "itsdangerous",
                 "markupsafe", "waitress", "pypdf", "reportlab", "PIL",
-                "cryptography", "openpyxl"):
+                "cryptography", "openpyxl", "docx"):
         cmd.extend(["--collect-submodules", pkg])
     # PIL data files (fonts, image format plugins) still need to be present.
     cmd.extend(["--copy-metadata", "Pillow"])

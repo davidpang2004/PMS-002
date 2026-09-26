@@ -7029,6 +7029,123 @@ def post_databook():
     return Response(pdf_bytes, mimetype="application/pdf", headers=headers)
 
 
+@app.route("/api/databook-docx", methods=["POST"])
+def post_databook_docx():
+    """
+    Build an auto-organized Word (.docx) databook from a single selected
+    folder: every subfolder becomes a nested chapter, documents keep their
+    existing tree order, and each document is followed by its Description
+    field. See databook.build_databook_docx for the full layout rules.
+
+    Request is always multipart/form-data:
+      payload=<JSON string: {"nodeId": "NODE-...", "title": "...", "subtitle": "..."}>
+      cover_pages=<zero or more PDF/image files, each becomes its own leading page>
+
+    A copy is saved to <project root>/databook/DB_<SN>_<YYYY>_<MM>_<DD>.docx,
+    same convention as /api/databook, with its path in X-Databook-Saved-Path.
+
+    Response: .docx binary stream.
+    """
+    if not get_storage_root():
+        return jsonify({"error": "Storage path not configured"}), 503
+
+    try:
+        data = json.loads(request.form.get("payload") or "{}")
+    except ValueError:
+        return jsonify({"error": "Invalid payload JSON"}), 400
+
+    node_id = (data.get("nodeId") or "").strip()
+    if not node_id:
+        return jsonify({"error": "No folder selected"}), 400
+    title = data.get("title", "").strip() or "Engineering Databook"
+    subtitle = data.get("subtitle", "").strip()
+
+    cover_pages = []
+    for f in request.files.getlist("cover_pages"):
+        if not f or not f.filename:
+            continue
+        mime = f.mimetype or ""
+        if mime in ("application/octet-stream", ""):
+            guessed = mimetypes.guess_type(f.filename)[0]
+            if guessed:
+                mime = guessed
+        cover_pages.append({"bytes": f.read(), "mime": mime, "filename": f.filename})
+
+    docs_dir = get_docs_dir()
+    idx = read_index()
+
+    try:
+        from databook import build_databook_docx
+        docx_bytes = build_databook_docx(
+            node_id=node_id,
+            tree=idx.get("tree"),
+            doc_index=idx.get("docIndex", []),
+            docs_dir=docs_dir,
+            title=title,
+            subtitle=subtitle,
+            cover_pages=cover_pages or None,
+        )
+    except ImportError as e:
+        return jsonify({
+            "error": (
+                "Databook libraries not installed. Run:\n"
+                "    pip3 install python-docx pypdf reportlab Pillow\n"
+                "(add PyMuPDF too if you want PDF pages rendered into the Word file)\n"
+                "Then restart the server.\n\nDetail: " + str(e)
+            )
+        }), 500
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": f"Databook generation failed: {e}"}), 500
+
+    ascii_name = "".join(
+        c if (c.isascii() and (c.isalnum() or c in "-_ ")) else "_" for c in title
+    )[:60].strip()
+    ascii_filename = f"{ascii_name or 'Databook'}.docx"
+
+    from urllib.parse import quote as _pct_encode
+    utf8_filename = _pct_encode(f"{title.strip() or 'Databook'}.docx", safe="")
+
+    headers = {
+        "Content-Disposition": (
+            f'attachment; filename="{ascii_filename}"; '
+            f"filename*=UTF-8''{utf8_filename}"
+        ),
+        "Content-Length": str(len(docx_bytes)),
+    }
+    try:
+        root = get_storage_root()
+        root_sn = ((idx.get("tree") or {}).get("sn") or "").strip()
+        date_str = datetime.now().strftime("%Y_%m_%d")
+        if root_sn:
+            safe_sn = "".join(c if (c.isalnum() or c in "-") else "_" for c in root_sn)[:40]
+            base_name = f"DB_{safe_sn}_{date_str}"
+        else:
+            base_name = f"DB_{date_str}"
+
+        databook_dir = root / "databook"
+        databook_dir.mkdir(parents=True, exist_ok=True)
+        save_path = databook_dir / f"{base_name}.docx"
+        n = 2
+        while save_path.exists():
+            save_path = databook_dir / f"{base_name}_{n}.docx"
+            n += 1
+        save_path.write_bytes(docx_bytes)
+        headers["X-Databook-Saved-Path"] = _pct_encode(str(save_path), safe="")
+    except Exception:
+        import traceback
+        traceback.print_exc()
+
+    return Response(
+        docx_bytes,
+        mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers=headers,
+    )
+
+
 @app.route("/api/folder-ai-pdf", methods=["POST"])
 def post_folder_ai_pdf():
     """Folder-level "Ask AI" -- option 2: build a single PDF whose first page
