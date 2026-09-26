@@ -187,19 +187,21 @@ toc_entries = [
     ("3.4", "Serial Numbers (SN)"),
     ("3.5", "Description: Voice Input, AI Cleanup, and PDF Export"),
     ("3.6", "Login Credentials (can save multiple sets)"), ("3.7", "Text Tree Preview"),
-    ("3.8", "Batch Folder Operations (Multi-select)"),
+    ("3.8", "Batch Folder Operations (Multi-select)"), ("3.9", "Setting a Photo Root Folder"),
     ("4", "Working with Documents"), ("4.1", "Uploading Files"), ("4.2", "Uploading a Folder"),
     ("4.3", "Pasting Screenshots"), ("4.4", "Linking Existing Documents"),
     ("4.5", "Viewing a Document"), ("4.6", "Downloading, Sending, and Deleting Documents"),
     ("4.7", "Duplicate Detection"), ("4.8", "Barcode Scanning"),
     ("4.9", "Ask AI About a Document, or One-Click Polish"), ("4.10", "Convert to PDF (Batch)"),
     ("4.11", "On-Disk Filenames and Recovering Deletions"),
+    ("4.12", "Batch Document Actions (Multi-select: Download, Batch Rename, Find Near-Duplicates)"),
     ("5", "OCR - Extract Text from Documents"), ("5.1", "How OCR Works"),
     ("5.2", "Running OCR"), ("5.3", "Saving OCR Text for Search"),
     ("6", "Key Parameter Extraction"), ("6.1", "What Are Key Parameters?"),
     ("6.2", "Extracting Parameters from a Document"), ("6.3", "Managing Global Key Parameters"),
     ("6.4", "Configuring an AI Provider (Gemini / DeepSeek)"),
     ("6.5", "Parameter Trend Charts and Snapshots"),
+    ("6.6", "Batch AI Parameter Extraction (Multi-select Documents)"),
     ("7", "Searching Documents"), ("7.1", "Basic Search"), ("7.2", "Using Filters"),
     ("7.3", "Opening and Jumping to Results"),
     ("8", "Generating a Databook (PDF / Word)"), ("8.1", "Selecting Documents (PDF mode)"),
@@ -308,6 +310,7 @@ add_table(
     col_widths=[1.5, 1.8, 3.3]
 )
 tip("Drag the vertical divider between the sidebar and the content panel to resize either side. Double-click the divider to reset to the default width.")
+tip("The storage path shown in the middle of the header bar is itself a button - click it anytime to open a Change storage location dialog and point DMS at a different folder on your computer, no restart and no need to go back through the section 1.3 startup screen (see section 1.3 for the first-time setup).")
 
 figure("01_overview.png", "Figure 2-1  Overall layout: folder tree on the left, folder details and action buttons on the right")
 
@@ -415,6 +418,15 @@ numbered("Check the folders you want to act on (you can check folders across dif
 numbered("Click Download to export the checked folders individually, or Delete to soft-delete them all at once (moved into \u201cNot Show in Tree\u201d - see section 3.2).")
 numbered("Click Cancel Multi-select to exit the mode.")
 figure("27_folder_multiselect.png", "Figure 3-7  Folder multi-select mode: one folder checked, ready to batch-download or batch-delete")
+
+h2("3.9  Setting a Photo Root Folder")
+para("Section 4.1 explains that uploading a photo automatically creates “year/month” subfolders under the current folder. If you'd rather have every photo in the whole project archived by year/month under one fixed location - instead of scattered under whichever folder you happened to upload into - you can designate a “photo root” folder:")
+numbered("Right-click the folder you want to use as the root, and choose Set as photo root folder.")
+numbered("That folder gets a small camera-icon marker in the tree.")
+numbered("From then on, uploading a photo anywhere in the tree (as long as you're not using the “current folder” upload mode) creates its year/month subfolders under this designated root, not under whatever folder you uploaded into.")
+numbered("To undo it, right-click the marked folder and choose Unset photo root folder.")
+figure("39_photo_root_context_menu.png", "Figure 3-8  Folder right-click menu: Set/Unset photo root folder")
+tip("Handy for funneling every photo from every device and every folder into one central “Photo Library” folder organized by year/month, while each business folder keeps only the documents relevant to it, unmixed with photos.")
 page_break()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -538,6 +550,15 @@ para("These are lower-level improvements that need no action from you, but are u
 bullet("Filenames on disk now start with the document's name instead of its internal ID (e.g. Inspection Report+DOC-20260920-xxx.pdf), so browsing the storage folder directly in Finder / Explorer immediately tells you what a file is without opening it first.")
 bullet("A failed upload now reports the actual reason (e.g. disk full, no write permission) instead of a bare, unexplained \u201c500 error.\u201d")
 bullet("Before any change to a project's folder structure (adding/removing folders, moving things, batch operations), DMS automatically saves a snapshot of the structure at that moment; if a particular change ever leaves the structure in a bad state, that snapshot can be used to roll back. This safety net runs entirely in the background - you won't see any UI for it during normal use.")
+
+h2("4.12  Batch Document Actions (Multi-select: Download, Batch Rename, Find Near-Duplicates)")
+para("The document list has a row of batch-action buttons above it that work on every document in the current folder, without needing to pop out the grid-view window first (Section 19 covers the pop-out window's own batch actions - the two can be used together):")
+figure("40_multiselect_toolbar.png", "Figure 4-7  Document list toolbar: Select, AI-fill parameter, Batch rename, Find near-duplicates")
+bullet("Select - check one or more documents, then either Download them to a folder (defaults to your Downloads folder) or Unlink them from the current folder (the documents themselves are soft-deleted - see section 3.2).")
+bullet("AI-fill parameter - multi-select documents and have AI read one parameter's value off each and fill it in for all of them at once; see section 6.6 for the full flow.")
+bullet("Batch rename - renames every document in the current folder to “date + location - original name” (the date comes from the document's own capture/archive date, and documents where no date can be resolved are skipped; the location comes from the document's location metadata and is omitted if there isn't one). The actual file on disk is renamed too. Clicking it shows a preview first; nothing changes until you confirm.")
+figure("42_batch_rename_preview.png", "Figure 4-8  Batch rename preview: nothing is renamed until you confirm")
+bullet("Find near-duplicates - check a few photos (or click Select all photos to grab every photo in the folder), then drag the Similarity threshold slider (50%-100%); DMS compares the selected photos pairwise and flags ones that look highly similar to each other (e.g. several near-identical burst-mode shots), making it easy to spot redundant photos to clean up. This is a “looks similar” fuzzy match, a different mechanism from section 4.7's exact filename-and-size match at upload time.")
 page_break()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -612,6 +633,7 @@ numbered("Paste your own Google Gemini or DeepSeek API key and click the matchin
 numbered("The two providers' keys are stored completely independently; with both configured, each AI feature generally prefers Gemini and falls back to DeepSeek automatically when Gemini isn't available.")
 figure("32_ai_provider_settings.png", "Figure 6-2  AI Provider Settings: Gemini and DeepSeek configured separately")
 note("These AI features are opt-in and need an internet connection; with no key configured at all, every core DMS feature (folder management, uploads, OCR, barcode scanning, search, and so on) still runs fully offline and is unaffected. Keys are stored only on this machine (a local server-side file) and are never uploaded to any DMS-related or third-party server.")
+tip("Next to \u201cDetailed Gemini setup steps (including how to get a free/paid key)\u201d in the dialog is a Download setup guide (.docx) link, with screenshots showing how to sign up for a Google account and request a free Gemini API key - handy if you've never gotten one before.")
 
 h2("6.5  Parameter Trend Charts and Snapshots")
 para("Chart how a key parameter's value changes over time - useful for blood pressure, account balances, inventory levels, or any reading that needs to be logged repeatedly and reviewed for trends.")
@@ -621,6 +643,16 @@ figure("29_trend_chart.png", "Figure 6-3  The trend chart window (this folder ha
 numbered("Like the document viewer, the chart window can be dragged, resized by its edges, or popped out into its own window; the axis ranges can also be set manually instead of relying on auto-scaling.")
 numbered("Happy with a particular parameter's chart? Click Save Snapshot - DMS records that parameter's current total/latest value into an \u201c[X] History.xlsx\u201d document; save a few snapshots over time and you get a chart of how the value has changed.")
 tip("Typical use: click Save Snapshot on a \u201cBank Account\u201d folder's balance parameter at the end of each month; after a few months you'll have a chart of the balance trend. The same pattern works for blood pressure, body weight, or periodic inventory counts.")
+numbered("Once there are enough data points, click Fit with Gemini in the chart window (it becomes Re-analyze once you have a result) to have Gemini fit a trend line across the values and comment on it in plain language (e.g. \u201coverall upward trend; the latest reading is slightly above average\u201d). Needs a Gemini API key configured first (section 6.4).")
+
+h2("6.6  Batch AI Parameter Extraction (Multi-select Documents)")
+para("Section 6.2 covers opening one document and manually checking parameters to extract them one at a time. To fill in the same parameter across a whole batch of documents at once, use AI-fill parameter in the document list toolbar instead - no need to open each document individually.")
+numbered("Above a folder's document list, click AI-fill parameter; the toolbar switches to multi-select mode.")
+numbered("Check the documents to process (or click Select all), then click AI-extract parameter on the right.")
+numbered("In the dialog, pick an existing key parameter from the dropdown, or type a new parameter name below it.")
+figure("41_ai_fill_parameter.png", "Figure 6-4  The AI-extract parameter dialog: choose a parameter, with the document count checked")
+numbered("Click Start extracting. DMS reads each selected document's page images to find that parameter's value (it doesn't need to match the document's text verbatim); results are listed for you to review first, and only get written into each document's \u201cActual Value\u201d once you click Apply.")
+note("Because this reads the page images themselves, it works just as well on scans and photos with no text layer. Needs a Gemini API key configured first (section 6.4).")
 
 page_break()
 
@@ -724,6 +756,7 @@ numbered("Click the Faces tab in the sidebar.")
 numbered("If the component (deepface) isn't installed yet, a prompt explains this and offers an Auto-install deepface button.")
 numbered("Click it and wait - this downloads TensorFlow and related libraries in the background and can take several minutes on a slow connection; you can keep using the rest of the app meanwhile.")
 figure("16_face_tab.png", "Figure 10-1  The Faces tab (shown here with the component already installed, hence the empty state; before installing, you'd instead see a prompt with an Auto-install deepface button)")
+tip("If auto-install keeps failing (more common on Windows), download the Face Recognition Install Guide (.txt) - Windows from the Project menu's Downloads group for manual, step-by-step instructions for installing Python 3.12 and deepface.")
 
 h2("10.2  Tagging Faces")
 numbered("From a folder, click Tag Faces to enter selection mode.")
@@ -757,6 +790,7 @@ page_break()
 # ══════════════════════════════════════════════════════════════════════════════
 h1("12  Project Management")
 para("The Project menu (in the header bar) provides tools for backing up, restoring, merging, and importing data.")
+note("If you've set an access password (Chapter 14), all three export types (METADATA / COMP / PART) show an “Automatically encrypted with the project password” note in the menu - the exported .dms file is encrypted with that password, and the same password is needed to decrypt it when importing on another machine. Without a password set, exported backups are not encrypted.")
 
 h2("12.1  Export Index Backup (METADATA)")
 para("Backs up only the folder-tree structure and metadata (not the actual document files) as a .dms file, named with a METADATA- prefix. Much smaller and faster than a full backup - useful for structural snapshots.")
@@ -816,6 +850,7 @@ numbered("Enter your SMTP server, port, username, and password (an app-specific 
 numbered("Save the settings; DMS uses them to send documents as attachments going forward.")
 figure("20_email_settings.png", "Figure 13-1  Email sending (SMTP) settings dialog")
 note("On Mac, if SMTP hasn't been configured, clicking the email action instead opens your system Mail app with the document attached, so the feature still works without any setup.")
+tip("The Download setup guide (.docx) button in the dialog gives step-by-step, illustrated instructions for enabling SMTP and generating an app-specific password in common providers like Gmail and QQ Mail.")
 
 page_break()
 
@@ -862,6 +897,7 @@ add_table(
         ["Copy selected text", "Ctrl+C"],
         ["Select all text in a text field", "Ctrl+A"],
         ["Undo (in text fields)", "Ctrl+Z"],
+        ["Jump to the previous/next document in the viewer", "← / → (left/right arrow)"],
     ],
     col_widths=[3.5, 3.0]
 )
@@ -876,6 +912,7 @@ para("DMS is no longer limited to one project at a time.")
 numbered("Click the Project menu in the header bar and choose the \u201copen another project\u201d option (or simply run DMS.app / DMS.exe again and pick a different project in the startup window described in section 1.3).")
 numbered("DMS starts a separate window and its own service for the new project, on a different local port, completely independent of the first window - both can be logged in and used at the same time without kicking each other's session out.")
 numbered("Opening the same project folder again is detected, and DMS switches to the existing window for it instead of starting a duplicate service.")
+tip("Besides switching to an existing project, the Project menu's Settings group also has Create New Blank Project, which starts a brand-new, empty project in a new folder at any time - no restart, and no need to go through the section 1.3 startup screen.")
 note("Every normal quit (the red close button, the Quit DMS button, Cmd+Q, Dock right-click quit, and so on) records that project's path, so the next plain double-click launch's Continue with last project (section 1.3) points to it - if several project windows were open, \u201clast\u201d means whichever one you quit most recently.")
 
 page_break()
