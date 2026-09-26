@@ -10671,10 +10671,33 @@ def download_deepface_guide_cn():
 
 
 # ---- Quit -----------------------------------------------------------------
+def _record_last_project_on_quit() -> None:
+    """Record this instance's own project as the one to reopen on the next
+    plain launch ("last closed wins" -- mirrors LauncherWindow._quit() in
+    dms_launcher.py). Without this, quitting via /api/quit -- the
+    discoverable in-app way to close a project, as opposed to the separate
+    launcher window's own quit control -- left the shared config's
+    storage_path untouched, so "Continue with previous project" kept
+    reopening whatever was configured before, even after closing a project
+    opened via "Open another project in a new window". Split out from
+    quit_app() so it can be tested without exercising the process-exit path.
+    """
+    root = get_storage_root()
+    if not root:
+        return
+    try:
+        cfg = load_config()
+        cfg["storage_path"] = str(root)
+        save_config(cfg)
+    except Exception:
+        pass
+
+
 @app.route("/api/quit", methods=["POST"])
 def quit_app():
     """Shut down the DMS server and exit the process."""
     import threading
+    _record_last_project_on_quit()
     _auto_backup()
     threading.Thread(target=lambda: __import__("os")._exit(0), daemon=True).start()
     return jsonify({"ok": True})
