@@ -2074,19 +2074,22 @@ const TreeNode = ({
         )}
 
         {isRenaming ? (
-          <input
-            autoFocus
-            type="text"
-            value={draftName}
-            onChange={(e) => setDraftName(e.target.value)}
-            onClick={(e) => e.stopPropagation()}
-            onBlur={commitRename}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") commitRename();
-              if (e.key === "Escape") onCancelRename();
-            }}
-            className="flex-1 text-base px-1 py-0 border border-amber-500 rounded bg-white text-stone-900 focus:outline-none"
-          />
+          <>
+            <input
+              autoFocus
+              type="text"
+              value={draftName}
+              onChange={(e) => setDraftName(e.target.value)}
+              onClick={(e) => e.stopPropagation()}
+              onBlur={commitRename}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") commitRename();
+                if (e.key === "Escape") onCancelRename();
+              }}
+              className="flex-1 text-base px-1 py-0 border border-amber-500 rounded bg-white text-stone-900 focus:outline-none"
+            />
+            <VoiceMicButton onFinalTranscript={(chunk) => setDraftName((prev) => appendWithSpace(prev, chunk))} />
+          </>
         ) : (
           <span className={`truncate flex-1 ${isRecycleBin ? "italic text-stone-600" : ""}`} title={isRecycleBin ? t("已删除文件暂存于此 · 在此处删除则永久清除", "Deleted files are held here · deleting here erases them permanently") : t("双击重命名", "Double-click to rename")}>
             {isRecycleBin ? t("已删除文件 (Not Show in Tree)", "Deleted files (not shown in tree)") : node.name}
@@ -2183,6 +2186,7 @@ const TreeNode = ({
             }}
             className="flex-1 text-base px-1 py-0 border border-amber-500 rounded bg-white text-stone-900 focus:outline-none"
           />
+          <VoiceMicButton onFinalTranscript={(chunk) => setNewChildName((prev) => appendWithSpace(prev, chunk))} />
         </div>
       )}
 
@@ -2366,6 +2370,166 @@ const MAP_PROVIDERS = [
 const DEFAULT_MAP_PROVIDER = "amap";
 
 /* =============================================================================
+ * VOICE DICTATION — shared Web Speech API wrapper. `useVoiceDictation` is the
+ * one implementation behind every mic button in the app: the compact
+ * per-field `VoiceMicButton` below, and the richer language-pill toolbars in
+ * DocumentViewer / NodeDescriptionPanel / FolderAskAIDialog. Only one
+ * recognizer is ever allowed to run at a time app-wide (see
+ * _stopActiveVoiceDictation) so two mic buttons can't end up listening
+ * simultaneously.
+ * =============================================================================
+ */
+let _stopActiveVoiceDictation = null;
+
+// The smart-space join used by every dictation target: append a recognized
+// chunk to whatever's already in the field, adding a space first unless the
+// field already ends in whitespace/newline.
+const appendWithSpace = (prev, chunk) => {
+  const needsSpace = prev && !/[\s\n]$/.test(prev);
+  return prev + (needsSpace ? " " : "") + chunk.trim();
+};
+
+const useVoiceDictation = (onFinalTranscript) => {
+  const { t } = useLang();
+  const [voiceLang, setVoiceLang] = useState("zh-CN");
+  const [listening, setListening] = useState(false);
+  const [voiceInterim, setVoiceInterim] = useState("");
+  const [voiceError, setVoiceError] = useState("");
+  const recognitionRef = useRef(null);
+  // Ref so the recognition's onresult handler (created once per
+  // start/stop cycle) always calls the latest callback, even if the
+  // caller's onFinalTranscript closes over state that's changed since.
+  const onFinalTranscriptRef = useRef(onFinalTranscript);
+  onFinalTranscriptRef.current = onFinalTranscript;
+
+  const SpeechRecognitionCtor = typeof window !== "undefined"
+    ? (window.SpeechRecognition || window.webkitSpeechRecognition)
+    : null;
+  const voiceSupported = !!SpeechRecognitionCtor;
+
+  const stopListening = () => {
+    try { recognitionRef.current && recognitionRef.current.stop(); } catch {}
+  };
+
+  const startListening = (lang) => {
+    if (!SpeechRecognitionCtor) return;
+    stopListening();
+    if (_stopActiveVoiceDictation) { try { _stopActiveVoiceDictation(); } catch {} }
+    const recognition = new SpeechRecognitionCtor();
+    recognition.lang = lang;
+    recognition.continuous = true;
+    recognition.interimResults = true;
+
+    recognition.onresult = (event) => {
+      let finalChunk = "";
+      let interim = "";
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const result = event.results[i];
+        if (result.isFinal) finalChunk += result[0].transcript;
+        else interim += result[0].transcript;
+      }
+      if (finalChunk) onFinalTranscriptRef.current(finalChunk);
+      setVoiceInterim(interim);
+    };
+    recognition.onerror = (event) => {
+      setVoiceError(
+        event.error === "not-allowed" ? t("麦克风权限被拒绝，请在浏览器设置中允许访问麦克风", "Microphone access denied — please allow microphone access in your browser settings")
+        : event.error === "no-speech" ? t("未检测到语音，请再试一次", "No speech detected, please try again")
+        : t(`语音识别出错：${event.error}`, `Speech recognition error: ${event.error}`)
+      );
+      setListening(false);
+      setVoiceInterim("");
+    };
+    recognition.onend = () => {
+      setListening(false);
+      setVoiceInterim("");
+    };
+
+    recognitionRef.current = recognition;
+    _stopActiveVoiceDictation = stopListening;
+    setVoiceError("");
+    setVoiceInterim("");
+    try {
+      recognition.start();
+      setListening(true);
+    } catch {
+      setListening(false);
+    }
+  };
+
+  const toggleListening = () => {
+    if (listening) { stopListening(); return; }
+    startListening(voiceLang);
+  };
+
+  // For callers whose own lifecycle (switching documents/folders, closing a
+  // dialog) needs to fully reset the voice UI, not just stop the recognizer.
+  const resetVoiceUI = () => {
+    stopListening();
+    setListening(false);
+    setVoiceInterim("");
+    setVoiceError("");
+  };
+
+  useEffect(() => () => stopListening(), []);
+
+  return {
+    voiceLang, setVoiceLang, listening, voiceInterim, voiceError, voiceSupported,
+    toggleListening, stopListening, resetVoiceUI,
+  };
+};
+
+// Compact mic button for every ordinary text field: no interim-text row (no
+// room for one next to a table-cell input or a title field), but it still
+// carries the same Chinese/English toggle as the richer toolbars -- the
+// language to dictate in doesn't necessarily match the app's current UI
+// language, so it must stay independently switchable everywhere, not just
+// on the 5 richer fields.
+// `onFinalTranscript` receives each recognized chunk; callers typically do
+// `(chunk) => setX((prev) => appendWithSpace(prev, chunk))`.
+const VoiceMicButton = ({ onFinalTranscript, title, className = "" }) => {
+  const { t } = useLang();
+  const voice = useVoiceDictation(onFinalTranscript);
+
+  if (!voice.voiceSupported) return null;
+
+  const tooltip = voice.voiceError || title || (
+    voice.listening ? t("停止语音输入", "Stop voice input") : t("语音输入", "Voice input")
+  );
+
+  return (
+    <span className={"inline-flex items-center shrink-0 rounded border border-stone-300 overflow-hidden " + className}>
+      <button
+        type="button"
+        onMouseDown={(e) => e.preventDefault()}
+        onClick={() => voice.setVoiceLang(voice.voiceLang === "zh-CN" ? "en-US" : "zh-CN")}
+        disabled={voice.listening}
+        title={t("识别语言，点击切换中文／English", "Recognition language — click to switch Chinese / English")}
+        className="px-1 py-1.5 text-[10px] font-medium leading-none text-stone-600 hover:bg-stone-100 border-r border-stone-300 disabled:opacity-50"
+      >
+        {voice.voiceLang === "zh-CN" ? "中" : "EN"}
+      </button>
+      <button
+        type="button"
+        onMouseDown={(e) => e.preventDefault()}
+        onClick={voice.toggleListening}
+        title={tooltip}
+        className={
+          "p-1.5 " +
+          (voice.listening
+            ? "text-red-700 bg-red-50 animate-pulse"
+            : voice.voiceError
+            ? "text-red-600 hover:bg-red-50"
+            : "text-stone-600 hover:bg-stone-100")
+        }
+      >
+        {voice.listening ? <MicOff size={12} /> : <Mic size={12} />}
+      </button>
+    </span>
+  );
+};
+
+/* =============================================================================
  * UI: DOCUMENT VIEWER
  * =============================================================================
  */
@@ -2416,16 +2580,15 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
   const [typoError, setTypoError] = useState("");
   const [typoIssues, setTypoIssues] = useState(null);   // [{type, original, corrected, note}] once returned, or [] for "no issues"
 
-  // Voice-to-text dictation for the description field (Web Speech API).
-  const [voiceLang, setVoiceLang] = useState("zh-CN");
-  const [listening, setListening] = useState(false);
-  const [voiceInterim, setVoiceInterim] = useState("");
-  const [voiceError, setVoiceError] = useState("");
-  const recognitionRef = useRef(null);
-  const SpeechRecognitionCtor = typeof window !== "undefined"
-    ? (window.SpeechRecognition || window.webkitSpeechRecognition)
-    : null;
-  const voiceSupported = !!SpeechRecognitionCtor;
+  // Voice-to-text dictation for the description field -- shared
+  // implementation, see useVoiceDictation above.
+  const {
+    voiceLang, setVoiceLang, listening, voiceInterim, voiceError, voiceSupported,
+    toggleListening, resetVoiceUI,
+  } = useVoiceDictation((chunk) => {
+    setDescription((prev) => appendWithSpace(prev, chunk));
+    setDescSaved(false);
+  });
 
   // Upload-a-recording alternative to live mic dictation (.m4a/.mp3/.wav/...,
   // transcribed server-side via Gemini) -- see runTranscribeAudioFile below.
@@ -2466,6 +2629,11 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
   const [askError, setAskError] = useState("");
   const [askAnswer, setAskAnswer] = useState(null);   // {question, answer, model} of the last answer shown
   const [askLogName, setAskLogName] = useState("");   // filename the last Q&A was saved into
+  // Voice dictation for the question box -- separate recognizer instance
+  // from the description field's, same shared hook.
+  const askVoice = useVoiceDictation((chunk) => {
+    setAskQuestion((prev) => appendWithSpace(prev, chunk));
+  });
 
   // "Save this panel's text as a new document" state (shared by the
   // description / OCR text / AI answer panels).
@@ -2646,7 +2814,7 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
     popOutRef.current = null;
     setPoppedOut(false); setPopupBlocked(false);
     setPolishResult(null); setPolishError(""); setPolishing(false);
-    setVoiceInterim(""); setVoiceError(""); setListening(false);
+    resetVoiceUI();
     // Load this document's locally-added parameters; select NONE by default
     // (request: user explicitly picks what to extract for each document).
     setLocalKeys(normalizeKeyParameters(doc.localKeyParams || []));
@@ -2654,10 +2822,11 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
     setNewKeyInput(""); setSameLineOnly(true);
     setKeyRows(null); setKeyError(""); setKeyHint(""); setKeyDiag(null); setParamsSaved(false);
     setAskQuestion(""); setAskRunning(false); setAskError(""); setAskAnswer(null); setAskLogName("");
+    askVoice.resetVoiceUI();
     setSavingNewDoc(false); setNewDocMsg(null);
     setTranscribing(false); setTranscribeError("");
     // Stop any dictation still running from the previously-open document.
-    return () => { try { recognitionRef.current && recognitionRef.current.stop(); } catch {} };
+    return () => { resetVoiceUI(); askVoice.resetVoiceUI(); };
   }, [doc?.id]);
 
   // Probe OCR capability once when a viewer opens on an eligible file.
@@ -2897,66 +3066,6 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
 
   const newDocButtonClass =
     "text-sm px-2.5 py-1 border border-indigo-300 text-indigo-800 bg-indigo-50 hover:bg-indigo-100 rounded flex items-center gap-1 disabled:opacity-40";
-
-  // --- Voice-to-text dictation (description field) ---------------------------
-  const stopListening = () => {
-    try { recognitionRef.current && recognitionRef.current.stop(); } catch {}
-  };
-
-  const startListening = (lang) => {
-    if (!SpeechRecognitionCtor) return;
-    stopListening();
-    const recognition = new SpeechRecognitionCtor();
-    recognition.lang = lang;
-    recognition.continuous = true;
-    recognition.interimResults = true;
-
-    recognition.onresult = (event) => {
-      let finalChunk = "";
-      let interim = "";
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const result = event.results[i];
-        if (result.isFinal) finalChunk += result[0].transcript;
-        else interim += result[0].transcript;
-      }
-      if (finalChunk) {
-        setDescription((prev) => {
-          const needsSpace = prev && !/[\s\n]$/.test(prev);
-          return prev + (needsSpace ? " " : "") + finalChunk.trim();
-        });
-        setDescSaved(false);
-      }
-      setVoiceInterim(interim);
-    };
-    recognition.onerror = (event) => {
-      setVoiceError(
-        event.error === "not-allowed" ? t("麦克风权限被拒绝，请在浏览器设置中允许访问麦克风", "Microphone access denied — please allow microphone access in your browser settings")
-        : event.error === "no-speech" ? t("未检测到语音，请再试一次", "No speech detected, please try again")
-        : t(`语音识别出错：${event.error}`, `Speech recognition error: ${event.error}`)
-      );
-      setListening(false);
-      setVoiceInterim("");
-    };
-    recognition.onend = () => {
-      setListening(false);
-      setVoiceInterim("");
-    };
-
-    recognitionRef.current = recognition;
-    setVoiceError("");
-    setVoiceInterim("");
-    try {
-      recognition.start();
-      setListening(true);
-    } catch {
-      setListening(false);
-    }
-  };
-
-  const toggleListening = () => {
-    if (listening) { stopListening(); return; }
-    startListening(voiceLang);
-  };
 
   // Upload-a-recording alternative to the mic: pick a file, send it to
   // Gemini for transcription, append the result into the description the
@@ -3827,12 +3936,17 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
                   <div className="text-sm text-red-600 whitespace-pre-wrap">{ocrError}</div>
                 )}
                 {!ocrRunning && !ocrError && ocrText && (
-                  <textarea
-                    value={ocrText}
-                    onChange={(e) => { setOcrText(e.target.value); setSaved(false); }}
-                    spellCheck={false}
-                    className="w-full h-full resize-none text-[13px] leading-relaxed font-mono text-stone-800 outline-none"
-                  />
+                  <div className="h-full flex flex-col">
+                    <div className="flex justify-end pb-1 shrink-0">
+                      <VoiceMicButton onFinalTranscript={(chunk) => { setOcrText((prev) => appendWithSpace(prev, chunk)); setSaved(false); }} />
+                    </div>
+                    <textarea
+                      value={ocrText}
+                      onChange={(e) => { setOcrText(e.target.value); setSaved(false); }}
+                      spellCheck={false}
+                      className="w-full flex-1 resize-none text-[13px] leading-relaxed font-mono text-stone-800 outline-none"
+                    />
+                  </div>
                 )}
                 {!ocrRunning && !ocrError && !ocrText && (
                   <div className="text-sm text-stone-700 whitespace-pre-wrap">
@@ -3961,6 +4075,7 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
                     placeholder={t("为本文档添加新参数（如 Heat No）", "Add a new parameter for this document (e.g. Heat No)")}
                     className="flex-1 text-[13px] px-2 py-1 border border-stone-300 rounded font-mono focus:outline-none focus:border-emerald-500"
                   />
+                  <VoiceMicButton onFinalTranscript={(chunk) => setNewKeyInput((prev) => appendWithSpace(prev, chunk))} />
                   <button
                     onClick={addNewKey}
                     disabled={!newKeyInput.trim()}
@@ -4061,34 +4176,43 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
                             </div>
                           </td>
                           <td className="py-1 pr-2">
-                            <input
-                              type="text"
-                              value={row.value}
-                              onChange={(e) => editRowField(idx, "value", e.target.value)}
-                              placeholder="—"
-                              className={"w-full text-[13px] px-1.5 py-0.5 border rounded focus:outline-none focus:border-emerald-500 " +
-                                (row.found ? "border-stone-300 text-stone-800" : "border-stone-200 text-stone-600 italic")}
-                            />
+                            <div className="flex items-center gap-1">
+                              <input
+                                type="text"
+                                value={row.value}
+                                onChange={(e) => editRowField(idx, "value", e.target.value)}
+                                placeholder="—"
+                                className={"w-full text-[13px] px-1.5 py-0.5 border rounded focus:outline-none focus:border-emerald-500 " +
+                                  (row.found ? "border-stone-300 text-stone-800" : "border-stone-200 text-stone-600 italic")}
+                              />
+                              <VoiceMicButton onFinalTranscript={(chunk) => editRowField(idx, "value", appendWithSpace(row.value, chunk))} />
+                            </div>
                           </td>
                           <td className="py-1 pr-2">
-                            <input
-                              type="text"
-                              value={row.unit}
-                              onChange={(e) => editRowField(idx, "unit", e.target.value)}
-                              placeholder="—"
-                              className={"w-full text-[13px] px-1.5 py-0.5 border rounded focus:outline-none focus:border-emerald-500 " +
-                                (row.found ? "border-stone-300 text-stone-800" : "border-stone-200 text-stone-600 italic")}
-                            />
+                            <div className="flex items-center gap-1">
+                              <input
+                                type="text"
+                                value={row.unit}
+                                onChange={(e) => editRowField(idx, "unit", e.target.value)}
+                                placeholder="—"
+                                className={"w-full text-[13px] px-1.5 py-0.5 border rounded focus:outline-none focus:border-emerald-500 " +
+                                  (row.found ? "border-stone-300 text-stone-800" : "border-stone-200 text-stone-600 italic")}
+                              />
+                              <VoiceMicButton onFinalTranscript={(chunk) => editRowField(idx, "unit", appendWithSpace(row.unit, chunk))} />
+                            </div>
                           </td>
                           <td className="py-1">
-                            <input
-                              type="text"
-                              value={row.description}
-                              onChange={(e) => editRowField(idx, "description", e.target.value)}
-                              placeholder="—"
-                              className={"w-full text-[13px] px-1.5 py-0.5 border rounded focus:outline-none focus:border-emerald-500 " +
-                                (row.found ? "border-stone-300 text-stone-800" : "border-stone-200 text-stone-600 italic")}
-                            />
+                            <div className="flex items-center gap-1">
+                              <input
+                                type="text"
+                                value={row.description}
+                                onChange={(e) => editRowField(idx, "description", e.target.value)}
+                                placeholder="—"
+                                className={"w-full text-[13px] px-1.5 py-0.5 border rounded focus:outline-none focus:border-emerald-500 " +
+                                  (row.found ? "border-stone-300 text-stone-800" : "border-stone-200 text-stone-600 italic")}
+                              />
+                              <VoiceMicButton onFinalTranscript={(chunk) => editRowField(idx, "description", appendWithSpace(row.description, chunk))} />
+                            </div>
                           </td>
                         </tr>
                       ))}
@@ -4239,6 +4363,32 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
                   </div>
                 )}
 
+                {askVoice.voiceSupported && (
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <div className="flex rounded overflow-hidden border border-stone-300 text-[11px] shrink-0">
+                      <button
+                        onClick={() => askVoice.setVoiceLang("zh-CN")} disabled={askVoice.listening}
+                        title={t("识别语言：中文", "Recognition language: Chinese")}
+                        className={"px-1.5 py-0.5 " + (askVoice.voiceLang === "zh-CN" ? "bg-stone-700 text-white" : "bg-white text-stone-700 hover:bg-stone-100")}
+                      >中文</button>
+                      <button
+                        onClick={() => askVoice.setVoiceLang("en-US")} disabled={askVoice.listening}
+                        title="Recognition language: English"
+                        className={"px-1.5 py-0.5 border-l border-stone-300 " + (askVoice.voiceLang === "en-US" ? "bg-stone-700 text-white" : "bg-white text-stone-700 hover:bg-stone-100")}
+                      >EN</button>
+                    </div>
+                    <button
+                      onClick={askVoice.toggleListening}
+                      title={askVoice.listening ? t("停止语音输入", "Stop voice input") : t("开始语音输入，识别结果会自动追加到问题中", "Start voice input — recognized text will be appended to the question")}
+                      className={"text-[12px] px-2 py-0.5 rounded flex items-center gap-1 border shrink-0 " +
+                        (askVoice.listening ? "border-red-400 text-red-700 bg-red-50 animate-pulse" : "border-stone-300 text-stone-700 hover:bg-stone-100")}
+                    >
+                      {askVoice.listening ? <MicOff size={12} /> : <Mic size={12} />}
+                      {askVoice.listening ? t("正在聆听…", "Listening…") : t("语音输入", "Voice")}
+                    </button>
+                    {askVoice.voiceInterim && <span className="text-[12px] text-stone-500 italic truncate min-w-0">{askVoice.voiceInterim}</span>}
+                  </div>
+                )}
                 <textarea
                   value={askQuestion}
                   onChange={(e) => setAskQuestion(e.target.value)}
@@ -4248,6 +4398,7 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
                   disabled={!aiSettings.configured && !aiSettingsDS.configured}
                   className="w-full text-[13px] px-2 py-1.5 border border-stone-300 rounded focus:outline-none focus:border-purple-500 disabled:bg-stone-50"
                 />
+                {askVoice.voiceError && <div className="text-[12px] text-red-600">{askVoice.voiceError}</div>}
                 <button
                   onClick={runAskAI}
                   disabled={askRunning || !askQuestion.trim() || (!aiSettings.configured && !aiSettingsDS.configured)}
@@ -4552,47 +4703,65 @@ const MetadataEditor = ({ metadata, onChange, keyParameters = [], baseMetadata =
             <div className="flex gap-1.5 items-start pl-1">
               <span className="text-[12px] text-stone-700 w-[90px] shrink-0 text-right pr-1 pt-1">{t("设计 / 要求", "Design / spec")}</span>
               <div className="flex-1 grid grid-cols-[2fr_1.2fr_3fr] gap-1">
-                <ImeInput
-                  value={designParts.value}
-                  onCommit={(v) => updatePart(key, "design", "value", v)}
-                  placeholder={t("值", "Value")}
-                  className="text-sm px-2 py-1 border border-stone-300 rounded focus:outline-none focus:border-amber-600"
-                />
-                <ImeInput
-                  value={designParts.unit}
-                  onCommit={(v) => updatePart(key, "design", "unit", v)}
-                  placeholder={t("单位", "Unit")}
-                  className="text-sm px-2 py-1 border border-stone-300 rounded focus:outline-none focus:border-amber-600"
-                />
-                <ImeInput
-                  value={designParts.description}
-                  onCommit={(v) => updatePart(key, "design", "description", v)}
-                  placeholder={t("描述", "Description")}
-                  className="text-sm px-2 py-1 border border-stone-300 rounded focus:outline-none focus:border-amber-600"
-                />
+                <div className="flex items-center gap-1">
+                  <ImeInput
+                    value={designParts.value}
+                    onCommit={(v) => updatePart(key, "design", "value", v)}
+                    placeholder={t("值", "Value")}
+                    className="w-full text-sm px-2 py-1 border border-stone-300 rounded focus:outline-none focus:border-amber-600"
+                  />
+                  <VoiceMicButton onFinalTranscript={(chunk) => updatePart(key, "design", "value", appendWithSpace(designParts.value, chunk))} />
+                </div>
+                <div className="flex items-center gap-1">
+                  <ImeInput
+                    value={designParts.unit}
+                    onCommit={(v) => updatePart(key, "design", "unit", v)}
+                    placeholder={t("单位", "Unit")}
+                    className="w-full text-sm px-2 py-1 border border-stone-300 rounded focus:outline-none focus:border-amber-600"
+                  />
+                  <VoiceMicButton onFinalTranscript={(chunk) => updatePart(key, "design", "unit", appendWithSpace(designParts.unit, chunk))} />
+                </div>
+                <div className="flex items-center gap-1">
+                  <ImeInput
+                    value={designParts.description}
+                    onCommit={(v) => updatePart(key, "design", "description", v)}
+                    placeholder={t("描述", "Description")}
+                    className="w-full text-sm px-2 py-1 border border-stone-300 rounded focus:outline-none focus:border-amber-600"
+                  />
+                  <VoiceMicButton onFinalTranscript={(chunk) => updatePart(key, "design", "description", appendWithSpace(designParts.description, chunk))} />
+                </div>
               </div>
             </div>
             <div className="flex gap-1.5 items-start pl-1 pb-1 border-b border-stone-100">
               <span className="text-[12px] text-stone-700 w-[90px] shrink-0 text-right pr-1 pt-1">{t("实测值", "Actual value")}</span>
               <div className="flex-1 grid grid-cols-[2fr_1.2fr_3fr] gap-1">
-                <ImeInput
-                  value={actualParts.value}
-                  onCommit={(v) => updatePart(key, "actual", "value", v)}
-                  placeholder={t("值", "Value")}
-                  className="text-sm px-2 py-1 border border-stone-300 rounded focus:outline-none focus:border-amber-600"
-                />
-                <ImeInput
-                  value={actualParts.unit}
-                  onCommit={(v) => updatePart(key, "actual", "unit", v)}
-                  placeholder={t("单位", "Unit")}
-                  className="text-sm px-2 py-1 border border-stone-300 rounded focus:outline-none focus:border-amber-600"
-                />
-                <ImeInput
-                  value={actualParts.description}
-                  onCommit={(v) => updatePart(key, "actual", "description", v)}
-                  placeholder={t("描述", "Description")}
-                  className="text-sm px-2 py-1 border border-stone-300 rounded focus:outline-none focus:border-amber-600"
-                />
+                <div className="flex items-center gap-1">
+                  <ImeInput
+                    value={actualParts.value}
+                    onCommit={(v) => updatePart(key, "actual", "value", v)}
+                    placeholder={t("值", "Value")}
+                    className="w-full text-sm px-2 py-1 border border-stone-300 rounded focus:outline-none focus:border-amber-600"
+                  />
+                  <VoiceMicButton onFinalTranscript={(chunk) => updatePart(key, "actual", "value", appendWithSpace(actualParts.value, chunk))} />
+                </div>
+                <div className="flex items-center gap-1">
+                  <ImeInput
+                    value={actualParts.unit}
+                    onCommit={(v) => updatePart(key, "actual", "unit", v)}
+                    placeholder={t("单位", "Unit")}
+                    className="w-full text-sm px-2 py-1 border border-stone-300 rounded focus:outline-none focus:border-amber-600"
+                  />
+                  <VoiceMicButton onFinalTranscript={(chunk) => updatePart(key, "actual", "unit", appendWithSpace(actualParts.unit, chunk))} />
+                </div>
+                <div className="flex items-center gap-1">
+                  <ImeInput
+                    value={actualParts.description}
+                    onCommit={(v) => updatePart(key, "actual", "description", v)}
+                    placeholder={t("描述", "Description")}
+                    className="w-full text-sm px-2 py-1 border border-stone-300 rounded focus:outline-none focus:border-amber-600"
+                  />
+                  <VoiceMicButton onFinalTranscript={(chunk) => updatePart(key, "actual", "description", appendWithSpace(actualParts.description, chunk))} />
+                </div>
               </div>
             </div>
           </div>
@@ -4883,7 +5052,8 @@ const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree,
 
       {mode === "ai" ? (
         <div className="space-y-2">
-          <div className="relative">
+          <div className="flex gap-1.5">
+          <div className="flex-1 relative">
             <Sparkles size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-purple-500" />
             <input
               type="text"
@@ -4894,6 +5064,8 @@ const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree,
               disabled={!aiAnyConfigured}
               className="w-full pl-8 pr-3 py-1.5 text-sm border border-stone-300 rounded focus:outline-none focus:border-purple-600 disabled:bg-stone-50 disabled:text-stone-600"
             />
+          </div>
+          <VoiceMicButton onFinalTranscript={(chunk) => setQuestion((prev) => appendWithSpace(prev, chunk))} />
           </div>
 
           {!aiAnyConfigured ? (
@@ -4998,17 +5170,20 @@ const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree,
         </div>
       ) : (
       <>
-      <div className="relative">
-        <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-stone-600" />
-        <input
-          type="text"
-          value={q}
-          onChange={(e) => setQ(e.target.value)}
-          placeholder={matchMode === "phrase"
-            ? t("输入完整句子，按原样精确匹配…", "Type a full sentence to match verbatim…")
-            : t("按编号、名称、描述或元数据搜索，多个词用空格分隔…", "Search by number, name, description, or metadata — separate words with spaces…")}
-          className="w-full pl-8 pr-3 py-1.5 text-sm border border-stone-300 rounded focus:outline-none focus:border-amber-600"
-        />
+      <div className="flex gap-1.5">
+        <div className="flex-1 relative">
+          <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-stone-600" />
+          <input
+            type="text"
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder={matchMode === "phrase"
+              ? t("输入完整句子，按原样精确匹配…", "Type a full sentence to match verbatim…")
+              : t("按编号、名称、描述或元数据搜索，多个词用空格分隔…", "Search by number, name, description, or metadata — separate words with spaces…")}
+            className="w-full pl-8 pr-3 py-1.5 text-sm border border-stone-300 rounded focus:outline-none focus:border-amber-600"
+          />
+        </div>
+        <VoiceMicButton onFinalTranscript={(chunk) => setQ((prev) => appendWithSpace(prev, chunk))} />
       </div>
       <div className="flex items-center gap-1.5 text-[12px]">
         <span className="text-stone-700">{t("多词匹配：", "Multi-word match:")}</span>
@@ -5138,6 +5313,9 @@ const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree,
  */
 const DatabookPanel = ({ tree, docIndex, getPathFor, formatBytes, onOpenDoc }) => {
   const { t } = useLang();
+  // "manual": existing per-document tree-checkbox selection → PDF.
+  // "byFolder": pick one folder, auto-organize its subfolders as chapters → Word.
+  const [mode, setMode] = useState("manual");
   // Map<nodeId, Set<docId>>
   const [selection, setSelection] = useState(new Map());
   const [expanded, setExpanded] = useState(new Set());
@@ -5449,6 +5627,34 @@ const DatabookPanel = ({ tree, docIndex, getPathFor, formatBytes, onOpenDoc }) =
 
   return (
     <div className="flex flex-col h-full">
+      {/* Mode switch */}
+      <div className="border-b border-stone-200 p-2 flex gap-1">
+        <button
+          onClick={() => setMode("manual")}
+          className={`flex-1 text-[12px] px-2 py-1.5 rounded border ${
+            mode === "manual"
+              ? "bg-amber-600 border-amber-600 text-white"
+              : "border-stone-300 text-stone-700 hover:bg-stone-100"
+          }`}
+        >
+          {t("手动选择（PDF）", "Manual selection (PDF)")}
+        </button>
+        <button
+          onClick={() => setMode("byFolder")}
+          className={`flex-1 text-[12px] px-2 py-1.5 rounded border ${
+            mode === "byFolder"
+              ? "bg-amber-600 border-amber-600 text-white"
+              : "border-stone-300 text-stone-700 hover:bg-stone-100"
+          }`}
+        >
+          {t("按文件夹自动生成（Word）", "By folder, auto (Word)")}
+        </button>
+      </div>
+
+      {mode === "byFolder" ? (
+        <DatabookByFolderPanel tree={tree} docIndex={docIndex} formatBytes={formatBytes} onOpenDoc={onOpenDoc} />
+      ) : (
+      <>
       {/* Toolbar */}
       <div className="border-b border-stone-200 p-2 space-y-2">
         <div className="flex gap-1">
@@ -5512,25 +5718,31 @@ const DatabookPanel = ({ tree, docIndex, getPathFor, formatBytes, onOpenDoc }) =
             <label className="block text-sm uppercase tracking-wider text-stone-700 mb-1.5">
               {t("标题", "Title")}
             </label>
-            <input
-              type="text"
-              autoFocus
-              value={title}
-              onChange={(e) => setTitle(e.target.value)}
-              placeholder={t("工程数据手册", "Engineering data book")}
-              className="w-full px-2 py-1.5 text-base border border-stone-300 rounded focus:outline-none focus:border-amber-600 mb-3"
-            />
+            <div className="flex gap-1.5 mb-3">
+              <input
+                type="text"
+                autoFocus
+                value={title}
+                onChange={(e) => setTitle(e.target.value)}
+                placeholder={t("工程数据手册", "Engineering data book")}
+                className="flex-1 min-w-0 px-2 py-1.5 text-base border border-stone-300 rounded focus:outline-none focus:border-amber-600"
+              />
+              <VoiceMicButton onFinalTranscript={(chunk) => setTitle((prev) => appendWithSpace(prev, chunk))} />
+            </div>
 
             <label className="block text-sm uppercase tracking-wider text-stone-700 mb-1.5">
               {t("副标题", "Subtitle")} <span className="text-stone-600 normal-case tracking-normal">{t("（可选）", "(optional)")}</span>
             </label>
-            <input
-              type="text"
-              value={subtitle}
-              onChange={(e) => setSubtitle(e.target.value)}
-              placeholder={t("例如：项目编号、版次、客户名称", "e.g. project number, revision, client name")}
-              className="w-full px-2 py-1.5 text-base border border-stone-300 rounded focus:outline-none focus:border-amber-600 mb-3"
-            />
+            <div className="flex gap-1.5 mb-3">
+              <input
+                type="text"
+                value={subtitle}
+                onChange={(e) => setSubtitle(e.target.value)}
+                placeholder={t("例如：项目编号、版次、客户名称", "e.g. project number, revision, client name")}
+                className="flex-1 min-w-0 px-2 py-1.5 text-base border border-stone-300 rounded focus:outline-none focus:border-amber-600"
+              />
+              <VoiceMicButton onFinalTranscript={(chunk) => setSubtitle((prev) => appendWithSpace(prev, chunk))} />
+            </div>
 
             <label className="block text-sm uppercase tracking-wider text-stone-700 mb-1.5">
               {t("封面页", "Front page")} <span className="text-stone-600 normal-case tracking-normal">{t("（可选，PDF 或图片）", "(optional, PDF or image)")}</span>
@@ -5596,6 +5808,320 @@ const DatabookPanel = ({ tree, docIndex, getPathFor, formatBytes, onOpenDoc }) =
                 <>
                   <button
                     onClick={() => setShowTitleDialog(false)}
+                    disabled={generating}
+                    className="px-4 py-1.5 text-sm border border-stone-300 hover:bg-stone-100 rounded disabled:opacity-60"
+                  >
+                    {t("取消", "Cancel")}
+                  </button>
+                  <button
+                    onClick={generate}
+                    disabled={generating}
+                    className="px-4 py-1.5 text-sm bg-amber-600 hover:bg-amber-700 text-white rounded disabled:opacity-60 flex items-center gap-1.5"
+                  >
+                    {generating ? t("生成中…", "Generating…") : (<><Download size={11} /> {t("生成并下载", "Generate and download")}</>)}
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+      </>
+      )}
+    </div>
+  );
+};
+
+
+/*
+ * DatabookByFolderPanel — the "By folder, auto (Word)" mode. Pick one
+ * folder; every subfolder underneath becomes a nested chapter (numbered
+ * "1", "1.1", "1.1.1", ...), documents keep their existing tree order, and
+ * each document is followed by its own Description field. Optional cover
+ * page(s) (image/PDF) become the leading page(s); with none, page 1 is
+ * left blank. Server-side layout lives in databook.build_databook_docx.
+ */
+const DatabookByFolderPanel = ({ tree, docIndex, formatBytes, onOpenDoc }) => {
+  const { t } = useLang();
+  const [selectedNodeId, setSelectedNodeId] = useState(null);
+  const [expanded, setExpanded] = useState(new Set());
+  const [title, setTitle] = useState("Engineering Databook");
+  const [subtitle, setSubtitle] = useState("");
+  const [coverFiles, setCoverFiles] = useState([]);
+  const [generating, setGenerating] = useState(false);
+  const [showDialog, setShowDialog] = useState(false);
+  const [error, setError] = useState(null);
+  const [generated, setGenerated] = useState(false);
+  const [savedPath, setSavedPath] = useState(null);
+
+  const docsById = useMemo(() => new Map(docIndex.map((d) => [d.id, d])), [docIndex]);
+
+  useEffect(() => {
+    if (tree && tree.id && !expanded.has(tree.id)) {
+      setExpanded((prev) => new Set([...prev, tree.id]));
+    }
+  }, [tree?.id]);
+
+  useEffect(() => {
+    try {
+      const nid = localStorage.getItem("dms:databook-docx-nodeId");
+      if (nid) setSelectedNodeId(nid);
+      const t2 = localStorage.getItem("dms:databook-docx-title");
+      if (t2) setTitle(t2);
+      const s2 = localStorage.getItem("dms:databook-docx-subtitle");
+      if (s2) setSubtitle(s2);
+    } catch {}
+  }, []);
+
+  useEffect(() => {
+    try {
+      if (selectedNodeId) localStorage.setItem("dms:databook-docx-nodeId", selectedNodeId);
+      else localStorage.removeItem("dms:databook-docx-nodeId");
+    } catch {}
+  }, [selectedNodeId]);
+
+  const toggleExpand = (id) =>
+    setExpanded((prev) => {
+      const n = new Set(prev);
+      if (n.has(id)) n.delete(id);
+      else n.add(id);
+      return n;
+    });
+
+  const findNode = (node, id) => {
+    if (!node) return null;
+    if (node.id === id) return node;
+    for (const c of node.children || []) {
+      const found = findNode(c, id);
+      if (found) return found;
+    }
+    return null;
+  };
+  const selectedNode = useMemo(
+    () => (selectedNodeId ? findNode(tree, selectedNodeId) : null),
+    [tree, selectedNodeId]
+  );
+
+  const countDocs = (node) =>
+    (node.documents || []).length + (node.children || []).reduce((s, c) => s + countDocs(c), 0);
+  const countChapters = (node) =>
+    (node.children || []).length + (node.children || []).reduce((s, c) => s + countChapters(c), 0);
+
+  const renderNode = (node, depth = 0) => {
+    const isExpanded = expanded.has(node.id);
+    const hasChildren = (node.children || []).length > 0;
+    const docCount = (node.documents || []).length;
+    const canExpand = hasChildren;
+    const isSelected = selectedNodeId === node.id;
+
+    return (
+      <div key={node.id}>
+        <div
+          onClick={() => setSelectedNodeId(node.id)}
+          className={`flex items-center gap-1.5 py-1 pr-2 text-sm cursor-pointer ${
+            isSelected ? "bg-amber-50" : "hover:bg-stone-50"
+          }`}
+          style={{ paddingLeft: `${depth * 14 + 4}px` }}
+        >
+          <span
+            className="w-3.5 flex items-center justify-center text-stone-700"
+            onClick={(e) => { if (canExpand) { e.stopPropagation(); toggleExpand(node.id); } }}
+          >
+            {canExpand ? (
+              isExpanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />
+            ) : <span className="w-2.5" />}
+          </span>
+          <span className="shrink-0 text-amber-700">
+            {isSelected ? <CheckSquare size={13} /> : <Square size={13} className="text-stone-600" />}
+          </span>
+          <Folder size={13} className="text-amber-700 shrink-0" />
+          <span className="truncate flex-1 text-stone-800">{node.name}</span>
+          {docCount > 0 && (
+            <span className="text-[12px] tabular-nums px-1 bg-stone-100 text-stone-700 rounded">
+              {docCount}
+            </span>
+          )}
+        </div>
+        {isExpanded && (node.children || []).map((c) => renderNode(c, depth + 1))}
+      </div>
+    );
+  };
+
+  const generate = async () => {
+    if (!selectedNodeId) return;
+    setError(null);
+    setGenerating(true);
+    try {
+      const payload = { nodeId: selectedNodeId, title: title.trim() || "Engineering Databook", subtitle: subtitle.trim() };
+      try {
+        localStorage.setItem("dms:databook-docx-title", title);
+        localStorage.setItem("dms:databook-docx-subtitle", subtitle);
+      } catch {}
+
+      const form = new FormData();
+      form.append("payload", JSON.stringify(payload));
+      coverFiles.forEach((f) => form.append("cover_pages", f));
+
+      const res = await fetch("/api/databook-docx", { method: "POST", body: form });
+      if (!res.ok) {
+        let msg = `HTTP ${res.status}`;
+        try { msg = (await res.json()).error || msg; } catch {}
+        throw new Error(msg);
+      }
+
+      const savedHeader = res.headers.get("X-Databook-Saved-Path");
+      setSavedPath(savedHeader ? decodeURIComponent(savedHeader) : null);
+
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = (title.trim() || "Databook") + ".docx";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      setGenerated(true);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setGenerating(false);
+    }
+  };
+
+  if (!tree) return null;
+
+  return (
+    <div className="flex flex-col h-full">
+      <div className="border-b border-stone-200 p-2 text-[12px] text-stone-700 leading-tight">
+        {t(
+          "选择一个文件夹，其每个子文件夹将成为数据手册中的一个章节（可多级嵌套），文档按文件夹内原有顺序排列，每份文档后附其描述。",
+          "Pick a folder. Each of its subfolders becomes a chapter (nested subfolders become sub-chapters), documents keep the order they already have, and each is followed by its Description."
+        )}
+      </div>
+
+      <div className="flex-1 overflow-auto py-1">
+        {renderNode(tree)}
+      </div>
+
+      <div className="border-t border-stone-200 p-2">
+        {selectedNode && (
+          <div className="text-[13px] text-stone-700 bg-stone-50 border border-stone-200 rounded p-2 mb-2">
+            <div className="font-medium text-stone-900 truncate">{selectedNode.name}</div>
+            <div>{countChapters(selectedNode)} {t("个章节", "chapters")} · {countDocs(selectedNode)} {t("份文档", "documents")}</div>
+          </div>
+        )}
+        <button
+          onClick={() => { setError(null); setGenerated(false); setSavedPath(null); setShowDialog(true); }}
+          disabled={!selectedNodeId || countDocs(selectedNode || {}) === 0}
+          className="w-full px-3 py-2 bg-amber-600 hover:bg-amber-700 text-white text-sm font-medium rounded disabled:opacity-40 flex items-center justify-center gap-1.5"
+        >
+          <Download size={12} /> {t("生成数据手册（Word）", "Generate data book (Word)")}
+        </button>
+      </div>
+
+      {showDialog && (
+        <div
+          className="fixed inset-0 bg-stone-900/70 z-50 flex items-center justify-center p-4"
+          onClick={() => !generating && setShowDialog(false)}
+        >
+          <div className="bg-white w-full max-w-md rounded shadow-2xl p-5" onClick={(e) => e.stopPropagation()}>
+            <div className="text-[12px] tracking-[0.2em] uppercase text-stone-700 mb-1">
+              {t("生成数据手册（Word）", "Generate data book (Word)")}
+            </div>
+            <h2 className="text-xl font-semibold text-stone-900 mb-3">{t("封面信息", "Cover page info")}</h2>
+
+            <label className="block text-sm uppercase tracking-wider text-stone-700 mb-1.5">{t("标题", "Title")}</label>
+            <div className="flex gap-1.5 mb-3">
+              <input
+                type="text"
+                autoFocus
+                value={title}
+                onChange={(e) => setTitle(e.target.value)}
+                placeholder={t("工程数据手册", "Engineering data book")}
+                className="flex-1 min-w-0 px-2 py-1.5 text-base border border-stone-300 rounded focus:outline-none focus:border-amber-600"
+              />
+              <VoiceMicButton onFinalTranscript={(chunk) => setTitle((prev) => appendWithSpace(prev, chunk))} />
+            </div>
+
+            <label className="block text-sm uppercase tracking-wider text-stone-700 mb-1.5">
+              {t("副标题", "Subtitle")} <span className="text-stone-600 normal-case tracking-normal">{t("（可选）", "(optional)")}</span>
+            </label>
+            <div className="flex gap-1.5 mb-3">
+              <input
+                type="text"
+                value={subtitle}
+                onChange={(e) => setSubtitle(e.target.value)}
+                placeholder={t("例如：项目编号、版次、客户名称", "e.g. project number, revision, client name")}
+                className="flex-1 min-w-0 px-2 py-1.5 text-base border border-stone-300 rounded focus:outline-none focus:border-amber-600"
+              />
+              <VoiceMicButton onFinalTranscript={(chunk) => setSubtitle((prev) => appendWithSpace(prev, chunk))} />
+            </div>
+
+            <label className="block text-sm uppercase tracking-wider text-stone-700 mb-1.5">
+              {t("封面页", "Cover page(s)")} <span className="text-stone-600 normal-case tracking-normal">{t("（可选，可多张，PDF 或图片）", "(optional, one or more, PDF or image)")}</span>
+            </label>
+            {coverFiles.length > 0 && (
+              <div className="space-y-1 mb-1">
+                {coverFiles.map((f, i) => (
+                  <div key={i} className="flex items-center gap-2 text-sm bg-stone-50 border border-stone-200 rounded px-2 py-1.5">
+                    <FileText size={12} className="text-stone-700 shrink-0" />
+                    <span className="truncate flex-1">{f.name}</span>
+                    <button
+                      onClick={() => setCoverFiles((prev) => prev.filter((_, j) => j !== i))}
+                      className="text-stone-600 hover:text-red-600 shrink-0"
+                      title={t("移除", "Remove")}
+                    >
+                      <X size={12} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+            <input
+              type="file"
+              multiple
+              accept="application/pdf,image/*"
+              onChange={(e) => setCoverFiles((prev) => [...prev, ...Array.from(e.target.files || [])])}
+              className="w-full text-sm mb-1 file:mr-2 file:px-2 file:py-1 file:border file:border-stone-300 file:rounded file:bg-white file:text-sm file:cursor-pointer hover:file:bg-stone-50"
+            />
+            <div className="text-[12px] text-stone-700 mb-3 leading-tight">
+              {t(
+                "未提供封面时，第 1 页将留空。Word/Pages 文档请先导出为 PDF。",
+                "With no cover supplied, page 1 is left blank. Export Word/Pages documents to PDF first."
+              )}
+            </div>
+
+            {error && (
+              <div className="text-sm text-red-700 bg-red-50 border border-red-200 rounded p-2 mb-3 whitespace-pre-wrap">
+                {error}
+              </div>
+            )}
+
+            {generated && (
+              <div className="text-sm text-emerald-800 bg-emerald-50 border border-emerald-200 rounded p-2 mb-3">
+                <div className="font-medium mb-1">{t("生成成功，下载已开始。", "Generated successfully — the download has started.")}</div>
+                {savedPath ? (
+                  <div className="break-all">
+                    {t("副本已保存到项目文件夹：", "A copy was also saved to the project folder:")} <span className="font-mono">{savedPath}</span>
+                  </div>
+                ) : (
+                  <div className="text-amber-700">
+                    {t("未能保存副本到项目文件夹（浏览器下载仍可用）。", "Could not save a copy to the project folder (browser download still available).")}
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div className="flex gap-2 justify-end">
+              {generated ? (
+                <button onClick={() => setShowDialog(false)} className="px-4 py-1.5 text-sm bg-amber-600 hover:bg-amber-700 text-white rounded">
+                  {t("关闭", "Close")}
+                </button>
+              ) : (
+                <>
+                  <button
+                    onClick={() => setShowDialog(false)}
                     disabled={generating}
                     className="px-4 py-1.5 text-sm border border-stone-300 hover:bg-stone-100 rounded disabled:opacity-60"
                   >
@@ -6311,6 +6837,7 @@ const FolderBrowserModal = ({ startPath, onSelect, onClose }) => {
                 onKeyDown={(e) => { if (e.key === "Enter") load(pathInput); }}
                 className="flex-1 min-w-0 text-sm px-2 py-1 border border-stone-300 rounded font-mono"
               />
+              <VoiceMicButton onFinalTranscript={(chunk) => setPathInput((prev) => appendWithSpace(prev, chunk))} />
               <button onClick={() => load(pathInput)} className="text-sm px-2 py-1 rounded border border-stone-200 hover:bg-stone-50 shrink-0">
                 {t("前往", "Go")}
               </button>
@@ -6626,55 +7153,15 @@ const FolderAskAIDialog = ({ open, node, tree, docIndex, onClose, onOpenDoc, onO
     window.addEventListener("mouseup", onUp);
   };
 
-  // --- Voice-to-text dictation for the request field (Web Speech API,
-  // Chinese + English -- same approach as the document viewer's description).
-  const [voiceLang, setVoiceLang] = useState("zh-CN");
-  const [listening, setListening] = useState(false);
-  const [voiceInterim, setVoiceInterim] = useState("");
-  const [voiceError, setVoiceError] = useState("");
-  const recognitionRef = useRef(null);
-  const SpeechRecognitionCtor = typeof window !== "undefined"
-    ? (window.SpeechRecognition || window.webkitSpeechRecognition) : null;
-  const voiceSupported = !!SpeechRecognitionCtor;
-
-  const stopListening = () => { try { recognitionRef.current && recognitionRef.current.stop(); } catch {} };
-  const startListening = (lang) => {
-    if (!SpeechRecognitionCtor) return;
-    stopListening();
-    const recognition = new SpeechRecognitionCtor();
-    recognition.lang = lang;
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.onresult = (event) => {
-      let finalChunk = "", interim = "";
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const r = event.results[i];
-        if (r.isFinal) finalChunk += r[0].transcript; else interim += r[0].transcript;
-      }
-      if (finalChunk) {
-        setRequest((prev) => {
-          const needsSpace = prev && !/[\s\n]$/.test(prev);
-          return prev + (needsSpace ? " " : "") + finalChunk.trim();
-        });
-      }
-      setVoiceInterim(interim);
-    };
-    recognition.onerror = (event) => {
-      setVoiceError(
-        event.error === "not-allowed" ? t("麦克风权限被拒绝，请在浏览器设置中允许访问麦克风", "Microphone access denied — allow microphone access in your browser settings")
-        : event.error === "no-speech" ? t("未检测到语音，请再试一次", "No speech detected, please try again")
-        : t(`语音识别出错：${event.error}`, `Speech recognition error: ${event.error}`)
-      );
-      setListening(false); setVoiceInterim("");
-    };
-    recognition.onend = () => { setListening(false); setVoiceInterim(""); };
-    recognitionRef.current = recognition;
-    setVoiceError(""); setVoiceInterim("");
-    try { recognition.start(); setListening(true); } catch { setListening(false); }
-  };
-  const toggleListening = () => { if (listening) { stopListening(); return; } startListening(voiceLang); };
-  useEffect(() => () => stopListening(), []);
-  useEffect(() => { if (!open) stopListening(); }, [open]);
+  // Voice-to-text dictation for the request field -- shared implementation,
+  // see useVoiceDictation above.
+  const {
+    voiceLang, setVoiceLang, listening, voiceInterim, voiceError, voiceSupported,
+    toggleListening, resetVoiceUI,
+  } = useVoiceDictation((chunk) => {
+    setRequest((prev) => appendWithSpace(prev, chunk));
+  });
+  useEffect(() => { if (!open) resetVoiceUI(); }, [open]);
 
   // Ordered [{ nodeId, nodeName, depth, docs:[entry] }] for this folder + subtree.
   const sections = useMemo(() => {
@@ -8764,6 +9251,7 @@ const GridPopoutApp = ({ storageKey }) => {
                   placeholder={langCtxValue.t("例如：/Users/你/Downloads", "e.g. /Users/you/Downloads")}
                   className="flex-1 min-w-0 text-sm px-2 py-1.5 border border-stone-300 rounded font-mono"
                 />
+                <VoiceMicButton onFinalTranscript={(chunk) => setDownloadDialog((d) => ({ ...d, path: appendWithSpace(d.path, chunk) }))} />
                 <button
                   type="button"
                   onClick={() => setDownloadFolderBrowserOpen(true)}
@@ -8831,14 +9319,17 @@ const GridPopoutApp = ({ storageKey }) => {
             </h3>
             <label className="text-sm text-stone-700">
               {langCtxValue.t("前缀文字", "Prefix text")}
-              <input
-                type="text"
-                autoFocus
-                value={renamePrefixDialog.prefix}
-                onChange={(e) => setRenamePrefixDialog((d) => ({ ...d, prefix: e.target.value }))}
-                placeholder={langCtxValue.t("例如：2026家庭旅游-", "e.g. 2026-Trip-")}
-                className="mt-1 w-full text-sm px-2 py-1.5 border border-stone-300 rounded font-mono"
-              />
+              <div className="mt-1 flex gap-1.5">
+                <input
+                  type="text"
+                  autoFocus
+                  value={renamePrefixDialog.prefix}
+                  onChange={(e) => setRenamePrefixDialog((d) => ({ ...d, prefix: e.target.value }))}
+                  placeholder={langCtxValue.t("例如：2026家庭旅游-", "e.g. 2026-Trip-")}
+                  className="flex-1 min-w-0 text-sm px-2 py-1.5 border border-stone-300 rounded font-mono"
+                />
+                <VoiceMicButton onFinalTranscript={(chunk) => setRenamePrefixDialog((d) => ({ ...d, prefix: appendWithSpace(d.prefix, chunk) }))} />
+              </div>
             </label>
             {(() => {
               const firstDoc = docs.find((d) => selectedIds.has(d.id));
@@ -8981,13 +9472,16 @@ const CombineFolderModal = ({ node, docIndex, formatBytes, onClose, onSaved }) =
         <div className="px-5 py-3 border-b border-stone-200 space-y-3">
           <div>
             <label className="text-[12px] uppercase tracking-wider text-stone-700 block mb-1">{t("输出文件名", "Output filename")}</label>
-            <input
-              type="text"
-              value={title}
-              onChange={(e) => setTitle(e.target.value)}
-              className="w-full text-base border border-stone-300 rounded px-2 py-1.5 focus:outline-none focus:border-amber-500"
-              placeholder={t("合并文档标题", "Merged document title")}
-            />
+            <div className="flex gap-1.5">
+              <input
+                type="text"
+                value={title}
+                onChange={(e) => setTitle(e.target.value)}
+                className="flex-1 min-w-0 text-base border border-stone-300 rounded px-2 py-1.5 focus:outline-none focus:border-amber-500"
+                placeholder={t("合并文档标题", "Merged document title")}
+              />
+              <VoiceMicButton onFinalTranscript={(chunk) => setTitle((prev) => appendWithSpace(prev, chunk))} />
+            </div>
           </div>
           <label className="flex items-center gap-2 text-base text-stone-700 cursor-pointer select-none">
             <input
@@ -9460,6 +9954,9 @@ const SendEmailDialog = ({ doc, onClose, onOpenEmailSettings }) => {
   const [busy, setBusy] = useState(false);
   const [smtpConfigured, setSmtpConfigured] = useState(null); // null=loading, true/false
   const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform);
+  const bodyVoice = useVoiceDictation((chunk) => {
+    setBody((prev) => appendWithSpace(prev, chunk));
+  });
 
   useEffect(() => {
     fetch("/api/email-settings")
@@ -9519,33 +10016,69 @@ const SendEmailDialog = ({ doc, onClose, onOpenEmailSettings }) => {
         <div className="text-sm text-stone-700 mb-3 truncate" title={doc.name}>{doc.name}</div>
 
         <label className="block text-[12px] uppercase tracking-wider text-stone-700 mb-1">{t("收件人", "Recipient")}</label>
-        <input
-          autoFocus
-          type="email"
-          value={to}
-          onChange={(e) => setTo(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter") send(); if (e.key === "Escape") onClose(); }}
-          placeholder="example@email.com"
-          className="w-full px-3 py-2 border border-stone-300 rounded text-base focus:outline-none focus:border-amber-500 mb-2"
-        />
+        <div className="flex gap-1.5 mb-2">
+          <input
+            autoFocus
+            type="email"
+            value={to}
+            onChange={(e) => setTo(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") send(); if (e.key === "Escape") onClose(); }}
+            placeholder="example@email.com"
+            className="flex-1 min-w-0 px-3 py-2 border border-stone-300 rounded text-base focus:outline-none focus:border-amber-500"
+          />
+          <VoiceMicButton onFinalTranscript={(chunk) => setTo((prev) => appendWithSpace(prev, chunk))} />
+        </div>
 
         <label className="block text-[12px] uppercase tracking-wider text-stone-700 mb-1">{t("主题", "Subject")}</label>
-        <input
-          type="text"
-          value={subject}
-          onChange={(e) => setSubject(e.target.value)}
-          placeholder={t("邮件主题", "Email subject")}
-          className="w-full px-3 py-2 border border-stone-300 rounded text-base focus:outline-none focus:border-amber-500 mb-2"
-        />
+        <div className="flex gap-1.5 mb-2">
+          <input
+            type="text"
+            value={subject}
+            onChange={(e) => setSubject(e.target.value)}
+            placeholder={t("邮件主题", "Email subject")}
+            className="flex-1 min-w-0 px-3 py-2 border border-stone-300 rounded text-base focus:outline-none focus:border-amber-500"
+          />
+          <VoiceMicButton onFinalTranscript={(chunk) => setSubject((prev) => appendWithSpace(prev, chunk))} />
+        </div>
 
-        <label className="block text-[12px] uppercase tracking-wider text-stone-700 mb-1">{t("正文（可选）", "Body (optional)")}</label>
+        <div className="flex items-center justify-between mb-1 gap-2 flex-wrap">
+          <label className="block text-[12px] uppercase tracking-wider text-stone-700">{t("正文（可选）", "Body (optional)")}</label>
+          {bodyVoice.voiceSupported && (
+            <div className="flex items-center gap-1.5 flex-wrap">
+              <div className="flex rounded overflow-hidden border border-stone-300 text-[11px] shrink-0">
+                <button
+                  onClick={() => bodyVoice.setVoiceLang("zh-CN")} disabled={bodyVoice.listening}
+                  title={t("识别语言：中文", "Recognition language: Chinese")}
+                  className={"px-1.5 py-0.5 " + (bodyVoice.voiceLang === "zh-CN" ? "bg-stone-700 text-white" : "bg-white text-stone-700 hover:bg-stone-100")}
+                >中文</button>
+                <button
+                  onClick={() => bodyVoice.setVoiceLang("en-US")} disabled={bodyVoice.listening}
+                  title="Recognition language: English"
+                  className={"px-1.5 py-0.5 border-l border-stone-300 " + (bodyVoice.voiceLang === "en-US" ? "bg-stone-700 text-white" : "bg-white text-stone-700 hover:bg-stone-100")}
+                >EN</button>
+              </div>
+              <button
+                onClick={bodyVoice.toggleListening}
+                title={bodyVoice.listening ? t("停止语音输入", "Stop voice input") : t("开始语音输入，识别结果会自动追加到正文中", "Start voice input — recognized text will be appended to the body")}
+                className={"text-[12px] px-2 py-0.5 rounded flex items-center gap-1 border shrink-0 " +
+                  (bodyVoice.listening ? "border-red-400 text-red-700 bg-red-50 animate-pulse" : "border-stone-300 text-stone-700 hover:bg-stone-100")}
+              >
+                {bodyVoice.listening ? <MicOff size={12} /> : <Mic size={12} />}
+                {bodyVoice.listening ? t("正在聆听…", "Listening…") : t("语音输入", "Voice")}
+              </button>
+            </div>
+          )}
+        </div>
         <textarea
           value={body}
           onChange={(e) => setBody(e.target.value)}
           placeholder={t("请见附件。", "Please see attached.")}
           rows={2}
-          className="w-full px-3 py-2 border border-stone-300 rounded text-base focus:outline-none focus:border-amber-500 mb-3 resize-none"
+          className="w-full px-3 py-2 border border-stone-300 rounded text-base focus:outline-none focus:border-amber-500 resize-none"
         />
+        {bodyVoice.voiceInterim && <div className="text-[12px] text-stone-500 italic mt-0.5 truncate">{bodyVoice.voiceInterim}</div>}
+        {bodyVoice.voiceError && <div className="text-[12px] text-red-600 mt-0.5 mb-1">{bodyVoice.voiceError}</div>}
+        <div className="mb-2" />
 
         {status && (
           <div className={`text-sm rounded px-3 py-2 mb-3 ${status.ok ? "bg-green-50 text-green-800 border border-green-200" : "bg-red-50 text-red-700 border border-red-200"}`}>
@@ -9685,13 +10218,16 @@ const EmailSettingsDialog = ({ onClose }) => {
             <div className="grid grid-cols-2 gap-2 mb-2">
               <div>
                 <label className="block text-[12px] uppercase tracking-wider text-stone-700 mb-1">{t("SMTP 服务器", "SMTP server")}</label>
-                <input
-                  type="text"
-                  value={settings.smtp_host}
-                  onChange={(e) => set("smtp_host", e.target.value)}
-                  placeholder="smtp.gmail.com"
-                  className="w-full px-2 py-1.5 text-base border border-stone-300 rounded focus:outline-none focus:border-amber-500"
-                />
+                <div className="flex gap-1.5">
+                  <input
+                    type="text"
+                    value={settings.smtp_host}
+                    onChange={(e) => set("smtp_host", e.target.value)}
+                    placeholder="smtp.gmail.com"
+                    className="flex-1 min-w-0 px-2 py-1.5 text-base border border-stone-300 rounded focus:outline-none focus:border-amber-500"
+                  />
+                  <VoiceMicButton onFinalTranscript={(chunk) => set("smtp_host", appendWithSpace(settings.smtp_host, chunk))} />
+                </div>
               </div>
               <div>
                 <label className="block text-[12px] uppercase tracking-wider text-stone-700 mb-1">{t("端口", "Port")}</label>
@@ -9717,13 +10253,16 @@ const EmailSettingsDialog = ({ onClose }) => {
             </label>
 
             <label className="block text-[12px] uppercase tracking-wider text-stone-700 mb-1">{t("用户名（邮箱地址）", "Username (email address)")}</label>
-            <input
-              type="email"
-              value={settings.smtp_user}
-              onChange={(e) => set("smtp_user", e.target.value)}
-              placeholder="you@gmail.com"
-              className="w-full px-2 py-1.5 text-base border border-stone-300 rounded focus:outline-none focus:border-amber-500 mb-2"
-            />
+            <div className="flex gap-1.5 mb-2">
+              <input
+                type="email"
+                value={settings.smtp_user}
+                onChange={(e) => set("smtp_user", e.target.value)}
+                placeholder="you@gmail.com"
+                className="flex-1 min-w-0 px-2 py-1.5 text-base border border-stone-300 rounded focus:outline-none focus:border-amber-500"
+              />
+              <VoiceMicButton onFinalTranscript={(chunk) => set("smtp_user", appendWithSpace(settings.smtp_user, chunk))} />
+            </div>
 
             <label className="block text-[12px] uppercase tracking-wider text-stone-700 mb-1">
               {t("密码", "Password")}{" "}
@@ -9743,13 +10282,16 @@ const EmailSettingsDialog = ({ onClose }) => {
               {t("发件人地址", "Sender address")}{" "}
               <span className="text-stone-600 normal-case tracking-normal">{t("（可选，默认与用户名相同）", "(optional, defaults to the username)")}</span>
             </label>
-            <input
-              type="email"
-              value={settings.email_from}
-              onChange={(e) => set("email_from", e.target.value)}
-              placeholder={t("可选", "Optional")}
-              className="w-full px-2 py-1.5 text-base border border-stone-300 rounded focus:outline-none focus:border-amber-500 mb-3"
-            />
+            <div className="flex gap-1.5 mb-3">
+              <input
+                type="email"
+                value={settings.email_from}
+                onChange={(e) => set("email_from", e.target.value)}
+                placeholder={t("可选", "Optional")}
+                className="flex-1 min-w-0 px-2 py-1.5 text-base border border-stone-300 rounded focus:outline-none focus:border-amber-500"
+              />
+              <VoiceMicButton onFinalTranscript={(chunk) => set("email_from", appendWithSpace(settings.email_from, chunk))} />
+            </div>
           </>
         )}
 
@@ -10241,6 +10783,7 @@ const PdfViewerPanel = ({ url, jumpToPage, highlightText, jumpNonce }) => {
           onBlur={() => gotoPage(parseInt(pageInput, 10) || 1)}
           className="w-10 text-center px-1 py-0.5 border border-stone-300 rounded"
         />
+        <VoiceMicButton onFinalTranscript={(chunk) => setPageInput((prev) => appendWithSpace(prev, chunk))} />
         <span className="text-stone-600">/ {pageInfo.count || "—"}</span>
         <button onClick={() => gotoPage(pageInfo.page + 1)} disabled={!ready || pageInfo.page >= pageInfo.count}
           className="p-1 border border-stone-300 rounded disabled:opacity-30 hover:bg-white" title={t("下一页", "Next page")}>
@@ -10510,6 +11053,7 @@ const FloatingDocPreview = ({ doc, onClose }) => {
               placeholder={t("查找文字…（可与原文不完全一致）", "Find text… (doesn't need to match exactly)")}
               className="flex-1 min-w-0 text-base font-bold px-2 py-1 border border-stone-300 rounded focus:outline-none focus:border-amber-600"
             />
+            <VoiceMicButton onFinalTranscript={(chunk) => setQuery((prev) => appendWithSpace(prev, chunk))} />
             <button
               onClick={runSearch}
               disabled={searching || !query.trim()}
@@ -11010,6 +11554,7 @@ const DocumentCard = ({
               disabled={renamingBusy}
               className="flex-1 text-sm px-2 py-1 border border-stone-300 rounded font-mono focus:outline-none focus:border-amber-600 disabled:opacity-60"
             />
+            <VoiceMicButton onFinalTranscript={(chunk) => setNameDraft((prev) => appendWithSpace(prev, chunk))} />
             <button
               onClick={commitName}
               disabled={renamingBusy}
@@ -11062,6 +11607,7 @@ const DocumentCard = ({
               placeholder={nodeSn ? t(`留空则继承 "${nodeSn}"`, `Leave blank to inherit "${nodeSn}"`) : t("如不适用请留空", "Leave blank if not applicable")}
               className="flex-1 text-sm px-2 py-1 border border-stone-300 rounded font-mono focus:outline-none focus:border-amber-600"
             />
+            <VoiceMicButton onFinalTranscript={(chunk) => setSnDraft((prev) => appendWithSpace(prev, chunk))} />
             <button
               onClick={commitSn}
               className="text-sm px-3 py-1 bg-amber-600 hover:bg-amber-700 text-white rounded"
@@ -11393,15 +11939,18 @@ const SettingsScreen = ({ initialPath, currentPath, isInitialSetup, onSaved, onC
         <label className="block text-sm uppercase tracking-wider text-stone-700 mb-1.5">
           {t("存储路径", "Storage path")}
         </label>
-        <input
-          type="text"
-          value={pathValue}
-          onChange={(e) => setPathValue(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter") save(); }}
-          placeholder={exampleAbs}
-          autoFocus
-          className="w-full px-3 py-2 border border-stone-300 rounded font-mono text-base focus:outline-none focus:border-amber-600"
-        />
+        <div className="flex gap-1.5">
+          <input
+            type="text"
+            value={pathValue}
+            onChange={(e) => setPathValue(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") save(); }}
+            placeholder={exampleAbs}
+            autoFocus
+            className="flex-1 min-w-0 px-3 py-2 border border-stone-300 rounded font-mono text-base focus:outline-none focus:border-amber-600"
+          />
+          <VoiceMicButton onFinalTranscript={(chunk) => setPathValue((prev) => appendWithSpace(prev, chunk))} />
+        </div>
 
         {info && info.configured && info.exists && (
           <div className="mt-3 text-sm text-stone-700 bg-amber-50 border border-amber-200 rounded p-2">
@@ -11531,6 +12080,7 @@ const KeyParametersDialog = ({ open, keyParameters, onSave, onClose }) => {
             className="flex-1 px-2 py-1.5 text-base border border-stone-300 rounded font-mono focus:outline-none focus:border-amber-600"
             autoFocus
           />
+          <VoiceMicButton onFinalTranscript={(chunk) => setNewItem((prev) => appendWithSpace(prev, chunk))} />
           <button
             onClick={add}
             className="px-3 py-1.5 text-sm bg-amber-600 hover:bg-amber-700 text-white rounded flex items-center gap-1"
@@ -11551,6 +12101,7 @@ const KeyParametersDialog = ({ open, keyParameters, onSave, onClose }) => {
                 onChange={(e) => update(idx, e.target.value)}
                 className="flex-1 text-sm px-2 py-1 border border-stone-300 rounded font-mono focus:outline-none focus:border-amber-600"
               />
+              <VoiceMicButton onFinalTranscript={(chunk) => update(idx, appendWithSpace(item, chunk))} />
               <button
                 onClick={() => move(idx, -1)}
                 disabled={idx === 0}
@@ -11913,9 +12464,12 @@ const HierarchyImportDialog = ({ open, onClose, onImported, tree, defaultTargetN
 
           {/* Paste area */}
           <div>
-            <label className="block text-[12px] uppercase tracking-wider text-stone-700 mb-1.5">
-              {t("或直接粘贴层级文本", "Or paste hierarchy text directly")}
-            </label>
+            <div className="flex items-center justify-between mb-1.5">
+              <label className="block text-[12px] uppercase tracking-wider text-stone-700">
+                {t("或直接粘贴层级文本", "Or paste hierarchy text directly")}
+              </label>
+              <VoiceMicButton onFinalTranscript={(chunk) => { setText((prev) => appendWithSpace(prev, chunk)); setErrors([]); setPreview(null); setResult(null); }} />
+            </div>
             <textarea
               className="w-full h-36 text-sm font-mono border border-stone-300 rounded px-2.5 py-2 resize-y focus:outline-none focus:border-amber-600"
               placeholder={t("根文件夹\n子文件夹A, 根文件夹\n子文件夹B, 根文件夹\n孙文件夹, 子文件夹A", "Root folder\nSubfolder A, Root folder\nSubfolder B, Root folder\nGrandchild folder, Subfolder A")}
@@ -13770,14 +14324,17 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
             <label className="block text-sm uppercase tracking-wider text-stone-700 mb-1.5">
               {t("目标文件夹", "Destination folder")}
             </label>
-            <input
-              type="text"
-              autoFocus
-              value={importDialog.target}
-              onChange={(e) => setImportDialog({ ...importDialog, target: e.target.value })}
-              placeholder={isMac ? "/Users/yourname/DMS_Imported" : "C:\\DMS_Imported"}
-              className="w-full px-2 py-1.5 text-base border border-stone-300 rounded font-mono mb-3"
-            />
+            <div className="flex gap-1.5 mb-3">
+              <input
+                type="text"
+                autoFocus
+                value={importDialog.target}
+                onChange={(e) => setImportDialog({ ...importDialog, target: e.target.value })}
+                placeholder={isMac ? "/Users/yourname/DMS_Imported" : "C:\\DMS_Imported"}
+                className="flex-1 min-w-0 px-2 py-1.5 text-base border border-stone-300 rounded font-mono"
+              />
+              <VoiceMicButton onFinalTranscript={(chunk) => setImportDialog({ ...importDialog, target: appendWithSpace(importDialog.target, chunk) })} />
+            </div>
 
             <div className="text-[13px] text-stone-600 bg-stone-50 border border-stone-200 rounded px-3 py-2 mb-3">
               {t("导入只恢复文件夹树结构，不会删除磁盘上已有的文件。", "Import only restores the folder tree structure; it doesn't delete any existing files on disk.")}
@@ -13838,6 +14395,7 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
                 placeholder={exampleNew}
                 className="flex-1 min-w-0 px-2 py-1.5 text-base border border-stone-300 rounded font-mono"
               />
+              <VoiceMicButton onFinalTranscript={(chunk) => setNewDialog({ target: appendWithSpace(newDialog.target, chunk) })} />
               <button
                 onClick={() => setNewFolderBrowserOpen(true)}
                 className="shrink-0 px-3 py-1.5 text-sm border border-stone-300 rounded hover:bg-stone-50 text-stone-700"
@@ -13913,6 +14471,7 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
                 placeholder={exampleNew}
                 className="flex-1 min-w-0 px-2 py-1.5 text-base border border-stone-300 rounded font-mono"
               />
+              <VoiceMicButton onFinalTranscript={(chunk) => setOpenAnotherDialog({ target: appendWithSpace(openAnotherDialog.target, chunk) })} />
               <button
                 onClick={() => setOpenAnotherFolderBrowserOpen(true)}
                 className="shrink-0 px-3 py-1.5 text-sm border border-stone-300 rounded hover:bg-stone-50 text-stone-700"
@@ -14070,14 +14629,17 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
             <label className="block text-sm uppercase tracking-wider text-stone-700 mb-1.5">
               {t("项目名称", "Project name")}
             </label>
-            <input
-              type="text"
-              autoFocus
-              value={projectPwDialog.name}
-              onChange={(e) => setProjectPwDialog({ ...projectPwDialog, name: e.target.value })}
-              placeholder={t("例如：家庭文档", "e.g. Family Documents")}
-              className="w-full px-2 py-1.5 text-base border border-stone-300 rounded mb-3"
-            />
+            <div className="flex gap-1.5 mb-3">
+              <input
+                type="text"
+                autoFocus
+                value={projectPwDialog.name}
+                onChange={(e) => setProjectPwDialog({ ...projectPwDialog, name: e.target.value })}
+                placeholder={t("例如：家庭文档", "e.g. Family Documents")}
+                className="flex-1 min-w-0 px-2 py-1.5 text-base border border-stone-300 rounded"
+              />
+              <VoiceMicButton onFinalTranscript={(chunk) => setProjectPwDialog({ ...projectPwDialog, name: appendWithSpace(projectPwDialog.name, chunk) })} />
+            </div>
 
             {projectPwDialog.hasExisting && (
               <>
@@ -14377,6 +14939,28 @@ const LinkPicker = ({
   // sets browseNodeId but the Search tab never read it).
   const [searchFolderFilter, setSearchFolderFilter] = useState(null);
 
+  // Document list display: "list" (current default, shows id/size/link-count)
+  // or "grid" (thumbnails, like the main folder view's icon view -- see
+  // DocumentGridTile / gridThumbSize), with the same 3-tier size choice as
+  // the pop-out icon-grid window. Persisted like this dialog's other layout
+  // preferences above.
+  const [docViewMode, setDocViewMode] = useState(() => {
+    try { return localStorage.getItem("dms:link-picker-view-mode") || "list"; } catch { return "list"; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("dms:link-picker-view-mode", docViewMode); } catch {}
+  }, [docViewMode]);
+  const [thumbSize, setThumbSize] = useState(() => {
+    try {
+      const saved = localStorage.getItem("dms:link-picker-thumb-size");
+      if (saved === "small" || saved === "large" || saved === "xlarge") return saved;
+    } catch {}
+    return "small";
+  });
+  useEffect(() => {
+    try { localStorage.setItem("dms:link-picker-thumb-size", thumbSize); } catch {}
+  }, [thumbSize]);
+
   useEffect(() => {
     if (open) {
       setQ("");
@@ -14513,65 +15097,228 @@ const LinkPicker = ({
     );
   };
 
-  // Recursive tree renderer, also used as the drag-to-link drop target: a
-  // document row dragged from renderRow (either tab) and dropped on a
-  // folder here calls onLink(docId, node.id) directly -- purely additive
-  // (a new reference), no unlink/move involved, and unrelated to the
-  // app-wide drag-to-move feature on the real sidebar tree.
-  const renderBrowseTree = (node, depth = 0) => {
-    const docCount = (node.documents || []).length;
-    const isCurrent = node.id === browseNodeId;
-    const isDropTarget = dragOverNodeId === node.id;
-    const isLinkTarget = selectedNodeIds.has(node.id);
+  // Grid-view alternative to renderRow, for docViewMode === "grid" -- same
+  // thumbnail tile the main folder view and pop-out icon-grid window use
+  // (DocumentGridTile), wrapped so it keeps this dialog's own drag-to-link
+  // and already-linked-here behavior. selectMode is always on here (this
+  // dialog only ever picks documents to link, never opens/previews one).
+  const renderGridTile = (doc) => {
+    const linkedHere = alreadyLinkedHere.has(doc.id);
+    const selected = selectedIds.has(doc.id);
     return (
-      <div key={node.id}>
+      <div
+        key={doc.id}
+        draggable={!linkedHere}
+        onDragStart={(e) => {
+          e.dataTransfer.effectAllowed = "link";
+          e.dataTransfer.setData("text/plain", doc.id);
+          dragDocIdRef.current = doc.id;
+          setDragDocId(doc.id);
+        }}
+        onDragEnd={() => { dragDocIdRef.current = null; setDragDocId(null); }}
+        title={linkedHere
+          ? t("已在此处链接", "Already linked here")
+          : t("也可将此项拖到右侧的文件夹上以链接", "You can also drag this onto a folder on the right to link it there")}
+        className={linkedHere ? "opacity-50 pointer-events-none" : dragDocId === doc.id ? "opacity-40" : ""}
+      >
+        <DocumentGridTile
+          doc={doc}
+          selectMode
+          selected={selected || linkedHere}
+          onToggleSelect={() => toggleSelect(doc.id)}
+          badgeSize={thumbSize === "small" ? "small" : "large"}
+        />
+      </div>
+    );
+  };
+
+  // List/grid + thumbnail-size toggle, shown above the document list in
+  // both tabs -- same control shape as the main folder view's view toggle
+  // (docViewMode/gridThumbSize) and the pop-out icon-grid window's 3-tier
+  // size choice.
+  const renderViewToggle = () => (
+    <div className="flex items-center gap-1.5 shrink-0">
+      {docViewMode === "grid" && (
+        <div className="flex items-center border border-stone-300 rounded overflow-hidden shrink-0" title={t("缩略图大小", "Thumbnail size")}>
+          <button
+            onClick={() => setThumbSize("small")}
+            className={"px-1.5 py-1 text-[11px] " + (thumbSize === "small" ? "bg-stone-700 text-white" : "bg-white text-stone-600 hover:bg-stone-100")}
+          >{t("小图标", "Small")}</button>
+          <button
+            onClick={() => setThumbSize("large")}
+            className={"px-1.5 py-1 text-[11px] border-l border-stone-300 " + (thumbSize === "large" ? "bg-stone-700 text-white" : "bg-white text-stone-600 hover:bg-stone-100")}
+          >{t("大图标", "Large")}</button>
+          <button
+            onClick={() => setThumbSize("xlarge")}
+            className={"px-1.5 py-1 text-[11px] border-l border-stone-300 " + (thumbSize === "xlarge" ? "bg-stone-700 text-white" : "bg-white text-stone-600 hover:bg-stone-100")}
+          >{t("超大图标", "Extra Large")}</button>
+        </div>
+      )}
+      <div className="flex items-center border border-stone-300 rounded overflow-hidden shrink-0">
+        <button
+          onClick={() => setDocViewMode("list")}
+          title={t("列表视图", "List view")}
+          className={"px-1.5 py-1 flex items-center " + (docViewMode === "list" ? "bg-stone-700 text-white" : "bg-white text-stone-600 hover:bg-stone-100")}
+        >
+          <ListView size={13} />
+        </button>
+        <button
+          onClick={() => setDocViewMode("grid")}
+          title={t("图标视图（缩略图）", "Icon view (thumbnails)")}
+          className={"px-1.5 py-1 flex items-center border-l border-stone-300 " + (docViewMode === "grid" ? "bg-stone-700 text-white" : "bg-white text-stone-600 hover:bg-stone-100")}
+        >
+          <LayoutGrid size={13} />
+        </button>
+      </div>
+    </div>
+  );
+
+  const gridCols = thumbSize === "xlarge" ? 340 : thumbSize === "large" ? 200 : 110;
+
+  const navigateTo = (nodeId) => { setBrowseNodeId(nodeId); setSearchFolderFilter(nodeId); };
+
+  const handleDropOnNode = async (e, node) => {
+    e.preventDefault();
+    const docId = dragDocIdRef.current;
+    dragDocIdRef.current = null;
+    setDragOverNodeId(null);
+    setDragDocId(null);
+    if (!docId) return;
+    await onLink(docId, node.id);
+    setLinkFeedback(t(`已链接至 "${node.name}"`, `Linked to "${node.name}"`));
+    setTimeout(() => setLinkFeedback(""), 1800);
+  };
+
+  // Root-to-node chain of {id, name}, for the breadcrumb below.
+  const findAncestors = (root, nodeId) => {
+    const trail = [];
+    const walk = (n, acc) => {
+      const next = [...acc, { id: n.id, name: n.name }];
+      if (n.id === nodeId) { trail.push(...next); return true; }
+      for (const c of n.children || []) if (walk(c, next)) return true;
+      return false;
+    };
+    if (root) walk(root, []);
+    return trail;
+  };
+
+  // Drill-down folder browser -- one level at a time with an Up button and
+  // a clickable breadcrumb, the same navigation shape as "choose a folder"
+  // (FolderBrowserModal) uses for picking a spot on disk. Replaces the
+  // previous always-fully-expanded nested tree, which became unreadable on
+  // a project with many nested folders. Used as both the Search tab's
+  // drop-target rail and the Browse tab's folder pane -- a folder is still
+  // a drag-and-drop target and still checkable as a batch-link destination,
+  // now just one level of children at a time instead of the whole tree.
+  const renderFolderBrowser = () => {
+    if (!tree) return null;
+    const currentNode = (browseNodeId && findNode(tree, browseNodeId)) || tree;
+    const ancestors = findAncestors(tree, currentNode.id);
+    const parent = ancestors.length > 1 ? ancestors[ancestors.length - 2] : null;
+    const children = currentNode.children || [];
+    const currentDocCount = (currentNode.documents || []).length;
+
+    return (
+      <div className="flex flex-col h-full">
+        <div className="flex items-center gap-1 pb-1.5 mb-1.5 border-b border-stone-200 text-[12px] flex-wrap shrink-0">
+          <button
+            onClick={() => parent && navigateTo(parent.id)}
+            disabled={!parent}
+            title={t("上一级", "Up one level")}
+            className="px-1.5 py-0.5 rounded border border-stone-200 hover:bg-stone-50 disabled:opacity-30 disabled:cursor-not-allowed shrink-0"
+          >
+            ↑
+          </button>
+          <div className="flex items-center gap-0.5 flex-wrap min-w-0">
+            {ancestors.map((a, i) => (
+              <React.Fragment key={a.id}>
+                {i > 0 && <span className="text-stone-400">/</span>}
+                <button
+                  onClick={() => navigateTo(a.id)}
+                  className={`truncate max-w-[110px] px-1 rounded hover:bg-stone-100 ${
+                    i === ancestors.length - 1 ? "font-semibold text-stone-900" : "text-stone-600"
+                  }`}
+                  title={a.name}
+                >
+                  {a.name}
+                </button>
+              </React.Fragment>
+            ))}
+          </div>
+        </div>
+
+        {/* Current folder itself -- also selectable as a batch-link target */}
         <div
-          onClick={() => { setBrowseNodeId(node.id); setSearchFolderFilter(node.id); }}
-          // Unconditional preventDefault -- this tree only ever receives
-          // drags originating from renderRow in this same modal, so there's
-          // no real "is this a valid drop target" decision to make, and no
-          // reason to gate it on state that might not have caught up yet
-          // (see dragDocIdRef's comment above).
           onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "link"; }}
-          onDragEnter={(e) => { e.preventDefault(); setDragOverNodeId(node.id); }}
-          onDragLeave={() => setDragOverNodeId((cur) => (cur === node.id ? null : cur))}
-          onDrop={async (e) => {
-            e.preventDefault();
-            const docId = dragDocIdRef.current;
-            dragDocIdRef.current = null;
-            setDragOverNodeId(null);
-            setDragDocId(null);
-            if (!docId) return;
-            await onLink(docId, node.id);
-            setLinkFeedback(t(`已链接至 "${node.name}"`, `Linked to "${node.name}"`));
-            setTimeout(() => setLinkFeedback(""), 1800);
-          }}
-          className={`flex items-center gap-1.5 py-1 px-2 cursor-pointer text-sm border-l-2 transition-colors ${
-            isDropTarget
-              ? "bg-amber-100 border-amber-600 ring-1 ring-inset ring-amber-500"
-              : isLinkTarget
-                ? "bg-amber-50 border-amber-500 text-stone-900"
-                : isCurrent
-                  ? "bg-amber-50 border-amber-600 text-stone-900"
-                  : "border-transparent text-stone-700 hover:bg-stone-100"
+          onDragEnter={(e) => { e.preventDefault(); setDragOverNodeId(currentNode.id); }}
+          onDragLeave={() => setDragOverNodeId((cur) => (cur === currentNode.id ? null : cur))}
+          onDrop={(e) => handleDropOnNode(e, currentNode)}
+          className={`flex items-center gap-1.5 py-1.5 px-2 mb-1 rounded text-sm border shrink-0 transition-colors ${
+            dragOverNodeId === currentNode.id
+              ? "bg-amber-100 border-amber-500 ring-1 ring-inset ring-amber-500"
+              : selectedNodeIds.has(currentNode.id)
+                ? "bg-amber-50 border-amber-400"
+                : "border-stone-200 bg-stone-50"
           }`}
-          style={{ paddingLeft: `${depth * 12 + 8}px` }}
         >
           <input
             type="checkbox"
-            checked={isLinkTarget}
-            onClick={(e) => e.stopPropagation()}
-            onChange={() => toggleSelectNode(node.id)}
-            title={t("勾选以将此文件夹加入本次批量链接目标", "Check to include this folder as a batch-link target")}
+            checked={selectedNodeIds.has(currentNode.id)}
+            onChange={() => toggleSelectNode(currentNode.id)}
+            title={t("勾选以将当前文件夹加入本次批量链接目标", "Check to include the current folder as a batch-link target")}
             className="shrink-0"
           />
-          <Folder size={12} className="text-amber-700 shrink-0" />
-          <span className="truncate flex-1">{node.name}</span>
-          {docCount > 0 && (
-            <span className="text-[11px] tabular-nums px-1 bg-stone-200 rounded">{docCount}</span>
+          <Folder size={13} className="text-amber-700 shrink-0" />
+          <span className="truncate flex-1 font-medium">{currentNode.name}</span>
+          {currentDocCount > 0 && (
+            <span className="text-[11px] tabular-nums px-1 bg-stone-200 rounded">{currentDocCount}</span>
           )}
         </div>
-        {(node.children || []).map((c) => renderBrowseTree(c, depth + 1))}
+
+        {/* Subfolders -- click to descend */}
+        <div className="flex-1 overflow-auto">
+          {children.length === 0 ? (
+            <div className="text-[12px] text-stone-500 italic text-center py-4">{t("没有子文件夹", "No subfolders")}</div>
+          ) : (
+            children.map((child) => {
+              const docCount = (child.documents || []).length;
+              const isLinkTarget = selectedNodeIds.has(child.id);
+              const isDropTarget = dragOverNodeId === child.id;
+              return (
+                <div
+                  key={child.id}
+                  onClick={() => navigateTo(child.id)}
+                  onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "link"; }}
+                  onDragEnter={(e) => { e.preventDefault(); setDragOverNodeId(child.id); }}
+                  onDragLeave={() => setDragOverNodeId((cur) => (cur === child.id ? null : cur))}
+                  onDrop={(e) => handleDropOnNode(e, child)}
+                  className={`flex items-center gap-1.5 py-1 px-2 rounded cursor-pointer text-sm transition-colors ${
+                    isDropTarget
+                      ? "bg-amber-100 ring-1 ring-inset ring-amber-500"
+                      : isLinkTarget
+                        ? "bg-amber-50"
+                        : "hover:bg-stone-100"
+                  }`}
+                >
+                  <input
+                    type="checkbox"
+                    checked={isLinkTarget}
+                    onClick={(e) => e.stopPropagation()}
+                    onChange={() => toggleSelectNode(child.id)}
+                    title={t("勾选以将此文件夹加入本次批量链接目标", "Check to include this folder as a batch-link target")}
+                    className="shrink-0"
+                  />
+                  <Folder size={13} className="text-amber-700 shrink-0" />
+                  <span className="truncate flex-1">{child.name}</span>
+                  {docCount > 0 && (
+                    <span className="text-[11px] tabular-nums px-1 bg-stone-200 rounded">{docCount}</span>
+                  )}
+                  <ChevronRight size={12} className="text-stone-400 shrink-0" />
+                </div>
+              );
+            })
+          )}
+        </div>
       </div>
     );
   };
@@ -14634,21 +15381,24 @@ const LinkPicker = ({
           {tab === "search" && (
             <>
               <div className="flex-1 flex flex-col p-3 gap-2 overflow-hidden">
-                <div className="relative shrink-0">
-                  <Search
-                    size={14}
-                    className="absolute left-2.5 top-1/2 -translate-y-1/2 text-stone-600"
-                  />
-                  <input
-                    type="text"
-                    autoFocus
-                    value={q}
-                    onChange={(e) => setQ(e.target.value)}
-                    placeholder={t("按编号、文件名或元数据搜索…", "Search by number, filename, or metadata…")}
-                    className="w-full pl-8 pr-3 py-1.5 text-sm border border-stone-300 rounded focus:outline-none focus:border-amber-600"
-                  />
+                <div className="flex gap-1.5 shrink-0">
+                  <div className="flex-1 relative">
+                    <Search
+                      size={14}
+                      className="absolute left-2.5 top-1/2 -translate-y-1/2 text-stone-600"
+                    />
+                    <input
+                      type="text"
+                      autoFocus
+                      value={q}
+                      onChange={(e) => setQ(e.target.value)}
+                      placeholder={t("按编号、文件名或元数据搜索…", "Search by number, filename, or metadata…")}
+                      className="w-full pl-8 pr-3 py-1.5 text-sm border border-stone-300 rounded focus:outline-none focus:border-amber-600"
+                    />
+                  </div>
+                  <VoiceMicButton onFinalTranscript={(chunk) => setQ((prev) => appendWithSpace(prev, chunk))} />
                 </div>
-                <div className="flex items-center gap-2 text-[13px] text-stone-700 shrink-0">
+                <div className="flex items-center gap-2 text-[13px] text-stone-700 shrink-0 flex-wrap">
                   {searchFolderNode ? (
                     <span className="inline-flex items-center gap-1 pl-2 pr-1 py-0.5 bg-amber-100 border border-amber-300 rounded-full text-amber-800">
                       <Folder size={11} className="shrink-0" />
@@ -14667,8 +15417,9 @@ const LinkPicker = ({
                       ? t(`此文件夹中共 ${searchResults.length} 份文档`, `${searchResults.length} document(s) in this folder`)
                       : t(`文件库中共 ${searchResults.length} 份文档`, `${searchResults.length} documents in the library`)}
                   </span>
+                  <div className="ml-auto">{renderViewToggle()}</div>
                 </div>
-                <div className="flex-1 overflow-auto space-y-1.5">
+                <div className="flex-1 overflow-auto">
                   {searchResults.length === 0 && (
                     <div className="text-sm text-stone-700 italic text-center py-8">
                       {docIndex.length === 0
@@ -14678,7 +15429,13 @@ const LinkPicker = ({
                           : t("没有与搜索条件匹配的文档。", "No documents match your search.")}
                     </div>
                   )}
-                  {searchResults.map(renderRow)}
+                  {docViewMode === "grid" ? (
+                    <div className="grid gap-2" style={{ gridTemplateColumns: `repeat(auto-fill, minmax(${gridCols}px, 1fr))` }}>
+                      {searchResults.map(renderGridTile)}
+                    </div>
+                  ) : (
+                    <div className="space-y-1.5">{searchResults.map(renderRow)}</div>
+                  )}
                 </div>
               </div>
               {/* Drag handle — adjusts the rail's width, same narrow-bar-with-
@@ -14697,24 +15454,24 @@ const LinkPicker = ({
                   Clicking a folder's name also filters the doc list on the
                   left to that folder's contents (see searchFolderFilter). */}
               <div
-                className="shrink-0 overflow-auto p-2"
+                className="shrink-0 overflow-hidden p-2 flex flex-col"
                 style={{ width: searchRailWidth }}
               >
-                <div className="text-[11px] text-stone-600 uppercase tracking-wider mb-1.5 px-1">
-                  {t("点击文件夹以按其内容筛选；拖到此处以链接；勾选可批量链接到多个文件夹", "Click a folder to filter by its contents, drag a doc here to link, or check several folders to batch-link")}
+                <div className="text-[11px] text-stone-600 uppercase tracking-wider mb-1.5 px-1 shrink-0">
+                  {t("点击文件夹进入；拖到此处以链接；勾选可批量链接到多个文件夹", "Click a folder to open it, drag a doc here to link, or check several folders to batch-link")}
                 </div>
-                {tree && renderBrowseTree(tree)}
+                <div className="flex-1 min-h-0">{renderFolderBrowser()}</div>
               </div>
             </>
           )}
 
           {tab === "browse" && (
             <>
-              <div className="w-1/3 border-r border-stone-200 overflow-auto">
-                <div className="text-[11px] text-stone-600 uppercase tracking-wider mb-1.5 px-2 pt-2">
-                  {t("勾选多个文件夹以批量链接", "Check several folders to batch-link")}
+              <div className="w-1/3 border-r border-stone-200 overflow-hidden flex flex-col p-2">
+                <div className="text-[11px] text-stone-600 uppercase tracking-wider mb-1.5 px-1 shrink-0">
+                  {t("点击文件夹进入；勾选多个文件夹以批量链接", "Click a folder to open it; check several to batch-link")}
                 </div>
-                {tree && renderBrowseTree(tree)}
+                <div className="flex-1 min-h-0">{renderFolderBrowser()}</div>
               </div>
               <div className="flex-1 p-3 overflow-auto">
                 {browseNode && (
@@ -14722,17 +15479,24 @@ const LinkPicker = ({
                     <div className="text-[13px] font-mono text-stone-700 mb-2">
                       {getPathFor(browseNode.id)}
                     </div>
-                    <div className="text-sm uppercase tracking-wider text-stone-700 mb-2">
-                      {t("已附加文档", "Attached documents")}
+                    <div className="flex items-center justify-between mb-2 flex-wrap gap-2">
+                      <div className="text-sm uppercase tracking-wider text-stone-700">
+                        {t("已附加文档", "Attached documents")}
+                      </div>
+                      {renderViewToggle()}
                     </div>
-                    <div className="space-y-1.5">
-                      {browseDocs.length === 0 && (
-                        <div className="text-sm text-stone-700 italic">
-                          {t("此节点暂无附加文档。", "No documents attached to this node yet.")}
-                        </div>
-                      )}
-                      {browseDocs.map(renderRow)}
-                    </div>
+                    {browseDocs.length === 0 && (
+                      <div className="text-sm text-stone-700 italic">
+                        {t("此节点暂无附加文档。", "No documents attached to this node yet.")}
+                      </div>
+                    )}
+                    {docViewMode === "grid" ? (
+                      <div className="grid gap-2" style={{ gridTemplateColumns: `repeat(auto-fill, minmax(${gridCols}px, 1fr))` }}>
+                        {browseDocs.map(renderGridTile)}
+                      </div>
+                    ) : (
+                      <div className="space-y-1.5">{browseDocs.map(renderRow)}</div>
+                    )}
                   </>
                 )}
               </div>
@@ -14827,16 +15591,14 @@ const NodeDescriptionPanel = ({ node, derivedDocs = [], onSaveDescription, onSav
   const [typoError, setTypoError] = useState("");
   const [typoIssues, setTypoIssues] = useState(null);
 
-  // Voice-to-text dictation (Web Speech API)
-  const [voiceLang, setVoiceLang] = useState("zh-CN");
-  const [listening, setListening] = useState(false);
-  const [voiceInterim, setVoiceInterim] = useState("");
-  const [voiceError, setVoiceError] = useState("");
-  const recognitionRef = useRef(null);
-  const SpeechRecognitionCtor = typeof window !== "undefined"
-    ? (window.SpeechRecognition || window.webkitSpeechRecognition)
-    : null;
-  const voiceSupported = !!SpeechRecognitionCtor;
+  // Voice-to-text dictation -- shared implementation, see useVoiceDictation above.
+  const {
+    voiceLang, setVoiceLang, listening, voiceInterim, voiceError, voiceSupported,
+    toggleListening, resetVoiceUI,
+  } = useVoiceDictation((chunk) => {
+    setDescription((prev) => appendWithSpace(prev, chunk));
+    setDescSaved(false);
+  });
 
   // Upload-a-recording alternative to live mic dictation (.m4a/.mp3/.wav/...,
   // transcribed server-side via Gemini) -- see runTranscribeAudioFile below.
@@ -14857,11 +15619,10 @@ const NodeDescriptionPanel = ({ node, derivedDocs = [], onSaveDescription, onSav
     setPolishResult(null); setPolishError("");
     setTypoIssues(null); setTypoError("");
     setNewDocMsg(null); setPdfMsg(null);
-    setVoiceInterim(""); setVoiceError("");
     setTranscribing(false); setTranscribeError("");
     // Stop any dictation still running from the previously-selected folder
     // (also covers unmount, since this panel is remounted with key=node.id).
-    return () => { try { recognitionRef.current && recognitionRef.current.stop(); } catch {} };
+    return () => { resetVoiceUI(); };
   }, [node.id]);
 
   useEffect(() => {
@@ -14980,56 +15741,6 @@ const NodeDescriptionPanel = ({ node, derivedDocs = [], onSaveDescription, onSav
     } finally {
       setSavingPdf(false);
     }
-  };
-
-  const stopListening = () => {
-    try { recognitionRef.current && recognitionRef.current.stop(); } catch {}
-  };
-  const startListening = (lang) => {
-    if (!SpeechRecognitionCtor) return;
-    stopListening();
-    const recognition = new SpeechRecognitionCtor();
-    recognition.lang = lang;
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.onresult = (event) => {
-      let finalChunk = "";
-      let interim = "";
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const result = event.results[i];
-        if (result.isFinal) finalChunk += result[0].transcript;
-        else interim += result[0].transcript;
-      }
-      if (finalChunk) {
-        setDescription((prev) => {
-          const needsSpace = prev && !/[\s\n]$/.test(prev);
-          return prev + (needsSpace ? " " : "") + finalChunk.trim();
-        });
-        setDescSaved(false);
-      }
-      setVoiceInterim(interim);
-    };
-    recognition.onerror = (event) => {
-      setVoiceError(
-        event.error === "not-allowed" ? t("麦克风权限被拒绝，请在浏览器设置中允许访问麦克风", "Microphone access denied — please allow microphone access in your browser settings")
-        : event.error === "no-speech" ? t("未检测到语音，请再试一次", "No speech detected, please try again")
-        : t(`语音识别出错：${event.error}`, `Speech recognition error: ${event.error}`)
-      );
-      setListening(false);
-      setVoiceInterim("");
-    };
-    recognition.onend = () => {
-      setListening(false);
-      setVoiceInterim("");
-    };
-    recognitionRef.current = recognition;
-    setVoiceError("");
-    setListening(true);
-    recognition.start();
-  };
-  const toggleListening = () => {
-    if (listening) stopListening();
-    else startListening(voiceLang);
   };
 
   // Upload-a-recording alternative to the mic: pick a file, send it to
@@ -15426,7 +16137,8 @@ function DMS({ storagePath, onChangeFolder }) {
       if (data.ok) {
         setDmsImportDialog(null);
         try {
-          ["dms:databook-selection", "dms:databook-title", "dms:databook-subtitle"].forEach((k) => localStorage.removeItem(k));
+          ["dms:databook-selection", "dms:databook-title", "dms:databook-subtitle",
+           "dms:databook-docx-nodeId", "dms:databook-docx-title", "dms:databook-docx-subtitle"].forEach((k) => localStorage.removeItem(k));
         } catch {}
         window.location.reload();
       } else {
@@ -15454,6 +16166,7 @@ function DMS({ storagePath, onChangeFolder }) {
   const [viewerDoc, setViewerDoc] = useState(null);
   const [loading, setLoading] = useState(true);
   const [editingNode, setEditingNode] = useState(false);
+  const nodeNameInputRef = useRef(null); // uncontrolled (defaultValue) node-name input, see the voice mic button beside it
   const [loginPwDrafts, setLoginPwDrafts] = useState({}); // loginId -> password being typed, never persisted to tree state
   const [credCopied, setCredCopied] = useState(null);     // { loginId, type: "account" | "password" } | null — transient copy feedback
   useEffect(() => { setLoginPwDrafts({}); setEditingNode(false); }, [selectedId]);
@@ -18148,6 +18861,9 @@ function DMS({ storagePath, onChangeFolder }) {
                     "dms:databook-selection",
                     "dms:databook-title",
                     "dms:databook-subtitle",
+                    "dms:databook-docx-nodeId",
+                    "dms:databook-docx-title",
+                    "dms:databook-docx-subtitle",
                   ].forEach((k) => localStorage.removeItem(k));
                 } catch {}
                 // Reliable refresh: reload the page so all React state restarts
@@ -18488,39 +19204,50 @@ function DMS({ storagePath, onChangeFolder }) {
               <div className="border-b border-stone-300 pb-4 mb-5">
                 {editingNode ? (
                   <div className="space-y-2 bg-amber-50/60 border border-amber-200 rounded-lg p-3 -mx-3">
-                    <input
-                      autoFocus
-                      type="text"
-                      defaultValue={selectedNode.name}
-                      onBlur={(e) => {
-                        const nextName = e.target.value.trim();
-                        if (nextName && nextName !== selectedNode.name) {
-                          handleCommitRename(selectedNode.id, nextName);
-                        } else {
-                          e.target.value = selectedNode.name;
+                    <div className="flex gap-1.5">
+                      <input
+                        ref={nodeNameInputRef}
+                        autoFocus
+                        type="text"
+                        defaultValue={selectedNode.name}
+                        onBlur={(e) => {
+                          const nextName = e.target.value.trim();
+                          if (nextName && nextName !== selectedNode.name) {
+                            handleCommitRename(selectedNode.id, nextName);
+                          } else {
+                            e.target.value = selectedNode.name;
+                          }
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") e.currentTarget.blur();
+                          if (e.key === "Escape") {
+                            e.currentTarget.value = selectedNode.name;
+                            e.currentTarget.blur();
+                          }
+                        }}
+                        placeholder={t("节点名称", "Node name")}
+                        className="flex-1 min-w-0 text-2xl font-semibold border border-stone-300 rounded px-2 py-1"
+                      />
+                      <VoiceMicButton onFinalTranscript={(chunk) => {
+                        if (nodeNameInputRef.current) {
+                          nodeNameInputRef.current.value = appendWithSpace(nodeNameInputRef.current.value, chunk);
                         }
-                      }}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") e.currentTarget.blur();
-                        if (e.key === "Escape") {
-                          e.currentTarget.value = selectedNode.name;
-                          e.currentTarget.blur();
-                        }
-                      }}
-                      placeholder={t("节点名称", "Node name")}
-                      className="w-full text-2xl font-semibold border border-stone-300 rounded px-2 py-1"
-                    />
+                      }} />
+                    </div>
                     <div>
                       <label className="text-[12px] uppercase tracking-wider text-stone-700 block mb-0.5">
                         {t("序列号（SN）", "Serial number (SN)")}
                       </label>
-                      <input
-                        type="text"
-                        value={selectedNode.sn || ""}
-                        onChange={(e) => updateNodeMeta({ sn: e.target.value })}
-                        placeholder={t("例如：SN-2026-04-001（可选）", "e.g. SN-2026-04-001 (optional)")}
-                        className="w-full text-base border border-stone-300 rounded px-2 py-1 font-mono"
-                      />
+                      <div className="flex gap-1.5">
+                        <input
+                          type="text"
+                          value={selectedNode.sn || ""}
+                          onChange={(e) => updateNodeMeta({ sn: e.target.value })}
+                          placeholder={t("例如：SN-2026-04-001（可选）", "e.g. SN-2026-04-001 (optional)")}
+                          className="flex-1 min-w-0 text-base border border-stone-300 rounded px-2 py-1 font-mono"
+                        />
+                        <VoiceMicButton onFinalTranscript={(chunk) => updateNodeMeta({ sn: appendWithSpace(selectedNode.sn || "", chunk) })} />
+                      </div>
                     </div>
                     <div className="pt-2 mt-1 border-t border-amber-200/70 space-y-3">
                       <label className="text-[12px] uppercase tracking-wider text-stone-700 block mb-0.5">
@@ -18529,21 +19256,27 @@ function DMS({ storagePath, onChangeFolder }) {
                       {getNodeLogins(selectedNode).map((login, i) => (
                         <div key={login.id} className={`flex gap-2 items-start ${i > 0 ? "pt-2 border-t border-stone-100" : ""}`}>
                           <div className="flex-1 min-w-0 space-y-2">
-                            <input
-                              type="text"
-                              value={login.websiteUrl || ""}
-                              onChange={(e) => updateNodeLogin(login.id, { websiteUrl: e.target.value })}
-                              placeholder={t("网站链接，例如：https://example.com/login", "Website link, e.g. https://example.com/login")}
-                              className="w-full text-base border border-stone-300 rounded px-2 py-1"
-                            />
-                            <input
-                              type="text"
-                              value={login.accountName || ""}
-                              onChange={(e) => updateNodeLogin(login.id, { accountName: e.target.value })}
-                              placeholder={t("账号 / 用户名", "Account / username")}
-                              className="w-full text-base border border-stone-300 rounded px-2 py-1"
-                              autoComplete="off"
-                            />
+                            <div className="flex gap-1.5">
+                              <input
+                                type="text"
+                                value={login.websiteUrl || ""}
+                                onChange={(e) => updateNodeLogin(login.id, { websiteUrl: e.target.value })}
+                                placeholder={t("网站链接，例如：https://example.com/login", "Website link, e.g. https://example.com/login")}
+                                className="flex-1 min-w-0 text-base border border-stone-300 rounded px-2 py-1"
+                              />
+                              <VoiceMicButton onFinalTranscript={(chunk) => updateNodeLogin(login.id, { websiteUrl: appendWithSpace(login.websiteUrl || "", chunk) })} />
+                            </div>
+                            <div className="flex gap-1.5">
+                              <input
+                                type="text"
+                                value={login.accountName || ""}
+                                onChange={(e) => updateNodeLogin(login.id, { accountName: e.target.value })}
+                                placeholder={t("账号 / 用户名", "Account / username")}
+                                className="flex-1 min-w-0 text-base border border-stone-300 rounded px-2 py-1"
+                                autoComplete="off"
+                              />
+                              <VoiceMicButton onFinalTranscript={(chunk) => updateNodeLogin(login.id, { accountName: appendWithSpace(login.accountName || "", chunk) })} />
+                            </div>
                             <div className="flex gap-2 items-center">
                               <input
                                 type="password"
@@ -19587,13 +20320,16 @@ function DMS({ storagePath, onChangeFolder }) {
             </label>
             <label className="flex flex-col gap-1 text-sm text-stone-700 border border-stone-200 rounded px-3 py-2 bg-stone-50">
               {t("在文件名中添加文字（可选）", "Add text to filenames (optional)")}
-              <input
-                type="text"
-                value={folderUploadExtraText}
-                onChange={(e) => setFolderUploadExtraText(e.target.value)}
-                placeholder={t("留空则不添加", "Leave blank to add nothing")}
-                className="text-sm px-2 py-1 border border-stone-300 rounded focus:outline-none focus:border-amber-500"
-              />
+              <div className="flex gap-1.5">
+                <input
+                  type="text"
+                  value={folderUploadExtraText}
+                  onChange={(e) => setFolderUploadExtraText(e.target.value)}
+                  placeholder={t("留空则不添加", "Leave blank to add nothing")}
+                  className="flex-1 min-w-0 text-sm px-2 py-1 border border-stone-300 rounded focus:outline-none focus:border-amber-500"
+                />
+                <VoiceMicButton onFinalTranscript={(chunk) => setFolderUploadExtraText((prev) => appendWithSpace(prev, chunk))} />
+              </div>
               <span className="text-[12px] text-stone-600">
                 {t("有日期时添加在日期之后，例如 2026-09-17-文字-原文件名；没有日期时添加在文件名最前面。", "Placed right after the date when there is one (e.g. 2026-09-17-text-original name), or at the very front of the name when there isn't.")}
               </span>
@@ -19628,6 +20364,7 @@ function DMS({ storagePath, onChangeFolder }) {
                   placeholder={t("例如：/Users/你/Downloads", "e.g. /Users/you/Downloads")}
                   className="flex-1 min-w-0 text-sm px-2 py-1.5 border border-stone-300 rounded font-mono"
                 />
+                <VoiceMicButton onFinalTranscript={(chunk) => setDownloadDialog((d) => ({ ...d, path: appendWithSpace(d.path, chunk) }))} />
                 <button
                   type="button"
                   onClick={() => setDownloadFolderBrowserOpen(true)}
@@ -19720,13 +20457,16 @@ function DMS({ storagePath, onChangeFolder }) {
                 </label>
                 <label className="text-sm text-stone-700">
                   {t("或输入一个不在列表中的参数名", "Or type a parameter name not in the list above")}
-                  <input
-                    type="text"
-                    value={aiFillDialog.customKey}
-                    onChange={(e) => setAiFillDialog((d) => ({ ...d, customKey: e.target.value }))}
-                    placeholder={t("例如：额定电压", "e.g. Rated Voltage")}
-                    className="mt-1 w-full text-sm px-2 py-1.5 border border-stone-300 rounded"
-                  />
+                  <div className="mt-1 flex gap-1.5">
+                    <input
+                      type="text"
+                      value={aiFillDialog.customKey}
+                      onChange={(e) => setAiFillDialog((d) => ({ ...d, customKey: e.target.value }))}
+                      placeholder={t("例如：额定电压", "e.g. Rated Voltage")}
+                      className="flex-1 min-w-0 text-sm px-2 py-1.5 border border-stone-300 rounded"
+                    />
+                    <VoiceMicButton onFinalTranscript={(chunk) => setAiFillDialog((d) => ({ ...d, customKey: appendWithSpace(d.customKey, chunk) }))} />
+                  </div>
                 </label>
                 <p className="text-[13px] text-stone-500">
                   {t("AI 会逐份读取所选文档的页面图像来查找该参数的值（无需与文档中的文字完全一致），结果会先给你确认，再写入「实测值」。",
@@ -20238,14 +20978,17 @@ function DMS({ storagePath, onChangeFolder }) {
                 />
                 <div className="flex-1 min-w-0">
                   <div className="text-sm font-medium text-stone-800 mb-1">{t("自定义路径", "Custom path")}</div>
-                  <input
-                    type="text"
-                    placeholder={isMacDMS ? "/Users/yourname/DMS_Imported" : "C:\\DMS_Imported"}
-                    value={dmsImportDialog.customPath}
-                    onClick={() => setDmsImportDialog({ ...dmsImportDialog, chosenPathMode: "custom" })}
-                    onChange={(e) => setDmsImportDialog({ ...dmsImportDialog, chosenPathMode: "custom", customPath: e.target.value })}
-                    className="w-full px-2 py-1 text-sm border border-stone-300 rounded font-mono focus:outline-none focus:border-amber-500"
-                  />
+                  <div className="flex gap-1.5">
+                    <input
+                      type="text"
+                      placeholder={isMacDMS ? "/Users/yourname/DMS_Imported" : "C:\\DMS_Imported"}
+                      value={dmsImportDialog.customPath}
+                      onClick={() => setDmsImportDialog({ ...dmsImportDialog, chosenPathMode: "custom" })}
+                      onChange={(e) => setDmsImportDialog({ ...dmsImportDialog, chosenPathMode: "custom", customPath: e.target.value })}
+                      className="flex-1 min-w-0 px-2 py-1 text-sm border border-stone-300 rounded font-mono focus:outline-none focus:border-amber-500"
+                    />
+                    <VoiceMicButton onFinalTranscript={(chunk) => setDmsImportDialog({ ...dmsImportDialog, chosenPathMode: "custom", customPath: appendWithSpace(dmsImportDialog.customPath, chunk) })} />
+                  </div>
                 </div>
               </label>
             </div>
