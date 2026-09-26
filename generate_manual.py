@@ -639,6 +639,12 @@ bullet("All metadata fields (parameter name / value).")
 bullet("GPS-derived location (if available).")
 bullet("Which folders reference this document.")
 note("Search is case-insensitive and partial-match - typing \u201cpump\u201d will find \u201cPump Assembly,\u201d \u201ccentrifugal pump,\u201d and so on.")
+para("When you type more than one word, the \u201cMulti-word match\u201d control next to the search box decides how they combine:")
+bullet("All words (AND) - the default. A document must contain every word you typed (in any order) to match.")
+bullet("Any word (OR) - a document matches if it contains at least one of the words.")
+bullet("Whole sentence - the entire contents of the search box is matched verbatim, as one exact phrase, instead of being split into separate words.")
+figure("38_search_match_modes.png", "Figure 7-1a  The Multi-word match control: All words (AND) / Any word (OR) / Whole sentence")
+tip("Switch to \u201cAny word (OR)\u201d when you're not sure which of several related terms a document uses (e.g. \u201cinvoice receipt bill\u201d); switch to \u201cWhole sentence\u201d when you want to find one specific phrase and AND/OR are turning up too many unrelated partial matches.")
 
 h2("7.2  Using Filters")
 add_table(
