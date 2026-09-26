@@ -89,6 +89,19 @@ def note(text):
     shd.set(qn('w:fill'), 'FFF8E1')
     pPr.append(shd)
 
+def codeblock(text):
+    p = doc.add_paragraph()
+    p.paragraph_format.left_indent = Inches(0.4)
+    run = p.add_run(text)
+    run.font.name = 'Courier New'
+    run.font.size = Pt(9)
+    pPr = p._p.get_or_add_pPr()
+    shd = OxmlElement('w:shd')
+    shd.set(qn('w:val'), 'clear')
+    shd.set(qn('w:color'), 'auto')
+    shd.set(qn('w:fill'), 'F3F4F6')
+    pPr.append(shd)
+
 def add_table(headers, rows, col_widths=None):
     t = doc.add_table(rows=1 + len(rows), cols=len(headers))
     t.style = 'Table Grid'
@@ -463,9 +476,16 @@ tip("For photos, DMS automatically reads the capture date and GPS location from 
 
 h2("4.2  Uploading a Folder")
 numbered("Select the destination folder in the tree.")
-numbered("Click Upload Folder.")
-numbered("Choose a folder on your computer in the dialog that appears.")
-numbered("DMS uploads every file recursively, creating matching sub-folders in the tree.")
+numbered("Click Upload Folder - this opens the Upload Multiple Folders dialog.")
+numbered("Click + Add Folder and pick a folder on your computer; repeat to queue up several folders at once, each listed above with an × to remove it.")
+numbered("Choose one of three upload modes:")
+bullet("Sort into year/month folders (default) - every file in each picked folder (including its subfolders) is routed by capture/archive date into “year/month” folders, created automatically if they don't exist yet. The original subfolder structure is not kept.")
+bullet("Upload files and subfolders as the sources - subfolders inside each picked folder are recreated here exactly as they are, with no date-based year/month folders. Good for material that's already organized the way you want to keep it.")
+bullet("Recreate the picked folder under the current folder - unlike the other two modes, the picked folder itself also becomes a new subfolder here (not just its contents); every subfolder under it is rebuilt as-is, files land in their matching folders, and matching directories are created on the local drive too.")
+numbered("Optionally type something into Add text to filenames (optional) - it's inserted right after the date when there is one (e.g. 2026-09-17-text-original name), or at the very front of the filename when there isn't. The mic button next to it accepts voice dictation too. Leave it blank to add nothing.")
+figure("43_upload_folder_modes.png", "Figure 4-2  The Upload Multiple Folders dialog: the three upload modes and the filename text field")
+numbered("Click Upload in the bottom-right corner to finish.")
+tip("Mix and match across batches as needed: archive a whole phone-camera-roll folder with Sort into year/month, while a drawing folder that's already organized by project uses Upload as the sources or Recreate the picked folder to keep its structure intact.")
 
 h2("4.3  Pasting Screenshots")
 para("You don't need to save a file first - a screenshot you just took, or an image copied from elsewhere, can be pasted straight into the current folder.")
@@ -492,9 +512,9 @@ bullet("Text files are shown in a readable monospace view.")
 bullet("Office files (Word, Excel, PowerPoint) offer a Download button to open in your local Office app.")
 numbered("The viewer's toolbar has buttons for Add Description, View Map Location, Extract Text (OCR), Extract Key Parameters, Scan Barcode (section 4.8), Ask AI (section 4.9, requires an API key - section 6.4), Download, Pop Out, and Close.")
 numbered("Click Close or press Escape to close the viewer.")
-figure("05_doc_viewer_pdf.png", "Figure 4-1  The PDF document viewer")
-figure("06_doc_viewer_image.png", "Figure 4-2  The image document viewer")
-figure("28_doc_viewer_popout.png", "Figure 4-3  The viewer's top toolbar: extract key parameters, scan barcode, ask AI, pop out, and more")
+figure("05_doc_viewer_pdf.png", "Figure 4-3  The PDF document viewer")
+figure("06_doc_viewer_image.png", "Figure 4-4  The image document viewer")
+figure("28_doc_viewer_popout.png", "Figure 4-5  The viewer's top toolbar: extract key parameters, scan barcode, ask AI, pop out, and more")
 tip("A document you've opened stays highlighted in its folder's list, so when you come back you can immediately spot which one you were just looking at, without hunting for it again.")
 
 h2("4.6  Downloading, Sending, and Deleting Documents")
@@ -524,7 +544,7 @@ numbered("Open the viewer for that image (or a PDF containing one).")
 numbered("Click Scan Barcode at the top.")
 numbered("On success, a banner shows the code type and value detected (e.g. \u201cCODE128: 6901234567892\u201d).")
 numbered("The result is saved automatically as the document's \u201cBarcode\u201d parameter, viewable/editable in the metadata section below; if a photo has more than one barcode, they're saved in turn as Barcode, Barcode2, Barcode3, and so on.")
-figure("24_scan_barcode.png", "Figure 4-4  Scan Barcode: the success banner after a successful read")
+figure("24_scan_barcode.png", "Figure 4-6  Scan Barcode: the success banner after a successful read")
 tip("The capture date and GPS location need no extra effort - DMS already pulls those from a photo's EXIF data on upload (see section 4.1); \u201cScan Barcode\u201d just adds the code's own content. Put together, a single photo can record when, where, and what code all at once.")
 note("This runs entirely offline (built on the open-source zbar library), sends nothing anywhere, and needs no AI key - but it does need a reasonably clean image: the code should be sharp, unobstructed, and have a clear quiet zone (blank margin) around it. QR codes shared as phone screenshots - especially ones with a logo overlaid in the middle, or a background that runs right up to the code's edge, like a WeChat \u201cscan to join group\u201d image - usually can't be read this way; typically only WeChat's own scanner or a phone camera can. That's a known limitation of the underlying library, not a bug.")
 
@@ -534,7 +554,7 @@ numbered("Open the document viewer and click Ask AI at the top.")
 numbered("A panel opens on the right; the AI answers based on whatever text (OCR), description, and key parameters have already been extracted for this document.")
 numbered("Type your question in the box (or click the microphone icon to dictate it), then click Send, or press Ctrl/Cmd+Enter.")
 numbered("The answer appears below, and the question and answer are both appended to a running Q&A record document kept in the same folder, so you can look back at it later.")
-figure("30_doc_ask_ai.png", "Figure 4-5  Asking AI about a single document (needs a Gemini or DeepSeek API key - section 6.4)")
+figure("30_doc_ask_ai.png", "Figure 4-7  Asking AI about a single document (needs a Gemini or DeepSeek API key - section 6.4)")
 para("The description panel's AI Cleanup button works the same way for a single document's description: choose \u201cOrganize / Polish wording / Make concise,\u201d and the AI tidies up rough or dictated text while keeping all the information; the result previews first, and only replaces your text once you click Apply.")
 
 h2("4.10  Convert to PDF (Batch)")
@@ -543,7 +563,7 @@ numbered("Check the images and/or PDFs you want to convert in the folder (use Mu
 numbered("Click Convert to PDF; the dialog lists the checked documents and their sizes.")
 numbered("Click Convert N document(s) to PDF.")
 numbered("Each document is converted into its own separate PDF (named with a \u201cYYYY-MM-DD-\u201d prefix whenever a date is known); the originals are moved to \u201cDeleted files\u201d (a soft delete - recoverable, see section 3.2).")
-figure("33_convert_to_pdf.png", "Figure 4-6  The Convert to PDF dialog, with one document selected")
+figure("33_convert_to_pdf.png", "Figure 4-8  The Convert to PDF dialog, with one document selected")
 
 h2("4.11  On-Disk Filenames and Recovering Deletions")
 para("These are lower-level improvements that need no action from you, but are useful to know about when browsing files in your system's file manager or troubleshooting:")
@@ -553,11 +573,11 @@ bullet("Before any change to a project's folder structure (adding/removing folde
 
 h2("4.12  Batch Document Actions (Multi-select: Download, Batch Rename, Find Near-Duplicates)")
 para("The document list has a row of batch-action buttons above it that work on every document in the current folder, without needing to pop out the grid-view window first (Section 19 covers the pop-out window's own batch actions - the two can be used together):")
-figure("40_multiselect_toolbar.png", "Figure 4-7  Document list toolbar: Select, AI-fill parameter, Batch rename, Find near-duplicates")
+figure("40_multiselect_toolbar.png", "Figure 4-9  Document list toolbar: Select, AI-fill parameter, Batch rename, Find near-duplicates")
 bullet("Select - check one or more documents, then either Download them to a folder (defaults to your Downloads folder) or Unlink them from the current folder (the documents themselves are soft-deleted - see section 3.2).")
 bullet("AI-fill parameter - multi-select documents and have AI read one parameter's value off each and fill it in for all of them at once; see section 6.6 for the full flow.")
 bullet("Batch rename - renames every document in the current folder to “date + location - original name” (the date comes from the document's own capture/archive date, and documents where no date can be resolved are skipped; the location comes from the document's location metadata and is omitted if there isn't one). The actual file on disk is renamed too. Clicking it shows a preview first; nothing changes until you confirm.")
-figure("42_batch_rename_preview.png", "Figure 4-8  Batch rename preview: nothing is renamed until you confirm")
+figure("42_batch_rename_preview.png", "Figure 4-10  Batch rename preview: nothing is renamed until you confirm")
 bullet("Find near-duplicates - check a few photos (or click Select all photos to grab every photo in the folder), then drag the Similarity threshold slider (50%-100%); DMS compares the selected photos pairwise and flags ones that look highly similar to each other (e.g. several near-identical burst-mode shots), making it easy to spot redundant photos to clean up. This is a “looks similar” fuzzy match, a different mechanism from section 4.7's exact filename-and-size match at upload time.")
 page_break()
 
@@ -629,11 +649,21 @@ figure("18_key_parameters.png", "Figure 6-1  The Global Key Parameters dialog")
 h2("6.4  Configuring an AI Provider (Gemini / DeepSeek)")
 para("AI-assisted key-parameter extraction, Ask AI (both for documents and folders), and the description panel's AI Cleanup and typo-check all share the same API-key setup - configure either provider, or both:")
 numbered("Click any \u201cConfigure AI (Gemini)\u201d link wherever it appears (the description panel, an Ask AI panel, the key-parameters panel, and so on all lead to the same dialog) to open the AI Provider Settings dialog.")
-numbered("Paste your own Google Gemini or DeepSeek API key and click the matching Save button.")
+para("If you don't have an API key yet, a \u201cDon't have an API key?\u201d link sits right below each provider's input field in that dialog and jumps straight to its free sign-up page in a new browser tab:")
+add_table(
+    ["Provider", "Free sign-up URL", "Steps"],
+    [
+        ["Google Gemini", "aistudio.google.com/apikey", "Sign in with a Google account (free to create one if you don't have one) \u2192 click \u201cCreate API key\u201d \u2192 choose a new project or an existing Google Cloud project \u2192 copy the generated key (a string starting with \u201cAIza\u201d)."],
+        ["DeepSeek", "platform.deepseek.com/api_keys", "Sign up / log in to the DeepSeek platform \u2192 on the \u201cAPI Keys\u201d page, click to create a new key \u2192 copy the generated key."],
+    ],
+    col_widths=[1.3, 2.2, 2.5]
+)
+numbered("Back in DMS's AI Provider Settings dialog, paste the copied key into the matching provider's field and click its Save button.")
 numbered("The two providers' keys are stored completely independently; with both configured, each AI feature generally prefers Gemini and falls back to DeepSeek automatically when Gemini isn't available.")
 figure("32_ai_provider_settings.png", "Figure 6-2  AI Provider Settings: Gemini and DeepSeek configured separately")
 note("These AI features are opt-in and need an internet connection; with no key configured at all, every core DMS feature (folder management, uploads, OCR, barcode scanning, search, and so on) still runs fully offline and is unaffected. Keys are stored only on this machine (a local server-side file) and are never uploaded to any DMS-related or third-party server.")
-tip("Next to \u201cDetailed Gemini setup steps (including how to get a free/paid key)\u201d in the dialog is a Download setup guide (.docx) link, with screenshots showing how to sign up for a Google account and request a free Gemini API key - handy if you've never gotten one before.")
+tip("Both providers offer a free tier - no credit card needed for occasional use. Free tiers are rate-limited (a cap on calls per minute/day); if you process a lot of documents in a short burst and see a \u201ctemporarily over the limit\u201d message, just wait a bit and retry.")
+tip("Next to \u201cDetailed Gemini setup steps (including how to get a free/paid key)\u201d in the dialog is a Download setup guide (.docx) link, with screenshots showing how to sign up for a Google account, request a free Gemini API key, and later upgrade to a paid tier if you need higher limits - handy if you've never gotten one before.")
 
 h2("6.5  Parameter Trend Charts and Snapshots")
 para("Chart how a key parameter's value changes over time - useful for blood pressure, account balances, inventory levels, or any reading that needs to be logged repeatedly and reviewed for trends.")
@@ -816,16 +846,35 @@ h2("12.6  CSV Export")
 para("Click Project, then Export Metadata (CSV) to download a spreadsheet with one row per document, including document ID, name, size, upload date, and metadata fields. Open it in Excel or Google Sheets for analysis or sharing.")
 
 h2("12.7  Batch ZIP Import")
-para("Upload many files at once from a ZIP archive and have DMS automatically sort them into matching folders by filename prefix. Folders referenced by a filename must already exist in the tree; documents with an unrecognized folder name are left unlinked.")
+para("Upload a large batch of files at once using a naming convention, and have DMS automatically sort each one into its matching folder.")
+numbered("Prepare a ZIP file, naming each file inside it like this: FolderName#description.pdf (e.g. Home Insurance#2026 Policy.pdf) - the part before the # is the destination folder name, and everything after the # is the rest of the filename, which can be anything you like.")
+numbered("Click Project, then Import Documents from ZIP, and choose your ZIP file.")
+numbered("DMS reads every filename, matches the part before the # against folder names in the tree, and places each document into the matching folder.")
+note("Folders referenced by a filename must already exist in the tree before importing (unlike Hierarchy Import in section 12.8, this does not create new folders). Documents whose folder name doesn't match anything are left unlinked.")
+note("If the same folder name occurs more than once in the tree (e.g. a “Bolt” sub-part under both “Rotor Assembly” and “Housing Assembly”), matching by bare name lands on whichever one comes first, which may not be the one you meant. In that case, use a “/”-separated path before the # instead of a bare name - starting from the root or from any ancestor folder that makes the path unique - e.g. Rotor Assembly/Bolt#List.pdf to land specifically on the “Bolt” folder under “Rotor Assembly” rather than the identically-named one under “Housing Assembly.”")
 
 h2("12.8  Hierarchy Import (with auto de-duplication)")
-para("Builds a folder tree quickly from a plain text file.")
-numbered("Prepare a text file with 2-3 comma-separated columns per line: folder name, parent folder name, description (optional). The first line is the root folder, with the parent-folder column omitted for it.")
+para("Builds a folder tree quickly from a plain text/CSV file - handy for turning a bill of materials or org-chart export from another system straight into a matching folder structure.")
+numbered("Prepare a text file with 2-3 comma-separated columns per line:")
+add_table(
+    ["Column", "Meaning", "Notes"],
+    [
+        ["Column 1", "Folder name", "Required. The folder this row creates."],
+        ["Column 2", "Parent folder name", "Which already-listed folder this one nests under; leave blank for the root. The file's very first row is the root folder itself, so its own parent column must be blank (or omitted)."],
+        ["Column 3", "Description (optional)", "Can be left out of the file entirely. When present, it becomes that folder's initial description text."],
+    ],
+    col_widths=[1.0, 1.8, 3.7]
+)
+para("Example:")
+codeblock("Top Assembly\nPump Housing,Top Assembly\nRotor Assembly,Top Assembly\nImpeller,Rotor Assembly\nShaft,Rotor Assembly")
+note("Level-heading rows exported by BOM tools (lines that just say something like “Level 1”) are skipped automatically - no need to delete them by hand. If the first row is a column-title row (“folder name, parent folder name, description,” in whatever wording), DMS detects that structurally from how the rows reference each other and ignores it automatically too, without you needing to delete it.")
 numbered("Click Project, then Create Folder Tree from Hierarchy, and upload (or paste) the text.")
-numbered("DMS validates the structure and shows a preview, including any errors.")
+numbered("Click Validate. If the same folder name repeats anywhere in the file, this is flagged as an error by default, listing the conflicting lines.")
 figure("12_hierarchy_import_empty.png", "Figure 12-1  The hierarchy import dialog (initial state)")
 figure("14_hierarchy_import_error.png", "Figure 12-2  With auto-numbering off, a duplicate folder name is flagged as an error")
+numbered("If your data genuinely has same-named folders on purpose (e.g. a “Bolt” sub-part repeated under several assemblies), check Auto-number duplicate folder names (01, 02, 03...) and re-validate - every repeated name is automatically numbered in turn (“Bolt 01,” “Bolt 02,” ...) and the whole file now passes validation instead of erroring.")
 figure("15_hierarchy_import_dedupe_ok.png", "Figure 12-3  With auto-numbering on, the duplicate name is numbered and passes validation")
+numbered("Once validation passes, a tree preview and the number of nodes to be created are shown.")
 numbered("Click Create; all folders appear in the tree immediately.")
 
 h2("12.9  Downloading This Manual from Inside the App")
