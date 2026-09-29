@@ -29,6 +29,21 @@ Babel.registerPreset('react-classic', {
 <script type="text/babel" data-presets="react-classic">
 const { useState, useEffect, useCallback, useMemo, useRef } = React;
 
+// macOS Chrome/Chromium doesn't reliably report DragEvent.altKey during a
+// native HTML5 drag -- it flickers/lags relative to the real key state, so
+// pressing Option mid-drag (the normal way to invoke it) is unreliable on
+// Mac even though the same drag/drop code works on Windows. Track the key
+// independently via keydown/keyup instead. Deliberately NOT reset on
+// "blur": macOS actually fires a window blur partway through a native drag
+// (the OS briefly hands key-window status to the drag session itself), and
+// that is not the user releasing Option -- treating it as a release broke
+// the very feature this is meant to fix. A stale `true` left over from a
+// genuine alt-tab-away is harmless since this is only ever read while a
+// drag is actually in progress.
+const dragAltKeyState = { current: false };
+window.addEventListener("keydown", (e) => { if (e.key === "Alt") dragAltKeyState.current = true; });
+window.addEventListener("keyup", (e) => { if (e.key === "Alt") dragAltKeyState.current = false; });
+
 /* =============================================================================
  * LANGUAGE (zh / en) — app-wide toggle, persisted in localStorage.
  * t(zh, en) returns whichever string matches the active language; call sites
@@ -1033,6 +1048,23 @@ const StorageAdapter = {
     return res.json();   // { ok, results:{key:{value,found}}, found_count, pages_used }
   },
 
+  // AI-assisted re-detection of a document's *service* date (Gemini,
+  // opt-in), excluding a date of birth -- see the folder-level "AI: detect
+  // service date" feature. Distinct from extractKeysAI: purpose-built
+  // prompt/route, and the result is meant for doc.docDate, not doc.metadata.
+  async detectServiceDateAI(docId) {
+    const res = await fetch(API_BASE + "/api/docs/" + docId + "/detect-service-date-ai", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
+    if (!res.ok) {
+      let detail = "";
+      try { detail = (await res.json()).error || ""; } catch {}
+      throw new Error(detail || tOutsideReact(`AI 识别失败: HTTP ${res.status}`, `AI detection failed: HTTP ${res.status}`));
+    }
+    return res.json();   // { ok, found, date: "YYYY-MM-DD"|null, raw }
+  },
+
   async getAISettings(provider = "gemini") {
     const res = await fetch(API_BASE + "/api/ai-settings?provider=" + encodeURIComponent(provider));
     if (!res.ok) return { configured: false, library_installed: false };
@@ -1983,10 +2015,14 @@ const TreeNode = ({
             setIsFileDragOver(true);
             e.dataTransfer.dropEffect = "copy";
           } else if (e.dataTransfer.types.includes("application/x-dms-doc")) {
-            // A document card is being dragged over this folder — always a
-            // straight "move into this folder", no before/after reordering.
-            setIsFileDragOver(true);
-            e.dataTransfer.dropEffect = "move";
+            // A document card is being dragged over this folder — always
+            // "into this folder", no before/after reordering. Plain drop
+            // moves it; holding Alt (Option on Mac) links it here instead,
+            // leaving it in its current folder too. e.altKey itself is
+            // unreliable mid-drag on Mac (see dragAltKeyState above), so
+            // use the tracked live value instead.
+            setIsFileDragOver(dragAltKeyState.current ? "link" : true);
+            e.dataTransfer.dropEffect = dragAltKeyState.current ? "link" : "move";
           } else {
             const rect = e.currentTarget.getBoundingClientRect();
             const y = e.clientY - rect.top;
@@ -2009,7 +2045,7 @@ const TreeNode = ({
           if (e.dataTransfer.files.length !== 0) {
             onFileDrop(node.id, e.dataTransfer.files);
           } else if (e.dataTransfer.types.includes("application/x-dms-doc")) {
-            onDocDrop && onDocDrop(node.id);
+            onDocDrop && onDocDrop(node.id, { link: dragAltKeyState.current });
           } else {
             onDrop();
           }
@@ -2017,6 +2053,7 @@ const TreeNode = ({
         onDragEnd={() => onDragEnd()}
         className={`group relative flex items-center gap-1.5 py-1.5 px-2 cursor-pointer text-base border-l-2 transition-colors ${
           isDragging ? "opacity-40" :
+          isFileDragOver === "link" ? "bg-sky-100 border-sky-500 text-stone-900" :
           isFileDragOver ? "bg-amber-100 border-amber-500 text-stone-900" :
           isDropTarget && dropPosition === "into" ? "bg-blue-50 border-blue-400 text-stone-900" :
           isSelected ? "bg-amber-200 border-amber-600 text-stone-900 font-medium" :
@@ -2533,7 +2570,7 @@ const VoiceMicButton = ({ onFinalTranscript, title, className = "" }) => {
  * UI: DOCUMENT VIEWER
  * =============================================================================
  */
-const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyParameter, onSaveLocalParams, onSaveParams, onSaveDescription, onSaveTextAsDoc, derivedDocs = [], onOpenAISettings, nodeId, onPrevDoc, onNextDoc }) => {
+const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyParameter, onSaveLocalParams, onSaveParams, onSaveDescription, onSaveTextAsDoc, onUpdateMeta, derivedDocs = [], onOpenAISettings, nodeId, onPrevDoc, onNextDoc }) => {
   const { t } = useLang();
   const isImage = doc?.mime?.startsWith("image/");
   const isPdf = doc?.mime === "application/pdf";
@@ -2561,10 +2598,40 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
   const [barcodeScanning, setBarcodeScanning] = useState(false);
   const [barcodeError, setBarcodeError] = useState("");
   const [barcodeResult, setBarcodeResult] = useState(null);   // { results: [{type, data}], saved }
-  // Side panel: null (closed) | "text" (OCR text) | "keys" (key-param extract) | "desc" (description) | "ask" (AI Q&A)
+  // Side panel: null (closed) | "text" (OCR text) | "keys" (key-param extract) | "desc" (description) | "ask" (AI Q&A) | "meta" (metadata) | "search" (find text, PDF only)
   const [panelMode, setPanelMode] = useState(null);
   const [copied, setCopied] = useState(false);
   const [saved, setSaved] = useState(false);
+
+  // "Find text in this document" (PDF only) -- fuzzy search over a fresh
+  // server-side OCR/extraction pass, reusing fuzzyFindAll/pageForOffset (see
+  // FloatingDocPreview above, which does the same thing for its own pdf.js-
+  // based viewer). Kept separate from the "text" panel's ocrText/ocrInfo
+  // state since runOcr() above has its own side effect of switching
+  // panelMode to "text" -- this needs to run without disturbing that panel.
+  // Chrome's native PDF plugin (the iframe below) can't be scripted to
+  // highlight a match in place, so navigating a match only shows a text
+  // snippet; jumping the iframe to that page is an explicit, separate
+  // action (via the "#page=N" URL fragment Chrome's viewer honors) rather
+  // than happening automatically on every match, so the embedded view never
+  // reloads/re-zooms without the user asking for it.
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchDocText, setSearchDocText] = useState(null);
+  const [searchPageRanges, setSearchPageRanges] = useState(null);
+  const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState("");
+  const [searchMatches, setSearchMatches] = useState([]);
+  const [searchMatchIdx, setSearchMatchIdx] = useState(-1);
+  const [lastSearchedQuery, setLastSearchedQuery] = useState(null);
+  const [pdfJumpPage, setPdfJumpPage] = useState(null);   // sets the iframe's #page= fragment
+  // Bumped on every "Jump to page" click so the iframe below remounts (a new
+  // `key`) even when re-jumping to the same page. Necessary because Chrome's
+  // PDF viewer only reads the "#page=N" fragment on a fresh navigation --
+  // just changing an already-loaded iframe's `src` to the same resource
+  // with a different fragment does nothing (confirmed while building this;
+  // no network request fires and the view doesn't move), so the page jump
+  // has to force a full remount/reload rather than an in-place src update.
+  const [pdfJumpNonce, setPdfJumpNonce] = useState(0);
 
   // Description / caption state
   const [description, setDescription] = useState("");
@@ -2618,6 +2685,12 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
   const [keyHint, setKeyHint] = useState("");
   const [keyDiag, setKeyDiag] = useState(null);           // {charCount, preview,...}
   const [paramsSaved, setParamsSaved] = useState(false);
+  // When a keyword occurs more than once, keyRows gets one row per
+  // occurrence ("Key", "Key01", "Key02", ...). keptVariant maps a base
+  // keyword to the single row's `key` the user chose to keep for it; the
+  // other occurrences in that group are then excluded from saveParams
+  // instead of all being saved as separate fields. Absent/empty = keep all.
+  const [keptVariant, setKeptVariant] = useState({});
   const [useAI, setUseAI] = useState(false);               // opt-in Gemini extraction
   const [aiSettings, setAiSettings] = useState({ configured: false, library_installed: true });
 
@@ -2820,7 +2893,10 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
     setLocalKeys(normalizeKeyParameters(doc.localKeyParams || []));
     setSelectedKeys([]);
     setNewKeyInput(""); setSameLineOnly(true);
-    setKeyRows(null); setKeyError(""); setKeyHint(""); setKeyDiag(null); setParamsSaved(false);
+    setKeyRows(null); setKeyError(""); setKeyHint(""); setKeyDiag(null); setParamsSaved(false); setKeptVariant({});
+    setSearchQuery(""); setSearchDocText(null); setSearchPageRanges(null); setSearching(false);
+    setSearchError(""); setSearchMatches([]); setSearchMatchIdx(-1); setLastSearchedQuery(null);
+    setPdfJumpPage(null); setPdfJumpNonce(0);
     setAskQuestion(""); setAskRunning(false); setAskError(""); setAskAnswer(null); setAskLogName("");
     askVoice.resetVoiceUI();
     setSavingNewDoc(false); setNewDocMsg(null);
@@ -2888,6 +2964,61 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
       setTimeout(() => setCopied(false), 1500);
     } catch {/* clipboard may be blocked; ignore */}
   };
+
+  // Get this doc's text for the "search text" panel, lazily and cached for
+  // as long as the viewer stays open on this doc. Always a fresh
+  // server-side OCR/extraction pass (like FloatingDocPreview's getDocText)
+  // so `info.page_ranges` comes back too -- that's what lets a match be
+  // attributed to a page (see pageForOffset above).
+  const getSearchDocText = async () => {
+    if (searchDocText != null) return searchDocText;
+    const r = await StorageAdapter.runOcr(doc.id);
+    const text = r.text || "";
+    setSearchDocText(text);
+    setSearchPageRanges(r.info?.page_ranges || null);
+    if (!text) {
+      setSearchError(r.hint || t("此文档没有可供搜索的文本（可能需要先运行 OCR）。", "No searchable text could be read from this document (it may need OCR first)."));
+    }
+    return text;
+  };
+
+  const runDocSearch = async () => {
+    const q = searchQuery.trim();
+    if (!q) return;
+    setSearchError(""); setSearching(true);
+    try {
+      const text = await getSearchDocText();
+      setLastSearchedQuery(q);
+      if (!text) { setSearchMatches([]); setSearchMatchIdx(-1); return; }
+      const found = fuzzyFindAll(text, q, FUZZY_MATCH_THRESHOLD);
+      setSearchMatches(found);
+      setSearchMatchIdx(found.length ? 0 : -1);
+      if (!found.length) {
+        setSearchError(t(`未找到与 "${q}" 相似度 ≥70% 的内容。`, `No text found at least 70% similar to "${q}".`));
+      }
+    } catch (e) {
+      setSearchError(e.message || String(e));
+    } finally {
+      setSearching(false);
+    }
+  };
+
+  const goToSearchMatch = (idx) => {
+    if (!searchMatches.length) return;
+    setSearchMatchIdx(((idx % searchMatches.length) + searchMatches.length) % searchMatches.length);
+  };
+  const nextSearchMatch = () => goToSearchMatch(searchMatchIdx + 1);
+  const prevSearchMatch = () => goToSearchMatch(searchMatchIdx - 1);
+
+  const handleSearchKeyDown = (e) => {
+    if (e.key !== "Enter") return;
+    e.preventDefault();
+    if (searchMatches.length && searchQuery.trim() === lastSearchedQuery) nextSearchMatch();
+    else runDocSearch();
+  };
+
+  const currentSearchMatch = searchMatchIdx >= 0 ? searchMatches[searchMatchIdx] : null;
+  const currentSearchMatchPage = currentSearchMatch ? pageForOffset(searchPageRanges, currentSearchMatch.start) : null;
 
   const saveText = async () => {
     if (!onSaveOcr) return;
@@ -3149,10 +3280,15 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
       // row per occurrence) -- include all of them, not just the originally
       // requested names, so repeated values are all shown and saved. Each
       // result is already split server-side into value/unit/description.
+      // baseKey ties a suffixed occurrence back to the keyword the user
+      // actually asked for, so the multi-value picker below can group them.
       const rows = Object.keys(r.results || {}).map((k) => {
         const res = r.results[k] || {};
+        const suffixMatch = !keys.includes(k) && k.match(/^(.*)(\d{2})$/);
+        const baseKey = keys.includes(k) ? k : (suffixMatch && keys.includes(suffixMatch[1]) ? suffixMatch[1] : k);
         return {
           key: k,
+          baseKey,
           value: res.value || "",
           unit: res.unit || "",
           description: res.description || "",
@@ -3160,6 +3296,7 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
         };
       });
       setKeyRows(rows);
+      setKeptVariant({});
       setKeyHint(r.hint || "");
       setKeyDiag({
         charCount: r.text_char_count || 0,
@@ -3204,8 +3341,11 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
       const r = await StorageAdapter.extractKeysAI(doc.id, keys);
       const rows = Object.keys(r.results || {}).map((k) => {
         const res = r.results[k] || {};
+        const suffixMatch = !keys.includes(k) && k.match(/^(.*)(\d{2})$/);
+        const baseKey = keys.includes(k) ? k : (suffixMatch && keys.includes(suffixMatch[1]) ? suffixMatch[1] : k);
         return {
           key: k,
+          baseKey,
           value: res.value || "",
           unit: res.unit || "",
           description: res.description || "",
@@ -3213,6 +3353,7 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
         };
       });
       setKeyRows(rows);
+      setKeptVariant({});
       setKeyHint(r.pages_used ? t(`AI 已读取 ${r.pages_used} 页文档图像进行识别。`, `AI read ${r.pages_used} page image(s) of the document for recognition.`) : "");
     } catch (e) {
       setKeyError(e.message || String(e));
@@ -3242,11 +3383,18 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
     const meta = { ...((doc.metadata) || {}) };
     for (const row of keyRows) {
       if (!includeNF && !row.found) continue;
-      const prev = meta[row.key];
+      // If the user picked one occurrence to keep for this keyword, skip
+      // every other occurrence in the same group and save the kept one
+      // under the plain base keyword name (not "Key01"/"Key02"), so it
+      // lands in the single field a repeated read of the doc would expect.
+      const kept = keptVariant[row.baseKey];
+      if (kept && row.key !== kept) continue;
+      const saveKey = kept ? row.baseKey : row.key;
+      const prev = meta[saveKey];
       const prevObj = (prev && typeof prev === "object")
         ? prev
         : { design: typeof prev === "string" ? prev : "", actual: "" };
-      meta[row.key] = {
+      meta[saveKey] = {
         ...prevObj,
         actual: row.found ? composeActualString(row.value, row.unit, row.description) : "NF",
         value: row.value || "",
@@ -3260,6 +3408,12 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
   };
 
   const foundCount = keyRows ? keyRows.filter((r) => r.found).length : 0;
+
+  // How many rows share each base keyword -- >1 means that keyword had
+  // multiple occurrences in the document, so the picker UI should offer
+  // "keep only this one" for that group.
+  const keyGroupCounts = {};
+  (keyRows || []).forEach((r) => { keyGroupCounts[r.baseKey] = (keyGroupCounts[r.baseKey] || 0) + 1; });
 
   // Human-readable summary of what the extraction did.
   const methodLabel = (() => {
@@ -3329,6 +3483,18 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
             >
               <Edit2 size={13} /> {doc.description ? t("编辑描述", "Edit description") : t("添加描述", "Add description")}
             </button>
+            {onUpdateMeta && (
+              <button
+                onClick={() => setPanelMode(panelMode === "meta" ? null : "meta")}
+                title={t("编辑元数据（更改对所有引用此文档的节点生效）", "Edit metadata (changes apply everywhere this document is referenced)")}
+                className={"text-sm px-3 py-1.5 rounded flex items-center gap-1.5 border " +
+                  (panelMode === "meta"
+                    ? "border-indigo-400 text-indigo-800 bg-indigo-100"
+                    : "border-indigo-300 text-indigo-800 bg-indigo-50 hover:bg-indigo-100")}
+              >
+                <Tag size={13} /> {t("编辑元数据", "Edit metadata")}
+              </button>
+            )}
             {(() => {
               const hasCoords = doc.lat != null && doc.lon != null;
               const locObj = doc.metadata?.Location;
@@ -3385,6 +3551,18 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
                 {ocrRunning
                   ? (<><Loader size={13} className="animate-spin" /> {t("识别中…", "Recognizing…")}</>)
                   : (<><ScanText size={13} /> {doc.ocrText ? t("重新 OCR", "Re-run OCR") : t("提取文字 (OCR)", "Extract text (OCR)")}</>)}
+              </button>
+            )}
+            {isPdf && (
+              <button
+                onClick={() => setPanelMode(panelMode === "search" ? null : "search")}
+                title={t("在文档中查找文字（模糊匹配，可跳转到对应页）", "Find text in this document (fuzzy matching, can jump to the matching page)")}
+                className={"text-sm px-3 py-1.5 rounded flex items-center gap-1.5 border " +
+                  (panelMode === "search"
+                    ? "border-cyan-400 text-cyan-800 bg-cyan-100"
+                    : "border-cyan-300 text-cyan-800 bg-cyan-50 hover:bg-cyan-100")}
+              >
+                <Search size={13} /> {t("查找文字", "Search text")}
               </button>
             )}
             {ocrEligible && (
@@ -3538,7 +3716,12 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
                   onError={() => setImgLoadError(true)} />
               </div>
             ) : isPdf ? (
-              <iframe src={doc.dataUrl} title={doc.name} className="w-full h-full border-0" />
+              <iframe
+                key={pdfJumpPage ? `pdf-jump-${pdfJumpNonce}` : "pdf-default"}
+                src={pdfJumpPage ? `${doc.dataUrl}#page=${pdfJumpPage}` : doc.dataUrl}
+                title={doc.name}
+                className="w-full h-full border-0"
+              />
             ) : isText ? (
               <iframe src={doc.dataUrl} title={doc.name} className="w-full h-full border-0 bg-white font-mono" />
             ) : (
@@ -3877,6 +4060,121 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
             </div>
           )}
 
+          {panelMode === "meta" && (
+            <div
+              className={"min-h-0 flex flex-col bg-white overflow-y-auto " + (poppedOut ? "flex-1" : "shrink-0")}
+              style={poppedOut ? undefined : { width: panelW }}
+            >
+              <div className="flex items-center justify-between px-3 py-2 border-b border-stone-200 bg-stone-50 sticky top-0">
+                <div className="flex items-center gap-1.5 text-sm font-medium text-stone-700">
+                  <Tag size={13} /> {t("元数据", "Metadata")}
+                </div>
+                <button onClick={() => setPanelMode(null)} className="text-stone-600 hover:text-stone-700">
+                  <X size={14} />
+                </button>
+              </div>
+              <div className="px-3 pb-3 pt-2 bg-indigo-50/60">
+                <div className="text-[12px] text-stone-600 mb-2">
+                  {t("对所有引用此文档的位置均生效", "Applies everywhere this document is referenced")}
+                </div>
+                <MetadataEditor
+                  metadata={doc.metadata || {}}
+                  keyParameters={keyParameters}
+                  onChange={onUpdateMeta}
+                />
+              </div>
+            </div>
+          )}
+
+          {panelMode === "search" && (
+            <div
+              className={"min-h-0 flex flex-col bg-white " + (poppedOut ? "flex-1" : "shrink-0")}
+              style={poppedOut ? undefined : { width: panelW }}
+            >
+              <div className="flex items-center justify-between px-3 py-2 border-b border-stone-200 bg-stone-50">
+                <div className="flex items-center gap-1.5 text-sm font-medium text-stone-700">
+                  <Search size={13} /> {t("查找文字", "Search text")}
+                </div>
+                <button onClick={() => setPanelMode(null)} className="text-stone-600 hover:text-stone-700">
+                  <X size={14} />
+                </button>
+              </div>
+              <div className="px-3 py-2 border-b border-stone-200 flex items-center gap-1">
+                <input
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  onKeyDown={handleSearchKeyDown}
+                  placeholder={t("查找文字…（可与原文不完全一致）", "Find text… (doesn't need to match exactly)")}
+                  className="flex-1 min-w-0 text-sm px-2 py-1 border border-stone-300 rounded focus:outline-none focus:border-cyan-600"
+                />
+                <button
+                  onClick={runDocSearch}
+                  disabled={searching || !searchQuery.trim()}
+                  className="text-sm px-2.5 py-1 border border-stone-300 rounded hover:bg-stone-100 disabled:opacity-40 shrink-0"
+                >
+                  {searching ? <Loader size={12} className="animate-spin" /> : t("查找", "Find")}
+                </button>
+                <button
+                  onClick={prevSearchMatch}
+                  disabled={searchMatches.length === 0}
+                  className="p-1 border border-stone-300 rounded hover:bg-stone-100 disabled:opacity-30 shrink-0"
+                  title={t("上一个", "Previous match")}
+                >
+                  <ChevronUp size={12} />
+                </button>
+                <button
+                  onClick={nextSearchMatch}
+                  disabled={searchMatches.length === 0}
+                  className="p-1 border border-stone-300 rounded hover:bg-stone-100 disabled:opacity-30 shrink-0"
+                  title={t("下一个", "Next match")}
+                >
+                  <ChevronDown size={12} />
+                </button>
+              </div>
+              <div className="flex-1 min-h-0 overflow-y-auto px-3 py-2">
+                {searchMatches.length > 0 ? (
+                  <>
+                    <div className="text-[12px] text-stone-700 mb-1.5">
+                      {t(`第 ${searchMatchIdx + 1} / ${searchMatches.length} 处`, `Match ${searchMatchIdx + 1} of ${searchMatches.length}`)}
+                      {currentSearchMatchPage != null && (
+                        <span> · {t(`第 ${currentSearchMatchPage} 页`, `page ${currentSearchMatchPage}`)}</span>
+                      )}
+                      {currentSearchMatch && currentSearchMatch.score < 1 && (
+                        <span className="text-stone-600"> · {t("相似度", "similarity")} {Math.round(currentSearchMatch.score * 100)}%</span>
+                      )}
+                    </div>
+                    {currentSearchMatch && searchDocText && (() => {
+                      const s = snippetAround(searchDocText, currentSearchMatch.start, currentSearchMatch.end);
+                      return (
+                        <div className="bg-stone-50 border border-stone-200 rounded px-2 py-1.5 text-[13px] text-stone-700 leading-snug mb-2">
+                          {s.before && <span className="text-stone-600">…{s.before} </span>}
+                          <mark className="bg-amber-200 text-stone-900 rounded px-0.5">{s.match}</mark>
+                          {s.after && <span className="text-stone-600"> {s.after}…</span>}
+                        </div>
+                      );
+                    })()}
+                    {currentSearchMatchPage != null && (
+                      <button
+                        onClick={() => { setPdfJumpPage(currentSearchMatchPage); setPdfJumpNonce((n) => n + 1); }}
+                        title={t("Chrome 内置的 PDF 阅读器无法被脚本控制高亮显示，只能跳转到该页", "Chrome's built-in PDF viewer can't be scripted to highlight the match, only jump to its page")}
+                        className="text-sm px-2.5 py-1 border border-cyan-300 text-cyan-800 bg-cyan-50 hover:bg-cyan-100 rounded flex items-center gap-1.5"
+                      >
+                        <FileText size={12} /> {t(`跳转到第 ${currentSearchMatchPage} 页`, `Jump to page ${currentSearchMatchPage}`)}
+                      </button>
+                    )}
+                  </>
+                ) : searchError ? (
+                  <div className="text-sm text-stone-700">{searchError}</div>
+                ) : (
+                  <div className="text-sm text-stone-600">
+                    {t("输入要查找的文字，回车或点击\"查找\"（支持模糊匹配）。", "Enter text to find, then press Enter or click \"Find\" (fuzzy matching supported).")}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
           {/* OCR result panel */}
           {panelMode === "text" && (
             <div
@@ -4154,6 +4452,11 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
                 {!keyRunning && keyError && (
                   <div className="text-sm text-red-600 whitespace-pre-wrap">{keyError}</div>
                 )}
+                {!keyRunning && !keyError && keyRows && keyRows.some((r) => keyGroupCounts[r.baseKey] > 1) && (
+                  <div className="text-[12px] text-amber-700 bg-amber-50 border border-amber-100 rounded px-2 py-1 mb-2">
+                    {t("同一关键字出现多次时，点击左侧圆点只保留一项，其余不会被保存。", "When a keyword appears more than once, click the dot on the left to keep only that one — the rest won't be saved.")}
+                  </div>
+                )}
                 {!keyRunning && !keyError && keyRows && keyRows.length > 0 && (
                   <table className="w-full text-[13px] border-collapse">
                     <thead>
@@ -4169,9 +4472,29 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
                         <tr key={row.key + idx} className="border-b border-stone-100 align-top">
                           <td className="py-1 pr-2 font-mono text-stone-700 break-all w-1/4">
                             <div className="flex items-center gap-1">
-                              <span>{row.key}</span>
+                              {keyGroupCounts[row.baseKey] > 1 && (
+                                <input
+                                  type="radio"
+                                  name={`kept-variant-${row.baseKey}`}
+                                  checked={keptVariant[row.baseKey] === row.key}
+                                  onChange={() => setKeptVariant((v) => ({ ...v, [row.baseKey]: row.key }))}
+                                  title={t("只保留这一项，丢弃同一关键字的其他结果", "Keep only this one; discard the other results for the same keyword")}
+                                  className="shrink-0 accent-emerald-600"
+                                />
+                              )}
+                              <span className={keptVariant[row.baseKey] && keptVariant[row.baseKey] !== row.key ? "opacity-40 line-through" : ""}>{row.key}</span>
                               {!row.found && (
                                 <span className="text-[11px] text-stone-600 shrink-0">NF</span>
+                              )}
+                              {keyGroupCounts[row.baseKey] > 1 && keptVariant[row.baseKey] === row.key && (
+                                <button
+                                  type="button"
+                                  onClick={() => setKeptVariant((v) => { const n = { ...v }; delete n[row.baseKey]; return n; })}
+                                  title={t("恢复：保留该关键字的全部结果", "Reset: keep all results for this keyword")}
+                                  className="text-[10px] text-stone-500 hover:text-stone-700 underline shrink-0"
+                                >
+                                  {t("重置", "reset")}
+                                </button>
                               )}
                             </div>
                           </td>
@@ -11304,7 +11627,7 @@ const DocumentCard = ({
       onDragStart={(e) => {
         if (faceSelectMode || (selectMode && !isChecked)) return;
         e.stopPropagation();
-        e.dataTransfer.effectAllowed = "move";
+        e.dataTransfer.effectAllowed = "linkMove";
         // Custom MIME type marks this as an internal document drag so
         // folder tree nodes can tell it apart from OS file drops and
         // from folder-reorder drags (both use different data shapes).
@@ -11317,7 +11640,7 @@ const DocumentCard = ({
         onDragStart && onDragStart();
       }}
       onDragEnd={() => onDragEnd && onDragEnd()}
-      title={showCheckbox ? (isChecked ? t("拖拽到左侧文件夹树可移动所有已勾选的文档", "Drag onto a folder in the tree to move all checked documents there") : undefined) : t("拖拽到左侧文件夹树可移动此文档", "Drag onto a folder in the tree to move this document there")}
+      title={showCheckbox ? (isChecked ? t("拖拽到左侧文件夹树可移动所有已勾选的文档（按住 Alt/Option 放下则改为链接）", "Drag onto a folder in the tree to move all checked documents there (hold Alt/Option while dropping to link them instead)") : undefined) : t("拖拽到左侧文件夹树可移动此文档（按住 Alt/Option 放下则改为链接）", "Drag onto a folder in the tree to move this document there (hold Alt/Option while dropping to link it instead)")}
       className={`border rounded bg-white transition-opacity ${
         isDragging ? "opacity-40" :
         isEditing ? "border-indigo-400 bg-indigo-50/60 ring-1 ring-indigo-300" :
@@ -11769,6 +12092,10 @@ const DocumentGridTile = ({
   selectMode = false, selected = false, onToggleSelect,
   scheduleMode = false, urgency = null,
   isLastWorked = false, onMarkWorked,
+  // Drag-to-move onto a folder in the tree -- same contract as
+  // DocumentCard's (the parent decides whether this drag carries just this
+  // document or the whole checked set).
+  isDragging = false, onDragStart, onDragEnd,
   // Near-duplicate "best copy" recommendation (see photos_near_duplicates'
   // recommendedDocId, carried onto the containing folder node by the mark
   // endpoint) -- shown as a ★ badge on the recommended document wherever a
@@ -11801,11 +12128,26 @@ const DocumentGridTile = ({
 
   const cardUrgencyClass = scheduleMode && urgency ? URGENCY_ROW_CLASSES[urgency] : "";
 
+  // Same rule as DocumentCard: in a select mode only checked tiles drag
+  // (and carry every checked document with them).
+  const canDrag = !faceSelectMode && (!selectMode || isChecked);
+
   return (
     <div
       onClick={handleClick}
+      draggable={canDrag}
+      onDragStart={(e) => {
+        if (!canDrag) return;
+        e.stopPropagation();
+        e.dataTransfer.effectAllowed = "linkMove";
+        e.dataTransfer.setData("application/x-dms-doc", doc.id);
+        e.dataTransfer.setData("text/plain", doc.id);
+        onDragStart && onDragStart();
+      }}
+      onDragEnd={() => onDragEnd && onDragEnd()}
       title={doc.name}
-      className={`relative border rounded bg-white p-2 cursor-pointer flex flex-col items-center gap-1.5 ${
+      className={`relative border rounded bg-white p-2 cursor-pointer flex flex-col items-center gap-1.5 transition-opacity ${
+        isDragging ? "opacity-40" :
         isLastWorked ? "border-indigo-400 bg-indigo-50/60 ring-1 ring-indigo-300" :
         showCheckbox && isChecked ? "border-amber-400 bg-amber-50" :
         cardUrgencyClass || "border-stone-200 hover:border-amber-300"
@@ -11823,6 +12165,7 @@ const DocumentGridTile = ({
           <img
             src={thumbUrl}
             alt={doc.name}
+            draggable={false}
             className="w-full h-full object-cover"
             onError={() => setThumbError(true)}
           />
@@ -12881,7 +13224,7 @@ const FaceTaggingDialog = ({ open, onClose, docIds, onLabeled }) => {
 
   return (
     <div className="fixed inset-0 bg-stone-900/60 z-50 flex items-center justify-center p-4" onClick={(e) => { if (e.target === e.currentTarget) { setActiveFace(null); } }}>
-      <div className="bg-white rounded-xl shadow-2xl w-full max-w-2xl max-h-[85vh] flex flex-col">
+      <div className="bg-white rounded-xl shadow-2xl w-full max-w-3xl max-h-[85vh] flex flex-col">
         {/* Header */}
         <div className="flex items-center justify-between px-5 py-3 border-b border-stone-200">
           <div className="font-semibold text-stone-900 flex items-center gap-2">
@@ -12931,7 +13274,7 @@ const FaceTaggingDialog = ({ open, onClose, docIds, onLabeled }) => {
               >
                 {installing ? <><Loader size={11} className="animate-spin" /> {t("安装中，请稍候…", "Installing, please wait…")}</> : t("自动安装 deepface", "Auto-install deepface")}
               </button>
-              <p className="text-[12px] text-amber-600">{t("首次安装需下载约 200 MB，请保持网络连接。", "First-time install downloads about 200 MB — please stay connected to the network.")}</p>
+              <p className="text-[12px] text-amber-600">{t("首次安装需下载约 1.5 GB（需约 4 GB 可用磁盘空间），请保持网络连接。", "First-time install downloads about 1.5 GB (needs about 4 GB of free disk space) — please stay connected to the network.")}</p>
             </div>
           )}
           {error && (
@@ -12946,7 +13289,7 @@ const FaceTaggingDialog = ({ open, onClose, docIds, onLabeled }) => {
                 <img
                   src={`/api/docs/${result.docId}/preview`}
                   alt=""
-                  className="w-16 h-16 object-cover rounded border border-stone-200 shrink-0"
+                  className="w-24 h-24 object-cover rounded border border-stone-200 shrink-0"
                   onError={(e) => { e.target.style.display = "none"; }}
                 />
                 <div className="flex-1 min-w-0">
@@ -12955,7 +13298,7 @@ const FaceTaggingDialog = ({ open, onClose, docIds, onLabeled }) => {
                   ) : result.faces.length === 0 ? (
                     <div className="text-base text-stone-600">{t("未检测到人脸", "No faces detected")}</div>
                   ) : (
-                    <div className="flex flex-wrap gap-2">
+                    <div className="flex flex-wrap gap-3">
                       {result.faces.map((face) => {
                         const isActive = activeFace && activeFace.docId === result.docId && activeFace.faceIdx === face.faceIdx;
                         return (
@@ -12964,7 +13307,7 @@ const FaceTaggingDialog = ({ open, onClose, docIds, onLabeled }) => {
                               <img
                                 src={`data:image/jpeg;base64,${face.crop_b64}`}
                                 alt={t(`人脸 ${face.faceIdx + 1}`, `Face ${face.faceIdx + 1}`)}
-                                className={`w-14 h-14 object-cover rounded cursor-pointer border-2 transition-colors ${
+                                className={`w-24 h-24 object-cover rounded cursor-pointer border-2 transition-colors ${
                                   isActive ? "border-amber-500 ring-2 ring-amber-300" :
                                   face.personId ? "border-green-400" : "border-stone-200 hover:border-amber-400"
                                 }`}
@@ -12980,15 +13323,15 @@ const FaceTaggingDialog = ({ open, onClose, docIds, onLabeled }) => {
                               {face.personId && (
                                 <button
                                   onClick={(e) => { e.stopPropagation(); handleUnlabel(result.docId, face.faceIdx); }}
-                                  className="absolute -top-1 -right-1 w-4 h-4 bg-red-500 text-white rounded-full flex items-center justify-center text-[11px] hover:bg-red-600"
+                                  className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-red-500 text-white rounded-full flex items-center justify-center text-sm hover:bg-red-600"
                                   title={t("取消标记", "Remove tag")}
                                 >×</button>
                               )}
                             </div>
                             {face.personName ? (
-                              <span className="text-[12px] bg-green-100 text-green-800 px-1.5 py-0.5 rounded max-w-[56px] truncate">{face.personName}</span>
+                              <span className="text-sm bg-green-100 text-green-800 px-1.5 py-0.5 rounded max-w-[96px] truncate">{face.personName}</span>
                             ) : (
-                              <span className="text-[12px] text-stone-600">{t("未标记", "Untagged")}</span>
+                              <span className="text-sm text-stone-600">{t("未标记", "Untagged")}</span>
                             )}
                           </div>
                         );
@@ -13051,7 +13394,7 @@ const FaceTaggingDialog = ({ open, onClose, docIds, onLabeled }) => {
 };
 
 // ---- People Panel ----------------------------------------------------------
-const PeoplePanel = ({ onFilterPerson, filteredPersonId, tree }) => {
+const PeoplePanel = ({ onFilterPerson, filteredPersonId, tree, currentNodeId, docIndex = [] }) => {
   const { t } = useLang();
   const [people, setPeople] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -13066,6 +13409,15 @@ const PeoplePanel = ({ onFilterPerson, filteredPersonId, tree }) => {
   const [installing, setInstalling] = useState(false);
   const [installError, setInstallError] = useState(null);
   const [gallery, setGallery] = useState(null); // { personName, docIds: [], folderCreated: false }
+  const [stopping, setStopping] = useState(false);
+  // Person the current scan-result message is about -- double-clicking that
+  // message opens their matched-photos gallery.
+  const [resultPersonId, setResultPersonId] = useState(null);
+  const imageDocIds = useMemo(
+    () => new Set(docIndex.filter((d) => d.mime?.startsWith("image/")).map((d) => d.id)),
+    [docIndex]
+  );
+  const libraryImageCount = imageDocIds.size;
   const [galleryBusy, setGalleryBusy] = useState(false);
 
   const openGallery = (person) => {
@@ -13084,12 +13436,14 @@ const PeoplePanel = ({ onFilterPerson, filteredPersonId, tree }) => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ personName: gallery.personName, docIds: gallery.docIds }),
       });
-      const d = await res.json();
+      const d = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
       if (d.ok) {
-        setGallery((g) => ({ ...g, folderCreated: true, added: d.added }));
+        setGallery((g) => ({ ...g, folderCreated: true, added: d.added, folderError: null }));
+      } else {
+        setGallery((g) => ({ ...g, folderError: d.error || t("创建失败", "Failed to create the folder") }));
       }
     } catch (e) {
-      // silent
+      setGallery((g) => ({ ...g, folderError: t("创建失败: ", "Failed to create the folder: ") + e.message }));
     } finally {
       setGalleryBusy(false);
     }
@@ -13111,8 +13465,23 @@ const PeoplePanel = ({ onFilterPerson, filteredPersonId, tree }) => {
 
   const openScanDialog = (personId) => {
     setScanDialog(personId);
-    setScanNodeIds(new Set());
-    setScanExpanded(tree ? new Set([tree.id]) : new Set());
+    const pathTo = (node, id) => {
+      if (!node) return null;
+      if (node.id === id) return [node];
+      for (const c of node.children || []) {
+        const p = pathTo(c, id);
+        if (p) return [node, ...p];
+      }
+      return null;
+    };
+    const path = currentNodeId && tree && currentNodeId !== tree.id ? pathTo(tree, currentNodeId) : null;
+    const ticked = new Set();
+    if (path) {
+      const walk = (n) => { ticked.add(n.id); (n.children || []).forEach(walk); };
+      walk(path[path.length - 1]);
+    }
+    setScanNodeIds(ticked);
+    setScanExpanded(new Set(path ? path.slice(0, -1).map((n) => n.id) : tree ? [tree.id] : []));
   };
 
   const toggleScanExpand = (id) =>
@@ -13126,6 +13495,31 @@ const PeoplePanel = ({ onFilterPerson, filteredPersonId, tree }) => {
       walk(node);
       return next;
     });
+  };
+
+  const scanPhotoCount = useMemo(() => {
+    if (!scanDialog || !tree || scanNodeIds.size === 0) return 0;
+    const ids = new Set();
+    const walk = (n) => {
+      if (scanNodeIds.has(n.id)) {
+        for (const d of n.documents || []) {
+          const id = typeof d === "string" ? d : d.id;
+          if (imageDocIds.has(id)) ids.add(id);
+        }
+      }
+      (n.children || []).forEach(walk);
+    };
+    walk(tree);
+    return ids.size;
+  }, [scanDialog, tree, scanNodeIds, imageDocIds]);
+
+  const stopRecognize = async () => {
+    setStopping(true);
+    try {
+      await fetch("/api/faces/recognize/cancel", { method: "POST" });
+    } catch (e) {
+      // the recognize request itself reports what happened
+    }
   };
 
   const hasScanDescendant = (node) =>
@@ -13158,6 +13552,8 @@ const PeoplePanel = ({ onFilterPerson, filteredPersonId, tree }) => {
 
   const handleRecognize = async (personId, nodeIds) => {
     setRecognizing(personId);
+    setStopping(false);
+    setResultPersonId(null);
     setScanDialog(null);
     setError(null);
     try {
@@ -13178,13 +13574,37 @@ const PeoplePanel = ({ onFilterPerson, filteredPersonId, tree }) => {
         const msg = photoCount > 0
           ? t(`在 ${d.scanned} 张照片中识别到 ${photoCount} 张含有${name}的照片`, `Recognized ${photoCount} photo(s) containing ${name} out of ${d.scanned} scanned`)
           : t(`已扫描 ${d.scanned} 张照片，未发现新的匹配`, `Scanned ${d.scanned} photo(s), no new matches found`);
-        setError("✅ " + msg);
+        // Scans skip faces already tagged by hand, so the card/gallery count
+        // (tagged + recognized) can be higher than this scan's matches.
+        const totalNote = d.personTotal != null && d.personTotal > photoCount
+          ? t(`（加上手动标记的 ${d.personTotal - photoCount} 张，共 ${d.personTotal} 张）`,
+              ` (plus ${d.personTotal - photoCount} tagged by hand: ${d.personTotal} in total)`)
+          : "";
+        // Time limit reached: finished photos are cached server-side, so
+        // running the same scan again continues from where it stopped.
+        const partial = d.cancelled
+          ? t(`（已停止，完成 ${d.scanned}/${d.total} 张。进度已保存，再次扫描会从中断处继续。）`,
+              ` (stopped: ${d.scanned} of ${d.total} done. Progress is saved; scan again to continue.)`)
+          : d.incomplete
+          ? t(`（时间已到，仅完成 ${d.scanned}/${d.total} 张。进度已保存，再次扫描会从中断处继续。）`,
+              ` (time limit reached: only ${d.scanned} of ${d.total} done. Progress is saved; scan again to continue.)`)
+          : "";
+        const folderNote = d.folderError
+          ? t(`（更新"人脸匹配"文件夹失败：${d.folderError}）`, ` (could not update the "人脸匹配" folder: ${d.folderError})`)
+          : photoCount > 0
+          ? (d.folderAdded > 0
+            ? t(`，已加入"人脸匹配/${name}"文件夹（新增 ${d.folderAdded} 张）。`, ` Added to folder "人脸匹配/${name}" (${d.folderAdded} new).`)
+            : t(`，照片已在"人脸匹配/${name}"文件夹中。`, ` Photos are in folder "人脸匹配/${name}".`))
+          : "";
+        setError((d.cancelled ? "⏹ " : d.incomplete ? "⏳ " : "✅ ") + msg + totalNote + partial + folderNote);
+        setResultPersonId(personId);
         loadPeople();
       }
     } catch (e) {
       setError(t("识别失败: ", "Recognition failed: ") + e.message);
     } finally {
       setRecognizing(null);
+      setStopping(false);
     }
   };
 
@@ -13210,7 +13630,16 @@ const PeoplePanel = ({ onFilterPerson, filteredPersonId, tree }) => {
       {recognizing !== null && (
         <div className="mx-2 mt-2 p-2 bg-amber-50 border border-amber-200 rounded text-sm text-amber-800 flex items-center gap-2">
           <Loader size={11} className="animate-spin shrink-0" />
-          <span>{t("正在扫描照片，识别人脸中…可能需要几分钟，请耐心等待。", "Scanning photos and recognizing faces… this may take a few minutes, please be patient.")}</span>
+          <span className="flex-1">{stopping
+            ? t("正在停止…已完成的照片会保留。", "Stopping… photos already done are kept.")
+            : t("正在扫描照片，识别人脸中…可能需要几分钟，请耐心等待。", "Scanning photos and recognizing faces… this may take a few minutes, please be patient.")}</span>
+          <button
+            onClick={stopRecognize}
+            disabled={stopping}
+            title={t("停止扫描（已完成的照片会保存，下次扫描不再重复）", "Stop scanning (photos already done are saved and won't be redone)")}
+            className="shrink-0 px-2 py-0.5 text-[12px] border border-amber-400 bg-white hover:bg-amber-100 text-amber-800 rounded disabled:opacity-50">
+            {t("停止", "Stop")}
+          </button>
         </div>
       )}
 
@@ -13240,16 +13669,32 @@ const PeoplePanel = ({ onFilterPerson, filteredPersonId, tree }) => {
               ? <><Loader size={11} className="animate-spin" /> {t("安装中，请稍候…", "Installing, please wait…")}</>
               : t("自动安装 deepface", "Auto-install deepface")}
           </button>
-          <p className="text-[12px] text-amber-600">{t("首次安装需下载约 200 MB，请保持网络连接。", "First-time install downloads about 200 MB — please stay connected to the network.")}</p>
+          <p className="text-[12px] text-amber-600">{t("首次安装需下载约 1.5 GB（需约 4 GB 可用磁盘空间），请保持网络连接。", "First-time install downloads about 1.5 GB (needs about 4 GB of free disk space) — please stay connected to the network.")}</p>
         </div>
       )}
 
-      {error && (
-        <div className={`mx-2 my-1 p-2 rounded text-sm flex items-start gap-1 ${error.startsWith("✅") ? "bg-green-50 border border-green-200 text-green-800" : "bg-red-50 border border-red-200 text-red-700"}`}>
-          <span className="flex-1">{error}</span>
-          <button onClick={() => setError(null)} className="ml-1 opacity-50 hover:opacity-100 shrink-0">×</button>
-        </div>
-      )}
+      {error && (() => {
+        const isScanResult = /^[✅⏳⏹]/u.test(error);
+        const resultPerson = isScanResult && resultPersonId ? people.find((p) => p.id === resultPersonId) : null;
+        const tone = error.startsWith("✅") ? "bg-green-50 border border-green-200 text-green-800"
+          : error.startsWith("⏳") || error.startsWith("⏹") ? "bg-amber-50 border border-amber-200 text-amber-800"
+          : "bg-red-50 border border-red-200 text-red-700";
+        return (
+          <div
+            className={`mx-2 my-1 p-2 rounded text-sm flex items-start gap-1 ${tone} ${resultPerson ? "cursor-pointer select-none" : ""}`}
+            onDoubleClick={resultPerson ? () => openGallery(resultPerson) : undefined}
+            title={resultPerson ? t(`双击查看 ${resultPerson.name} 的匹配照片`, `Double-click to see ${resultPerson.name}'s matched photos`) : undefined}
+          >
+            <span className="flex-1">
+              {error}
+              {resultPerson && (
+                <span className="block text-[12px] opacity-75 mt-0.5">{t("（双击查看匹配的照片）", "(double-click to see the matched photos)")}</span>
+              )}
+            </span>
+            <button onClick={() => { setError(null); setResultPersonId(null); }} className="ml-1 opacity-50 hover:opacity-100 shrink-0">×</button>
+          </div>
+        );
+      })()}
 
       {filteredPersonId && (
         <div className="mx-2 mt-1 flex items-center justify-between">
@@ -13276,7 +13721,7 @@ const PeoplePanel = ({ onFilterPerson, filteredPersonId, tree }) => {
                 {t("选择要扫描的文件夹", "Choose folders to scan")}
               </h2>
               <p className="text-[13px] text-stone-700 mt-1">
-                {t("扫描选中文件夹及其所有子文件夹中的照片。不选则扫描全库。", "Scans photos in the selected folders and all their subfolders. If none are selected, the whole library is scanned.")}
+                {t("扫描选中文件夹及其所有子文件夹中的照片。已默认勾选当前文件夹。", "Scans photos in the selected folders and all their subfolders. The folder you're in is ticked by default.")}
               </p>
             </div>
             <div className="overflow-y-auto flex-1 px-3 py-2">
@@ -13304,7 +13749,13 @@ const PeoplePanel = ({ onFilterPerson, filteredPersonId, tree }) => {
                 {t("取消", "Cancel")}
               </button>
               <button
-                onClick={() => handleRecognize(scanDialog, [])}
+                onClick={() => {
+                  if (!window.confirm(t(
+                    `确定扫描全库吗？\n\n全库共有约 ${libraryImageCount} 张照片。首次分析每张照片约需 1 秒，可能需要很长时间（每次最多运行 10 分钟，进度会保存，可多次扫描继续）。\n\n只想扫描部分照片，请取消并勾选文件夹。`,
+                    `Scan the whole library?\n\nIt has about ${libraryImageCount} photos. Analysing a photo for the first time takes about 1 second each, so this can take a long time (each run stops after 10 minutes; progress is saved, so you can scan again to continue).\n\nTo scan only some photos, cancel and tick folders instead.`
+                  ))) return;
+                  handleRecognize(scanDialog, []);
+                }}
                 disabled={recognizing !== null}
                 className="px-3 py-1.5 text-sm border border-stone-300 hover:bg-stone-50 text-stone-700 rounded disabled:opacity-50">
                 {t("扫描全库", "Scan whole library")}
@@ -13313,7 +13764,9 @@ const PeoplePanel = ({ onFilterPerson, filteredPersonId, tree }) => {
                 onClick={() => handleRecognize(scanDialog, Array.from(scanNodeIds))}
                 disabled={recognizing !== null || scanNodeIds.size === 0}
                 className="px-3 py-1.5 text-sm bg-amber-600 hover:bg-amber-700 text-white rounded disabled:opacity-50">
-                {t("扫描选中文件夹", "Scan selected folders")} {scanNodeIds.size > 0 ? `(${scanNodeIds.size})` : ""}
+                {t("扫描选中文件夹", "Scan selected folders")} {scanNodeIds.size > 0
+                  ? t(`（${scanNodeIds.size} 个文件夹，${scanPhotoCount} 张照片）`, `(${scanNodeIds.size} folders, ${scanPhotoCount} photos)`)
+                  : ""}
               </button>
             </div>
           </div>
@@ -13401,6 +13854,11 @@ const PeoplePanel = ({ onFilterPerson, filteredPersonId, tree }) => {
                 {gallery.personName} — {t(`${gallery.docIds.length} 张照片`, `${gallery.docIds.length} photos`)}
               </span>
               <div className="flex items-center gap-2">
+                {gallery.folderError && (
+                  <span className="text-sm text-red-700 bg-red-50 border border-red-200 rounded px-2 py-0.5 max-w-[260px] truncate" title={gallery.folderError}>
+                    {gallery.folderError}
+                  </span>
+                )}
                 {gallery.folderCreated ? (
                   <span className="text-sm text-green-700 bg-green-50 border border-green-200 rounded px-2 py-0.5">
                     {t(`✓ 已创建"人脸匹配/${gallery.personName}"文件夹（${gallery.added} 张）`, `✓ Created folder "人脸匹配/${gallery.personName}" (${gallery.added} photos)`)}
@@ -16387,6 +16845,112 @@ function DMS({ storagePath, onChangeFolder }) {
     setAiFillSelectedIds(new Set());
   };
 
+  // "AI: detect service date" (Gemini, opt-in) -- re-scans already-stored
+  // documents for the date a service/exam was performed, explicitly
+  // excluding date of birth. The upload-time date detector
+  // (_scan_uploaded_doc_date / find_document_date, page 1 only) is a pure
+  // regex/label scan with no way to tell a service date from a date of
+  // birth apart on e.g. a lab report; this calls the AI-only
+  // /detect-service-date-ai route instead. Two entry points feed the same
+  // scan: selecting documents in the open folder (serviceDateSelectMode,
+  // mirrors aiFillSelectMode above) or selecting whole subfolders via the
+  // existing folderSelectMode (see runServiceDateScanForFolders below,
+  // reusing collectAllDocIds for the recursive walk). Writes into
+  // doc.docDate, NOT doc.metadata, so review/apply reuses the exact same
+  // VerifyDatesDialog/applyVerifiedDates/verifyDatesQueue flow the
+  // upload-time detector already uses -- no separate dialog needed.
+  const [serviceDateSelectMode, setServiceDateSelectMode] = useState(false);
+  const [serviceDateSelectedIds, setServiceDateSelectedIds] = useState(new Set());
+  // { running, done, total, notFoundCount, error }
+  const [serviceDateScan, setServiceDateScan] = useState(null);
+  useEffect(() => {
+    setServiceDateSelectMode(false);
+    setServiceDateSelectedIds(new Set());
+  }, [selectedId]);
+
+  // Scans `docIds` sequentially, then opens the shared VerifyDatesDialog
+  // with whatever dates it found; docs where no service date was found are
+  // left out of the dialog and just counted (surfaced via notFoundCount).
+  const runServiceDateScan = async (docIds) => {
+    if (!docIds.length) return;
+    setServiceDateScan({ running: true, done: 0, total: docIds.length, notFoundCount: 0, error: "" });
+    const found = [];
+    let notFoundCount = 0;
+    let firstError = "";
+    for (const docId of docIds) {
+      const doc = docIndexRef.current.find((e) => e.id === docId);
+      const name = doc?.name || docId;
+      try {
+        const r = await StorageAdapter.detectServiceDateAI(docId);
+        if (r.found && r.date) {
+          found.push({ id: docId, name, docDate: r.date, docDateRaw: r.raw || "" });
+        } else {
+          notFoundCount++;
+        }
+      } catch (e) {
+        notFoundCount++;
+        if (!firstError) firstError = e.message || String(e);
+      }
+      setServiceDateScan((s) => (s ? { ...s, done: s.done + 1, notFoundCount } : s));
+    }
+    setServiceDateScan((s) => (s ? { ...s, running: false } : s));
+    setServiceDateSelectMode(false);
+    setServiceDateSelectedIds(new Set());
+    setFolderSelectMode(false);
+    setFolderSelectedIds(new Set());
+    if (found.length) setVerifyDatesQueue(found);
+    // The select-mode toolbar (and its live "N / total" counter) disappears
+    // as soon as select mode turns off above, so a completion summary needs
+    // its own one-off notice -- mirrors handleBulkDeleteFolders's alert() for
+    // this same reason.
+    if (firstError && found.length === 0) {
+      alert(t("识别失败：", "Detection failed: ") + firstError);
+    } else if (notFoundCount > 0) {
+      alert(t(
+        `已识别 ${found.length} 份文档的服务日期；另有 ${notFoundCount} 份未能识别（文档中未出现相关日期，或读取出错）。`,
+        `Detected a service date for ${found.length} document(s); ${notFoundCount} could not be detected (no matching date found, or a read error).`
+      ));
+    }
+  };
+
+  const runServiceDateScanForSelection = () => runServiceDateScan(Array.from(serviceDateSelectedIds));
+
+  const runServiceDateScanForFolders = () => {
+    const ids = topLevelFolderSelection(Array.from(folderSelectedIds));
+    const targets = ids.map((id) => findNode(tree, id)).filter(Boolean);
+    const docIds = targets.flatMap((n) => collectAllDocIds(n)).filter((id) => {
+      const d = docIndexRef.current.find((e) => e.id === id);
+      return d && (d.mime === "application/pdf" || (d.mime || "").startsWith("image/"));
+    });
+    runServiceDateScan(docIds);
+  };
+
+  // "Batch add description" -- set the same description on several selected
+  // documents at once. No AI/per-doc network round trip needed (unlike
+  // AI-fill/service-date above), so there's no scan/progress step: just a
+  // select-mode + a small dialog for the text, applied in one batched write
+  // via handleBulkSaveDescription.
+  const [descSelectMode, setDescSelectMode] = useState(false);
+  const [descSelectedIds, setDescSelectedIds] = useState(new Set());
+  const [descDialog, setDescDialog] = useState(null); // { text, applying }
+  useEffect(() => {
+    setDescSelectMode(false);
+    setDescSelectedIds(new Set());
+  }, [selectedId]);
+
+  const openDescDialog = () => setDescDialog({ text: "", applying: false });
+
+  const applyBulkDescription = async () => {
+    if (!descDialog) return;
+    const docIds = Array.from(descSelectedIds);
+    if (!docIds.length) return;
+    setDescDialog((d) => (d ? { ...d, applying: true } : d));
+    await handleBulkSaveDescription(docIds, descDialog.text);
+    setDescDialog(null);
+    setDescSelectMode(false);
+    setDescSelectedIds(new Set());
+  };
+
   // Near-duplicate photo check -- lets the user multi-select a handful of
   // photos in a normal folder and find ones that are near-identical to each
   // other (recompressed, tiny crop, brightness tweak, burst shots), grouped
@@ -17126,11 +17690,18 @@ function DMS({ storagePath, onChangeFolder }) {
     setDraggingDocId(null);
   };
 
-  const handleDocDropOnNode = async (targetNodeId) => {
+  // { link: true } (Alt/Option held on drop) links the dragged document(s)
+  // into the target folder and leaves them where they are; otherwise they
+  // move there.
+  const handleDocDropOnNode = async (targetNodeId, { link = false } = {}) => {
     const docId = draggingDocIdRef.current;
     const sourceNodeId = draggingDocSourceNodeIdRef.current;
     handleDocDragEnd();
     if (!docId || !sourceNodeId || sourceNodeId === targetNodeId) return;
+    if (link) {
+      await linkDocsToNode(Array.isArray(docId) ? docId : [docId], targetNodeId);
+      return;
+    }
     await moveDocToNode(docId, sourceNodeId, targetNodeId);
   };
 
@@ -18634,6 +19205,14 @@ function DMS({ storagePath, onChangeFolder }) {
     setViewerDoc((cur) => (cur && cur.id === docId ? { ...cur, metadata } : cur));
   };
 
+  // Manual metadata edits from the viewer's "Edit metadata" panel — same
+  // persistence as handleSaveParams, but honors the per-folder override
+  // (nodeId) the way the tree view's metadata editor does.
+  const handleUpdateDocMeta = async (docId, metadata, nodeId) => {
+    await updateDocMetadata(docId, metadata, nodeId);
+    setViewerDoc((cur) => (cur && cur.id === docId ? { ...cur, metadata } : cur));
+  };
+
   // Save a block of viewer side-panel text (description / OCR output / AI
   // answer) as a brand-new .txt document filed into the same folder, then
   // reload the tree + index so it shows up in the folder immediately.
@@ -18658,6 +19237,18 @@ function DMS({ storagePath, onChangeFolder }) {
     );
     await persistIndex(newIndex);
     setViewerDoc((cur) => (cur && cur.id === docId ? { ...cur, description: clean } : cur));
+  };
+
+  // Set the same description on several documents at once (one batched
+  // index write, like applyVerifiedDates) -- the "批量添加描述" feature.
+  // Replaces each doc's existing description outright, same as the
+  // single-document "Add description" button.
+  const handleBulkSaveDescription = async (docIds, description) => {
+    const clean = description || "";
+    const idSet = new Set(docIds);
+    const newIndex = docIndex.map((e) => idSet.has(e.id) ? { ...e, description: clean } : e);
+    await persistIndex(newIndex);
+    setViewerDoc((cur) => (cur && idSet.has(cur.id) ? { ...cur, description: clean } : cur));
   };
 
   // Persist a folder/component's Description field (node.description lives
@@ -19080,6 +19671,21 @@ function DMS({ storagePath, onChangeFolder }) {
                       {t(`已选 ${folderSelectedIds.size} 个文件夹`, `${folderSelectedIds.size} folder(s) selected`)}
                     </span>
                     <div className="flex items-center gap-1.5">
+                      {serviceDateScan?.running ? (
+                        <span className="text-[12px] text-stone-700 flex items-center gap-1">
+                          <Loader size={11} className="animate-spin" />
+                          {t(`识别中… ${serviceDateScan.done} / ${serviceDateScan.total}`, `Detecting… ${serviceDateScan.done} / ${serviceDateScan.total}`)}
+                        </span>
+                      ) : (
+                        <button
+                          onClick={runServiceDateScanForFolders}
+                          disabled={folderSelectedIds.size === 0 || folderBulkBusy}
+                          className="text-[12px] px-2 py-1 border border-cyan-300 hover:bg-cyan-50 hover:border-cyan-400 text-cyan-700 rounded flex items-center gap-1 disabled:opacity-40"
+                          title={t("对选中文件夹（含所有子文件夹）内的每份 PDF/图片，用 AI 识别其服务/检验日期（排除出生日期），供你核实后再写入", "For every PDF/image under the selected folders (including all subfolders), have AI detect the service/exam date (excluding date of birth), for you to review before anything is written")}
+                        >
+                          <Sparkles size={11} /> {t("AI 识别服务日期", "AI: Detect service date")}
+                        </button>
+                      )}
                       <button
                         onClick={handleBulkDownloadFolders}
                         disabled={folderSelectedIds.size === 0 || folderBulkBusy}
@@ -19174,6 +19780,8 @@ function DMS({ storagePath, onChangeFolder }) {
                 onFilterPerson={(pid) => { setFacePersonFilter(pid); }}
                 filteredPersonId={facePersonFilter}
                 tree={tree}
+                currentNodeId={selectedId}
+                docIndex={docIndex}
               />
             )}
           </aside>
@@ -19640,7 +20248,7 @@ function DMS({ storagePath, onChangeFolder }) {
                 {!isRecycleBinNode && (selectedNode.documents || []).length > 0 && (
                   <div className="flex items-center justify-between mb-3 px-3 py-2 border border-stone-300 rounded bg-stone-50">
                     <div className="flex items-center gap-2">
-                      {!downloadSelectMode && !aiFillSelectMode && !dupeSelectMode ? (
+                      {!downloadSelectMode && !aiFillSelectMode && !dupeSelectMode && !serviceDateSelectMode && !descSelectMode ? (
                         <>
                           <button
                             onClick={() => { setDownloadSelectMode(true); setDownloadSelectedIds(new Set()); }}
@@ -19649,11 +20257,25 @@ function DMS({ storagePath, onChangeFolder }) {
                             <CheckSquare size={12} /> {t("多选", "Select")}
                           </button>
                           <button
+                            onClick={() => { setDescSelectMode(true); setDescSelectedIds(new Set()); }}
+                            className="text-sm px-3 py-1.5 border border-fuchsia-300 hover:bg-fuchsia-50 hover:border-fuchsia-400 text-fuchsia-700 rounded flex items-center gap-1.5"
+                            title={t("批量选择多份文档，为它们统一填写同一段描述（会替换各自原有的描述）", "Multi-select documents and give them all the same description (replaces each one's existing description)")}
+                          >
+                            <Edit2 size={12} /> {t("批量添加描述", "Batch add description")}
+                          </button>
+                          <button
                             onClick={() => { setAiFillSelectMode(true); setAiFillSelectedIds(new Set()); }}
                             className="text-sm px-3 py-1.5 border border-purple-300 hover:bg-purple-50 hover:border-purple-400 text-purple-700 rounded flex items-center gap-1.5"
                             title={t("批量选择多份文档，用 AI 从中读取某个参数的值并填入", "Multi-select documents and have AI read one parameter's value off each, to fill in")}
                           >
                             <Sparkles size={12} /> {t("AI 填参数", "AI-fill parameter")}
+                          </button>
+                          <button
+                            onClick={() => { setServiceDateSelectMode(true); setServiceDateSelectedIds(new Set()); }}
+                            className="text-sm px-3 py-1.5 border border-cyan-300 hover:bg-cyan-50 hover:border-cyan-400 text-cyan-700 rounded flex items-center gap-1.5"
+                            title={t("批量选择多份 PDF/图片，用 AI 识别其服务/检验日期（排除出生日期），供你核实后写入文档日期", "Multi-select PDFs/images and have AI detect the service/exam date on each (excluding date of birth), for you to review before it's written to the document's date")}
+                          >
+                            <Sparkles size={12} /> {t("AI 识别服务日期", "AI: Detect service date")}
                           </button>
                           <button
                             onClick={openBatchRenameDialog}
@@ -19696,6 +20318,34 @@ function DMS({ storagePath, onChangeFolder }) {
                           >{t("清除", "Clear")}</button>
                           <span className="text-[13px] text-stone-700">
                             {t(`已选 ${aiFillSelectedIds.size} / ${visibleDocs.length}`, `${aiFillSelectedIds.size} / ${visibleDocs.length} selected`)}
+                          </span>
+                        </>
+                      ) : serviceDateSelectMode ? (
+                        <>
+                          <button
+                            onClick={() => setServiceDateSelectedIds(new Set(visibleDocs.filter((d) => d.mime === "application/pdf" || d.mime?.startsWith("image/")).map((d) => d.id)))}
+                            className="text-sm px-3 py-1.5 border border-cyan-300 hover:bg-cyan-50 hover:border-cyan-400 text-cyan-700 rounded"
+                          >{t("全选", "Select all")}</button>
+                          <button
+                            onClick={() => setServiceDateSelectedIds(new Set())}
+                            className="text-sm px-3 py-1.5 border border-stone-300 hover:bg-stone-100 text-stone-700 rounded"
+                          >{t("清除", "Clear")}</button>
+                          <span className="text-[13px] text-stone-700">
+                            {t(`已选 ${serviceDateSelectedIds.size} / ${visibleDocs.length}`, `${serviceDateSelectedIds.size} / ${visibleDocs.length} selected`)}
+                          </span>
+                        </>
+                      ) : descSelectMode ? (
+                        <>
+                          <button
+                            onClick={() => setDescSelectedIds(new Set(visibleDocs.map((d) => d.id)))}
+                            className="text-sm px-3 py-1.5 border border-fuchsia-300 hover:bg-fuchsia-50 hover:border-fuchsia-400 text-fuchsia-700 rounded"
+                          >{t("全选", "Select all")}</button>
+                          <button
+                            onClick={() => setDescSelectedIds(new Set())}
+                            className="text-sm px-3 py-1.5 border border-stone-300 hover:bg-stone-100 text-stone-700 rounded"
+                          >{t("清除", "Clear")}</button>
+                          <span className="text-[13px] text-stone-700">
+                            {t(`已选 ${descSelectedIds.size} / ${visibleDocs.length}`, `${descSelectedIds.size} / ${visibleDocs.length} selected`)}
                           </span>
                         </>
                       ) : (
@@ -19772,6 +20422,51 @@ function DMS({ storagePath, onChangeFolder }) {
                         </button>
                       </div>
                     )}
+                    {serviceDateSelectMode && (
+                      <div className="flex items-center gap-2">
+                        {serviceDateScan?.running ? (
+                          <span className="text-[13px] text-stone-700 flex items-center gap-1.5">
+                            <Loader size={12} className="animate-spin" />
+                            {t(`识别中… ${serviceDateScan.done} / ${serviceDateScan.total}`, `Detecting… ${serviceDateScan.done} / ${serviceDateScan.total}`)}
+                          </span>
+                        ) : (
+                          <>
+                            <button
+                              onClick={() => { setServiceDateSelectMode(false); setServiceDateSelectedIds(new Set()); }}
+                              className="text-sm px-3 py-1.5 border border-stone-300 hover:bg-stone-100 text-stone-700 rounded flex items-center gap-1.5"
+                            >
+                              <X size={12} /> {t("取消", "Cancel")}
+                            </button>
+                            <button
+                              onClick={runServiceDateScanForSelection}
+                              disabled={serviceDateSelectedIds.size === 0}
+                              className="text-sm px-3 py-1.5 border border-cyan-400 bg-cyan-50 hover:bg-cyan-100 text-cyan-700 rounded flex items-center gap-1.5 disabled:opacity-40"
+                              title={t("AI 逐份读取选中文档，识别服务/检验日期（排除出生日期），供你核实后再写入", "AI reads each selected document to detect the service/exam date (excluding date of birth), for you to review before anything is written")}
+                            >
+                              <Sparkles size={12} /> {t("识别所选", "Detect selected")} ({serviceDateSelectedIds.size})
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    )}
+                    {descSelectMode && (
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => { setDescSelectMode(false); setDescSelectedIds(new Set()); }}
+                          className="text-sm px-3 py-1.5 border border-stone-300 hover:bg-stone-100 text-stone-700 rounded flex items-center gap-1.5"
+                        >
+                          <X size={12} /> {t("取消", "Cancel")}
+                        </button>
+                        <button
+                          onClick={openDescDialog}
+                          disabled={descSelectedIds.size === 0}
+                          className="text-sm px-3 py-1.5 border border-fuchsia-400 bg-fuchsia-50 hover:bg-fuchsia-100 text-fuchsia-700 rounded flex items-center gap-1.5 disabled:opacity-40"
+                          title={t("为选中的文档统一填写同一段描述", "Write one description and apply it to all the selected documents")}
+                        >
+                          <Edit2 size={12} /> {t("添加描述", "Add description")} ({descSelectedIds.size})
+                        </button>
+                      </div>
+                    )}
                     {dupeSelectMode && (
                       <div className="flex items-center gap-2">
                         <button
@@ -19808,6 +20503,23 @@ function DMS({ storagePath, onChangeFolder }) {
                   {visibleDocs.map((doc) => {
                     const refs = refMap.get(doc.id) || [];
                     const otherRefs = refs.filter((id) => id !== selectedId).length;
+                    const docIsDragging = Array.isArray(draggingDocId) ? draggingDocId.includes(doc.id) : draggingDocId === doc.id;
+                    // Dragging a checked document while several are checked
+                    // moves the whole checked set; dragging any other one
+                    // (or a checked one when it's the only one checked)
+                    // moves just that document. Shared by list and grid view.
+                    const startDocDrag = () => {
+                      const activeSelectedIds = isRecycleBinNode ? recycleSelectedIds
+                        : dupeSelectMode ? dupeSelectedIds
+                        : aiFillSelectMode ? aiFillSelectedIds
+                        : serviceDateSelectMode ? serviceDateSelectedIds
+                        : descSelectMode ? descSelectedIds
+                        : downloadSelectedIds;
+                      const dragIds = activeSelectedIds.has(doc.id) && activeSelectedIds.size > 1
+                        ? Array.from(activeSelectedIds)
+                        : doc.id;
+                      handleDocDragStart(dragIds, selectedId);
+                    };
                     // Recycle bin always stays in the detailed list view (its
                     // own permanent-delete select flow lives in DocumentCard) —
                     // the view toggle is hidden there for the same reason.
@@ -19826,9 +20538,9 @@ function DMS({ storagePath, onChangeFolder }) {
                             n.has(doc.id) ? n.delete(doc.id) : n.add(doc.id);
                             return n;
                           })}
-                          selectMode={downloadSelectMode || aiFillSelectMode || (dupeSelectMode && doc.mime?.startsWith("image/"))}
-                          selected={dupeSelectMode ? dupeSelectedIds.has(doc.id) : aiFillSelectMode ? aiFillSelectedIds.has(doc.id) : downloadSelectedIds.has(doc.id)}
-                          onToggleSelect={() => (dupeSelectMode ? setDupeSelectedIds : aiFillSelectMode ? setAiFillSelectedIds : setDownloadSelectedIds)((prev) => {
+                          selectMode={downloadSelectMode || aiFillSelectMode || descSelectMode || (dupeSelectMode && doc.mime?.startsWith("image/")) || (serviceDateSelectMode && (doc.mime === "application/pdf" || doc.mime?.startsWith("image/")))}
+                          selected={dupeSelectMode ? dupeSelectedIds.has(doc.id) : aiFillSelectMode ? aiFillSelectedIds.has(doc.id) : serviceDateSelectMode ? serviceDateSelectedIds.has(doc.id) : descSelectMode ? descSelectedIds.has(doc.id) : downloadSelectedIds.has(doc.id)}
+                          onToggleSelect={() => (dupeSelectMode ? setDupeSelectedIds : aiFillSelectMode ? setAiFillSelectedIds : serviceDateSelectMode ? setServiceDateSelectedIds : descSelectMode ? setDescSelectedIds : setDownloadSelectedIds)((prev) => {
                             const n = new Set(prev);
                             n.has(doc.id) ? n.delete(doc.id) : n.add(doc.id);
                             return n;
@@ -19837,6 +20549,9 @@ function DMS({ storagePath, onChangeFolder }) {
                           urgency={urgencyTier(doc.dueDate)}
                           isLastWorked={lastWorkedDocId === doc.id}
                           onMarkWorked={() => setLastWorkedDocId(doc.id)}
+                          isDragging={docIsDragging}
+                          onDragStart={startDocDrag}
+                          onDragEnd={handleDocDragEnd}
                         />
                       );
                     }
@@ -19869,34 +20584,26 @@ function DMS({ storagePath, onChangeFolder }) {
                         })}
                         selectMode={isRecycleBinNode ? recycleSelectMode
                           : dupeSelectMode ? doc.mime?.startsWith("image/")
-                          : (downloadSelectMode || aiFillSelectMode)}
+                          : serviceDateSelectMode ? (doc.mime === "application/pdf" || doc.mime?.startsWith("image/"))
+                          : (downloadSelectMode || aiFillSelectMode || descSelectMode)}
                         selected={isRecycleBinNode ? recycleSelectedIds.has(doc.id)
                           : dupeSelectMode ? dupeSelectedIds.has(doc.id)
                           : aiFillSelectMode ? aiFillSelectedIds.has(doc.id)
+                          : serviceDateSelectMode ? serviceDateSelectedIds.has(doc.id)
+                          : descSelectMode ? descSelectedIds.has(doc.id)
                           : downloadSelectedIds.has(doc.id)}
                         onToggleSelect={() => (isRecycleBinNode ? setRecycleSelectedIds
                           : dupeSelectMode ? setDupeSelectedIds
                           : aiFillSelectMode ? setAiFillSelectedIds
+                          : serviceDateSelectMode ? setServiceDateSelectedIds
+                          : descSelectMode ? setDescSelectedIds
                           : setDownloadSelectedIds)((prev) => {
                           const n = new Set(prev);
                           n.has(doc.id) ? n.delete(doc.id) : n.add(doc.id);
                           return n;
                         })}
-                        isDragging={Array.isArray(draggingDocId) ? draggingDocId.includes(doc.id) : draggingDocId === doc.id}
-                        onDragStart={() => {
-                          // Dragging a checked card while several are checked
-                          // moves the whole checked set; dragging any other
-                          // card (or a checked one when it's the only one
-                          // checked) moves just that document.
-                          const activeSelectedIds = isRecycleBinNode ? recycleSelectedIds
-                            : dupeSelectMode ? dupeSelectedIds
-                            : aiFillSelectMode ? aiFillSelectedIds
-                            : downloadSelectedIds;
-                          const dragIds = activeSelectedIds.has(doc.id) && activeSelectedIds.size > 1
-                            ? Array.from(activeSelectedIds)
-                            : doc.id;
-                          handleDocDragStart(dragIds, selectedId);
-                        }}
+                        isDragging={docIsDragging}
+                        onDragStart={startDocDrag}
                         onDragEnd={handleDocDragEnd}
                         isLastWorked={lastWorkedDocId === doc.id}
                         onMarkWorked={() => setLastWorkedDocId(doc.id)}
@@ -19924,6 +20631,7 @@ function DMS({ storagePath, onChangeFolder }) {
         onSaveParams={handleSaveParams}
         onSaveDescription={handleSaveDescription}
         onSaveTextAsDoc={handleSaveTextAsDoc}
+        onUpdateMeta={viewerDoc ? (m) => handleUpdateDocMeta(viewerDoc.id, m, selectedId) : undefined}
         derivedDocs={viewerDoc ? docIndex.filter((e) => e.derivedFrom === viewerDoc.id) : []}
         onOpenAISettings={() => setShowAISettings(true)}
         nodeId={selectedId}
@@ -20124,6 +20832,53 @@ function DMS({ storagePath, onChangeFolder }) {
         onConfirm={applyVerifiedDates}
         onClose={() => setVerifyDatesQueue(null)}
       />
+
+      {descDialog && (
+        <div
+          className="fixed inset-0 bg-stone-900/70 z-50 flex items-center justify-center p-4"
+          onClick={() => !descDialog.applying && setDescDialog(null)}
+        >
+          <div className="bg-white w-full max-w-lg rounded shadow-2xl flex flex-col" onClick={(e) => e.stopPropagation()}>
+            <div className="px-5 py-4 border-b border-stone-200 flex items-center justify-between shrink-0">
+              <h2 className="text-base font-semibold text-stone-900 flex items-center gap-1.5">
+                <Edit2 size={14} className="text-fuchsia-600" />
+                {t("批量添加描述", "Batch add description")} ({descSelectedIds.size})
+              </h2>
+              <button onClick={() => setDescDialog(null)} className="text-stone-600 hover:text-stone-800 p-1"><X size={16} /></button>
+            </div>
+            <div className="px-5 py-2 text-sm text-stone-700 border-b border-stone-100">
+              {t("这段描述会替换所选每份文档各自原有的描述。", "This will replace each selected document's existing description.")}
+            </div>
+            <div className="p-5">
+              <textarea
+                autoFocus
+                value={descDialog.text}
+                onChange={(e) => setDescDialog((d) => ({ ...d, text: e.target.value }))}
+                placeholder={t("输入要应用到所有选中文档的描述…", "Enter the description to apply to all selected documents…")}
+                rows={5}
+                className="w-full text-sm px-3 py-2 border border-stone-300 rounded focus:outline-none focus:border-fuchsia-500"
+              />
+            </div>
+            <div className="px-5 py-3 border-t border-stone-200 flex items-center justify-end gap-2 shrink-0">
+              <button
+                onClick={() => setDescDialog(null)}
+                disabled={descDialog.applying}
+                className="text-sm px-3 py-1.5 border border-stone-300 hover:bg-stone-100 rounded disabled:opacity-40"
+              >
+                {t("取消", "Cancel")}
+              </button>
+              <button
+                onClick={applyBulkDescription}
+                disabled={descDialog.applying}
+                className="text-sm px-3 py-1.5 bg-fuchsia-600 hover:bg-fuchsia-700 text-white rounded disabled:opacity-40 flex items-center gap-1.5"
+              >
+                {descDialog.applying && <Loader size={12} className="animate-spin" />}
+                {t(`应用到 ${descSelectedIds.size} 份文档`, `Apply to ${descSelectedIds.size} document(s)`)}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <KeyParametersDialog
         open={showKeyParameters}
