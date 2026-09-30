@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DMS 文件管理系统 · 下载</title>
+<meta name="description" content="DMS 文件管理系统 - Mac / Windows 客户端下载与用户手册">
+<style>
+  :root {
+    --bg: #fafaf9;
+    --card: #ffffff;
+    --border: #e7e5e4;
+    --text: #292524;
+    --muted: #78716c;
+    --accent: #b45309;
+    --accent-bg: #fef3c7;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+  }
+  .wrap { max-width: 720px; margin: 0 auto; padding: 32px 20px 64px; }
+  header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; }
+  h1 { font-size: 22px; margin: 0; }
+  .lang-toggle { display: flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; flex-shrink: 0; }
+  .lang-toggle button {
+    border: none; background: var(--card); color: var(--muted);
+    padding: 6px 12px; font-size: 13px; cursor: pointer;
+  }
+  .lang-toggle button.active { background: #292524; color: #fff; }
+  .tagline { color: var(--muted); font-size: 15px; margin: -8px 0 28px; }
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+    padding: 24px; margin-bottom: 20px;
+  }
+  .card h2 { font-size: 15px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 14px; }
+  .buttons { display: flex; gap: 12px; flex-wrap: wrap; }
+  .btn {
+    flex: 1; min-width: 180px; display: flex; align-items: center; justify-content: center; gap: 8px;
+    background: var(--accent); color: #fff; text-decoration: none; font-weight: 600; font-size: 15px;
+    padding: 14px 18px; border-radius: 8px; text-align: center;
+  }
+  .btn:hover { background: #92400e; }
+  .btn.secondary { background: #fff; color: var(--accent); border: 1.5px solid var(--accent); }
+  .btn.secondary:hover { background: var(--accent-bg); }
+  .note {
+    font-size: 13px; color: var(--muted); background: var(--accent-bg); border-radius: 8px;
+    padding: 10px 14px; margin-top: 14px;
+  }
+  footer { text-align: center; color: var(--muted); font-size: 12px; margin-top: 32px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>DMS 文件管理系统</h1>
+    <div class="lang-toggle">
+      <button id="btn-zh" class="active" onclick="setLang('zh')">中文</button>
+      <button id="btn-en" onclick="setLang('en')">EN</button>
+    </div>
+  </header>
+
+  <p class="tagline" data-lang="zh">工程图纸与文档管理系统 — 按装配层级组织，本地存储，元数据检索。</p>
+  <p class="tagline" data-lang="en">Document management for engineering assemblies — hierarchical folders, local storage, metadata search.</p>
+
+  <div class="card">
+    <h2 data-lang="zh">下载客户端</h2>
+    <h2 data-lang="en">Download</h2>
+    <div class="buttons" data-lang="zh">
+      <a class="btn" href="https://github.com/davidpang2004/PMS-002/releases/latest/download/DMS-Mac.zip">下载 Mac 版 (.app)</a>
+      <a class="btn" href="https://github.com/davidpang2004/PMS-002/releases/latest/download/DMS-Windows.zip">下载 Windows 版 (.exe)</a>
+    </div>
+    <div class="buttons" data-lang="en">
+      <a class="btn" href="https://github.com/davidpang2004/PMS-002/releases/latest/download/DMS-Mac.zip">Download for Mac (.app)</a>
+      <a class="btn" href="https://github.com/davidpang2004/PMS-002/releases/latest/download/DMS-Windows.zip">Download for Windows (.exe)</a>
+    </div>
+    <p class="note" data-lang="zh">下载后是一个 .zip 压缩包，解压后即可运行。Mac 首次打开如提示"来自身份不明的开发者"，请右键点击应用 → 打开。</p>
+    <p class="note" data-lang="en">The download is a .zip — unzip it and run the app inside. On first launch on Mac, if you see "unidentified developer", right-click the app → Open.</p>
+  </div>
+
+  <div class="card">
+    <h2 data-lang="zh">用户手册</h2>
+    <h2 data-lang="en">User manual</h2>
+    <div class="buttons" data-lang="zh">
+      <a class="btn secondary" href="https://github.com/davidpang2004/PMS-002/releases/latest/download/DMS-User-Manual-CN.docx">下载中文手册 (.docx)</a>
+      <a class="btn secondary" href="https://github.com/davidpang2004/PMS-002/releases/latest/download/DMS-User-Manual-EN.docx">English manual (.docx)</a>
+    </div>
+    <div class="buttons" data-lang="en">
+      <a class="btn secondary" href="https://github.com/davidpang2004/PMS-002/releases/latest/download/DMS-User-Manual-EN.docx">Download manual (.docx)</a>
+      <a class="btn secondary" href="https://github.com/davidpang2004/PMS-002/releases/latest/download/DMS-User-Manual-CN.docx">中文手册 (.docx)</a>
+    </div>
+  </div>
+
+  <footer>
+    <span data-lang="zh">DMS 是本地运行的桌面应用，不会上传您的文件。</span>
+    <span data-lang="en">DMS runs locally on your computer — your files are never uploaded anywhere.</span>
+  </footer>
+
+</div>
+<script>
+  function setLang(lang) {
+    document.documentElement.lang = lang;
+    document.getElementById('btn-zh').classList.toggle('active', lang === 'zh');
+    document.getElementById('btn-en').classList.toggle('active', lang === 'en');
+    document.querySelectorAll('[data-lang]').forEach(el => {
+      const visible = el.getAttribute('data-lang') === lang;
+      el.style.display = visible ? (el.classList.contains('buttons') ? 'flex' : '') : 'none';
+    });
+  }
+  setLang('zh');
+</script>
+</body>
+</html>
