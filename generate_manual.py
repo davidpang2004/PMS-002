@@ -201,6 +201,7 @@ toc_entries = [
     ("3.5", "Description: Voice Input, AI Cleanup, and PDF Export"),
     ("3.6", "Login Credentials (can save multiple sets)"), ("3.7", "Text Tree Preview"),
     ("3.8", "Batch Folder Operations (Multi-select)"), ("3.9", "Setting a Photo Root Folder"),
+    ("3.10", "Pasting Screenshots Directly into a Description"),
     ("4", "Working with Documents"), ("4.1", "Uploading Files"), ("4.2", "Uploading a Folder"),
     ("4.3", "Pasting Screenshots"), ("4.4", "Linking Existing Documents"),
     ("4.5", "Viewing a Document"), ("4.6", "Downloading, Sending, and Deleting Documents"),
@@ -208,6 +209,9 @@ toc_entries = [
     ("4.9", "Ask AI About a Document, or One-Click Polish"), ("4.10", "Convert to PDF (Batch)"),
     ("4.11", "On-Disk Filenames and Recovering Deletions"),
     ("4.12", "Batch Document Actions (Multi-select: Download, Batch Rename, Find Near-Duplicates)"),
+    ("4.13", "Upload Eq Record (AN^SN^PN naming)"), ("4.14", "QC Review and the QC Review Report"),
+    ("4.15", "Convert HEIC Photos to JPG"), ("4.16", "PDF Translation, Find Text, and Edit Metadata"),
+    ("4.17", "AI: Detect Service Date"),
     ("5", "OCR - Extract Text from Documents"), ("5.1", "How OCR Works"),
     ("5.2", "Running OCR"), ("5.3", "Saving OCR Text for Search"),
     ("6", "Key Parameter Extraction"), ("6.1", "What Are Key Parameters?"),
@@ -440,6 +444,12 @@ numbered("From then on, uploading a photo anywhere in the tree (as long as you'r
 numbered("To undo it, right-click the marked folder and choose Unset photo root folder.")
 figure("39_photo_root_context_menu.png", "Figure 3-8  Folder right-click menu: Set/Unset photo root folder")
 tip("Handy for funneling every photo from every device and every folder into one central “Photo Library” folder organized by year/month, while each business folder keeps only the documents relevant to it, unmixed with photos.")
+h2("3.10  Pasting Screenshots Directly into a Description")
+para("Folder and document Description boxes now accept pasted images: take a screenshot (or copy an image), click into any Description box, and press Ctrl+V (Cmd+V on a Mac). The screenshot appears inline at the cursor, mixed in with your text.")
+bullet("The pasted screenshot is saved as a real image document in the current folder (it shows up in the document list like any upload, and deleting it sends it to Deleted Files where it can be recovered); the description just references it.")
+bullet("Pasting into a Description does not also trigger the \u201cpaste a screenshot as a new document\u201d behavior from section 4.3 - the two don't interfere. Pasting anything else (e.g. formatted text copied from a web page) keeps the plain text only, without its original formatting.")
+bullet("AI Polish and Check Typos only work on the text portion; screenshots already inserted are kept, not lost. When the description is exported as .txt/PDF or shown in search results, each screenshot appears as a \u201c[screenshot]\u201d placeholder.")
+note("A description now stores text plus images. Plain-text descriptions saved by older versions keep working and open without any conversion.")
 page_break()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -501,7 +511,7 @@ numbered("Click Link Existing Document.")
 numbered("A dialog lists all documents in the system.")
 numbered("Check the document(s) you want and click Add Link.")
 numbered("The document now appears in both the original folder and the new folder.")
-tip("A faster way: just drag a document card and drop it directly onto the target folder in the left-hand tree. It has exactly the same effect as the steps above, without opening the picker dialog first.")
+tip("A faster way: drag a document card onto the target folder in the left-hand tree. Dropping it normally MOVES the document (it leaves its old folder and goes into the target). Hold Alt (Option on a Mac) while dropping to LINK it instead - the document stays in its original folder and also appears in the target, exactly like the steps above without opening the picker. While Alt/Option is held, the target folder highlights blue to show it will be a link, not a move.")
 
 h2("4.5  Viewing a Document")
 numbered("Click the document name or thumbnail to open the Document Viewer.")
@@ -579,6 +589,57 @@ bullet("AI-fill parameter - multi-select documents and have AI read one paramete
 bullet("Batch rename - renames every document in the current folder to “date + location - original name” (the date comes from the document's own capture/archive date, and documents where no date can be resolved are skipped; the location comes from the document's location metadata and is omitted if there isn't one). The actual file on disk is renamed too. Clicking it shows a preview first; nothing changes until you confirm.")
 figure("42_batch_rename_preview.png", "Figure 4-10  Batch rename preview: nothing is renamed until you confirm")
 bullet("Find near-duplicates - check a few photos (or click Select all photos to grab every photo in the folder), then drag the Similarity threshold slider (50%-100%); DMS compares the selected photos pairwise and flags ones that look highly similar to each other (e.g. several near-identical burst-mode shots), making it easy to spot redundant photos to clean up. This is a “looks similar” fuzzy match, a different mechanism from section 4.7's exact filename-and-size match at upload time.")
+h2("4.13  Upload Eq Record (AN^SN^PN naming)")
+para("For equipment record-keeping: a record is renamed in the format Assembly Number (AN)^Serial Number (SN)^Part Name (PN)^original file name and filed straight into the folder whose name equals that AN, so the file name alone tells you which unit the record belongs to.")
+numbered("Click Upload Eq Record in the Tree tab toolbar. A window opens that you can drag and resize.")
+numbered("On the left, pick the AN (assembly number / folder) - type in the filter box first to narrow the list - then optionally fill in SN and PN (both may be left blank).")
+numbered("Click Choose file... and pick a file. The window shows \u201cWill be saved as:\u201d with the new file name, and previews images, PDFs and text on the right (other types can be downloaded to view).")
+numbered("Click Upload when it looks right. AN / SN / PN stay filled in afterwards, so you can simply pick the next file.")
+para("To upload many at once, click Upload by file name and pick several files whose names are already written as AN^SN^PN.extension (e.g. A100^SN001^Bearing.pdf). DMS splits out the fields, matches each AN to its folder, and shows a status per row (Uploaded / Already exists, skipped / the reason for an error); click Upload N file(s) to finish.")
+note("\u201c^\u201d is the separator because work-order numbers and part names often contain hyphens themselves. The AN must match a folder name, otherwise that row reports that no folder was found. The name stored on disk keeps the AN^SN^PN^original name format.")
+
+h2("4.14  QC Review and the QC Review Report")
+para("QC Review lets you fill in a review for each of a batch of inspection reports and roll everything up into a deliverable PDF at folder level. The structure: one folder per \u201cInspection\u201d containing that inspection's report files; each file has its own review form; the folder as a whole has one General Comment.")
+h3("Uploading QC review records")
+numbered("Click Upload QC Review in the Tree tab toolbar. It works like section 4.13, but the fields are Inspection (folder), SN, Equipment Description and WO/PO (Work Order Number / Purchase Order).")
+numbered("Upload by file name accepts names in the format Inspection^SN^Equipment Description^WO/PO (e.g. A100^SN001^Bearing^WO-2026-01.pdf), so many files go up in one go.")
+numbered("Each uploaded file automatically gets a review form, pre-filled with its Inspection, SN, Equipment Description and WO/PO.")
+h3("Filling in one file's review")
+numbered("Open the document viewer and click QC Review (it reads Add QC Review until one exists). The window widens automatically: the file on the left half, the review form on the right, with a draggable divider.")
+numbered("The form has Inspection, SN, Equipment Description, WO/PO, Date Reviewed, Reviewed By, Observation, Mitigation, and Review Result (Pass / Fail / Conditional / Pending).")
+numbered("There's no Save button - changes save automatically, and the bottom of the panel shows \u201cSaving automatically...\u201d / \u201cSaved automatically\u201d. These fields are also searchable.")
+h3("Writing the General Comment and generating the report")
+numbered("Select the inspection folder and fill in the General Comment in the folder's QC Review section; the same section lists every file under the folder (subfolders included) that already has a review.")
+numbered("Click QC Review Report (or Generate QC Review Report inside that section).")
+numbered("In the dialog, choose which actual inspection reports to attach after the review pages: Select all, None (review pages only), or tick them one by one. The review summary pages always list every file.")
+numbered("DMS builds a PDF: the General Comment and per-file review summary first, then the chosen inspection reports in order. Word and PowerPoint files are converted to PDF before merging (this needs LibreOffice installed on the computer). The report is filed in that folder, and generating again regenerates and overwrites it rather than piling up copies.")
+tip("The folder and the review fields (Inspection, SN, Equipment Description, WO/PO, Date Reviewed, Reviewed By, Observation, Mitigation, Review Result) can all be found with the search in chapter 7.")
+
+h2("4.15  Convert HEIC Photos to JPG")
+para("iPhones shoot HEIC by default, which many computer programs can't open. Click HEIC -> JPG in the Tree tab toolbar to batch-convert the HEIC/HEIF photos in a folder to standard JPG:")
+numbered("Type a path into Folder with the HEIC photos, or click Browse...; the Output folder may be left blank - then each JPG goes right next to its HEIC.")
+numbered("Tick options as needed: Include subfolders, Overwrite existing JPGs, Delete the HEIC after successful conversion (red - use with care), and set the image Quality (default 92).")
+numbered("Click Convert. A progress bar shows how many are done; when it finishes you see \u201cN converted, N skipped, N failed\u201d, with reasons listed for any failures.")
+numbered("Import the resulting JPGs into DMS with Upload Files / Upload Folder.")
+note("Conversion keeps the date taken, GPS and other photo info, and rotates the picture upright. This is a standalone tool for files on disk; it does not alter documents already in DMS. The same converter is available on the command line: python3 heic_to_jpg.py <folder>.")
+
+h2("4.16  PDF Translation, Find Text, and Edit Metadata")
+h3("Translate (side-by-side)")
+para("Open a PDF and click Translate in the viewer's top toolbar. The right half of the window shows the translation beside the original PDF on the left; the two scroll in sync, so the translation always lines up with the page you're reading.")
+bullet("Translation happens page by page, and only for the pages near what's on screen, so a large file doesn't take forever. If a page fails, click Retry; pages with no text are marked \u201cNo translatable text on this page\u201d.")
+bullet("The top dropdown picks the target language (Chinese by default, with other major languages available); the dropdown on the right picks Gemini or DeepSeek; the - and + buttons change the translation's font size; click the x at top right to close the translation.")
+bullet("Translation needs the matching AI key to be configured (section 6.4). For scanned files with no text layer, run OCR first (chapter 5).")
+h3("Search text")
+para("Search text in the viewer's toolbar finds a passage inside the current document using fuzzy matching (about 70% similarity counts as a hit), so it doesn't need to match the original exactly and still works with a few OCR errors; a match can jump straight to its page. Documents with no searchable text prompt you to run OCR first.")
+h3("Edit metadata")
+para("Click Edit metadata (Metadata in the info panel) to change a document's metadata. If the same document is linked into several folders, the change applies everywhere it is referenced.")
+
+h2("4.17  AI: Detect Service Date")
+para("Lab reports and medical exams often show both a date of birth and an exam date, and the upload-time date detector can't tell them apart. AI: Detect service date re-reads existing documents with Gemini, looking specifically for the date the service / inspection / exam took place, and explicitly excluding the date of birth.")
+bullet("Document list toolbar: click AI: Detect service date, tick several PDFs/images, and start.")
+bullet("Folder multi-select mode (see section 3.8): tick some folders and click AI: Detect service date to process every PDF/image in them and all their subfolders.")
+bullet("Progress shows as \u201cDetecting... done/total\u201d. When it finishes, the same confirmation dialog used for upload-time dates opens - nothing is written to a document's date until you review it. Documents where no service date was found don't appear in the dialog; they're only counted in the message.")
+note("This needs a Gemini API key (see section 6.4) and only runs when you trigger it.")
 page_break()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -744,6 +805,7 @@ figure("08_databook_tab.png", "Figure 8-1  The Databook tab: checking documents 
 h2("8.2  Generating the PDF")
 numbered("After selecting documents, click Generate Databook.")
 numbered("In the dialog, enter a Title (the main heading on the cover page) and a Subtitle (a secondary line, e.g. project name or revision number).")
+numbered("Optionally add Cover page(s): upload one or more PDF, Word, PowerPoint or image files, which become the very first pages, ahead of the auto-generated cover and table of contents.")
 numbered("Click Generate and Download.")
 numbered("DMS generates the PDF on the server and your browser downloads it automatically.")
 para("The generated PDF includes: a cover page (title, subtitle, date), a table of contents with clickable bookmarks, section-header pages, all selected documents in tree order, and page numbers/footers throughout.")
@@ -798,6 +860,7 @@ numbered("For each detected face, type a person's name (or pick an existing one)
 
 h2("10.3  Browsing by Person / Auto-Matching")
 para("Once some faces are tagged, the Faces tab lets you browse photos grouped by person. New photos you tag later are automatically compared against known faces and suggested matches, so you don't have to name every single photo of the same person from scratch.")
+para("Auto-matching can be interrupted at any time with the Stop button; results found so far are kept. In a person\u2019s photo gallery, Create matches folder gathers all of that person\u2019s photos into a new \u201c人脸匹配/name\u201d folder for easy viewing or export.")
 
 page_break()
 

@@ -45,6 +45,222 @@ window.addEventListener("keydown", (e) => { if (e.key === "Alt") dragAltKeyState
 window.addEventListener("keyup", (e) => { if (e.key === "Alt") dragAltKeyState.current = false; });
 
 /* =============================================================================
+ * DESCRIPTION RICH TEXT -- Description fields (per-document and per-folder)
+ * are plain strings, same as always, but can now hold a small sanitized
+ * subset of HTML (only <img src="/api/docs/..."> and <br>) so a pasted
+ * screenshot can be embedded inline. Every description ever saved before
+ * this feature is a bare plain-text string with no tags in it, so
+ * looksLikeRichDescription's cheap check ("does it contain <img or <br at
+ * all") is enough to tell old plain text apart from new rich content --
+ * legitimate description text essentially never contains those literal
+ * substrings. sanitizeDescriptionHtml is the single gatekeeper for what's
+ * allowed to persist: run on every save AND on load, so even a paste of
+ * richly-formatted HTML from somewhere else collapses down to plain text
+ * (images and line breaks aside) rather than smuggling in arbitrary markup.
+ * =============================================================================
+ */
+const looksLikeRichDescription = (raw) => /<(img|br)\b/i.test(raw || "");
+
+const escapeHtmlText = (s) => (s || "")
+  .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+const plainTextToDescriptionHtml = (text) => escapeHtmlText(text).replace(/\n/g, "<br>");
+
+// Walks a parsed fragment, keeping only text nodes, <br>, and <img> tags
+// whose src points at this server's own document store (an image we
+// created via the paste-screenshot-as-image flow below) -- everything else
+// is unwrapped (its own children/text are kept, just the tag is dropped),
+// so foreign formatting degrades to plain text instead of being stored raw.
+// Block-level tags Chrome's contentEditable can insert on Enter (depends on
+// browser/version) -- unwrapping one of these without inserting a <br> in
+// its place would silently merge separate lines into one.
+const _DESCRIPTION_BLOCK_TAGS = new Set(["DIV", "P", "LI", "UL", "OL", "TABLE", "TR", "TD", "H1", "H2", "H3", "H4", "H5", "H6", "BLOCKQUOTE"]);
+
+const sanitizeDescriptionHtml = (html) => {
+  const root = document.createElement("div");
+  root.innerHTML = html || "";
+  const walk = (node) => {
+    for (const child of Array.from(node.childNodes)) {
+      if (child.nodeType === Node.TEXT_NODE) continue;
+      if (child.nodeType !== Node.ELEMENT_NODE) { node.removeChild(child); continue; }
+      const tag = child.tagName;
+      if (tag === "BR") continue;
+      if (tag === "IMG") {
+        const src = child.getAttribute("src") || "";
+        if (!src.includes("/api/docs/")) { node.removeChild(child); continue; }
+        const clean = document.createElement("img");
+        clean.setAttribute("src", src);
+        clean.setAttribute("alt", child.getAttribute("alt") || "screenshot");
+        clean.setAttribute("style", "max-width:100%;display:block;margin:6px 0;border-radius:4px;");
+        node.replaceChild(clean, child);
+        continue;
+      }
+      walk(child);
+      if (_DESCRIPTION_BLOCK_TAGS.has(tag) && child.previousSibling) {
+        node.insertBefore(document.createElement("br"), child);
+      }
+      while (child.firstChild) node.insertBefore(child.firstChild, child);
+      node.removeChild(child);
+    }
+  };
+  walk(root);
+  return root.innerHTML;
+};
+
+// What to show/edit for a saved description value. Legacy plain text
+// (saved before this feature existed) needs escaping and \n -> <br>
+// conversion; our own previously-saved HTML must NOT be re-escaped (that
+// would turn a stored "&amp;" into "&amp;amp;" on every subsequent load).
+// Distinguishing them: a raw newline can only come from old plain text
+// (our own commits always use <br>, never a literal \n); short of that, if
+// raw already round-trips unchanged through the sanitizer it's our own
+// prior HTML output, not unescaped legacy text.
+const descriptionToEditableHtml = (raw) => {
+  if (!raw) return "";
+  if (/\n/.test(raw)) return plainTextToDescriptionHtml(raw);
+  if (looksLikeRichDescription(raw)) return sanitizeDescriptionHtml(raw);
+  const sanitized = sanitizeDescriptionHtml(raw);
+  return sanitized === raw ? sanitized : plainTextToDescriptionHtml(raw);
+};
+
+// Plain-text extraction for contexts that can't/shouldn't show HTML: AI
+// polish/typo-check input, search-result snippets, and the .txt/PDF export
+// of a description. Images become a bracketed placeholder so their
+// presence isn't silently dropped. Always routed through the sanitizer
+// (not just when it "looks rich") so stored entities like "&amp;" decode
+// back to their real characters instead of leaking through literally.
+const stripDescriptionHtml = (raw, imgPlaceholder) => {
+  if (!raw) return "";
+  const root = document.createElement("div");
+  root.innerHTML = sanitizeDescriptionHtml(raw);
+  root.querySelectorAll("img").forEach((img) => img.replaceWith(document.createTextNode(imgPlaceholder || "[screenshot]")));
+  root.querySelectorAll("br").forEach((br) => br.replaceWith(document.createTextNode("\n")));
+  return root.textContent || "";
+};
+
+// Used after an AI polish/typo result replaces the description's *text* --
+// keeps any images that were in the old value instead of silently dropping
+// them, appended after the new text.
+const mergeDescriptionImages = (oldRaw, newPlainText) => {
+  const root = document.createElement("div");
+  root.innerHTML = sanitizeDescriptionHtml(oldRaw);
+  const imgs = Array.from(root.querySelectorAll("img"));
+  let html = plainTextToDescriptionHtml(newPlainText);
+  for (const img of imgs) html += "<br>" + img.outerHTML;
+  return html;
+};
+
+// contentEditable div standing in for the old plain <textarea> wherever a
+// Description field is edited -- adds inline-image paste support. Not a
+// general rich-text editor: pasting an image uploads+embeds it (via
+// onPasteImage), pasting anything else is forced down to plain text (no
+// foreign formatting), and everything is re-sanitized through
+// sanitizeDescriptionHtml before it reaches onChange.
+// Make Enter insert a plain <br> instead of wrapping the new line in
+// <div>/<p> -- matches what sanitizeDescriptionHtml expects, and keeps
+// Description's HTML as flat text+<br>+<img> instead of a block hierarchy.
+// This is a document-wide setting (not scoped to one element), but this
+// app has no other contentEditable, so setting it once at load is safe.
+try { document.execCommand("defaultParagraphSeparator", false, "br"); } catch {}
+
+const DescriptionEditor = ({ value, onChange, onPasteImage, placeholder, className, spellCheck = false }) => {
+  const { t } = useLang();
+  const elRef = useRef(null);
+  const lastValueRef = useRef(null);
+  const [pasting, setPasting] = useState(false);
+
+  useEffect(() => {
+    if (elRef.current && value !== lastValueRef.current) {
+      // Don't rewrite the DOM if it already shows this content (modulo
+      // sanitizing): replacing innerHTML throws the caret to the top, which
+      // is what made pressing Enter at the end jump to the first line.
+      if (sanitizeDescriptionHtml(elRef.current.innerHTML) !== sanitizeDescriptionHtml(value || "")) {
+        elRef.current.innerHTML = value || "";
+      }
+      lastValueRef.current = value;
+    }
+  }, [value]);
+
+  const commit = () => {
+    if (!elRef.current) return;
+    let html = sanitizeDescriptionHtml(elRef.current.innerHTML);
+    // Chrome often leaves a lone <br> behind after the user deletes
+    // everything (to keep the caret placed) -- collapse that back to a
+    // true empty string so an emptied-out field doesn't linger as
+    // "has a description" (Indexed badge, non-empty save, etc).
+    if (!stripDescriptionHtml(html).trim()) html = "";
+    // Only touch the DOM to clear the leftover lone <br>; rewriting it
+    // otherwise would reset the caret to the start of the field.
+    if (!html && elRef.current.innerHTML !== "") elRef.current.innerHTML = "";
+    lastValueRef.current = html;
+    onChange(html);
+  };
+
+  const handlePaste = async (e) => {
+    e.preventDefault();
+    // Also stop this from reaching the app-wide "paste a screenshot as a
+    // new document" listener on `document` (see handlePasteScreenshot's
+    // paste effect) -- otherwise pasting an image here would both embed it
+    // in the description AND create an unrelated duplicate PDF document.
+    e.stopPropagation();
+    const items = e.clipboardData?.items;
+    let imageItem = null;
+    for (const item of items || []) {
+      if (item.kind === "file" && item.type.startsWith("image/")) { imageItem = item; break; }
+    }
+    if (imageItem && onPasteImage) {
+      const blob = imageItem.getAsFile();
+      if (!blob) return;
+      setPasting(true);
+      try {
+        const docId = await onPasteImage(blob);
+        const url = `${API_BASE}/api/docs/${docId}`;
+        document.execCommand("insertHTML", false,
+          `<img src="${url}" alt="screenshot" style="max-width:100%;display:block;margin:6px 0;border-radius:4px;"><br>`);
+      } catch (err) {
+        alert(t("截图插入失败：", "Failed to insert screenshot: ") + (err.message || String(err)));
+      } finally {
+        setPasting(false);
+      }
+    } else {
+      const text = e.clipboardData.getData("text/plain");
+      if (text) document.execCommand("insertText", false, text);
+    }
+    commit();
+  };
+
+  return (
+    <div className="relative w-full h-full">
+      <div
+        ref={elRef}
+        contentEditable
+        suppressContentEditableWarning
+        onInput={commit}
+        onBlur={commit}
+        onPaste={handlePaste}
+        onKeyDown={(e) => {
+          // Insert a real line break ourselves (browser-independent): at the
+          // end of the text this also adds the placeholder <br> that makes the
+          // new empty line visible, and the caret lands on it.
+          if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+            e.preventDefault();
+            document.execCommand("insertLineBreak");
+          }
+        }}
+        spellCheck={spellCheck}
+        data-placeholder={placeholder}
+        className={(className || "") + " empty:before:content-[attr(data-placeholder)] empty:before:text-stone-400"}
+      />
+      {pasting && (
+        <div className="absolute inset-0 bg-white/60 flex items-center justify-center text-[12px] text-stone-600">
+          <Loader size={14} className="animate-spin mr-1.5" /> {t("插入截图中…", "Inserting screenshot…")}
+        </div>
+      )}
+    </div>
+  );
+};
+
+/* =============================================================================
  * LANGUAGE (zh / en) — app-wide toggle, persisted in localStorage.
  * t(zh, en) returns whichever string matches the active language; call sites
  * keep the original Chinese text in place so this is a mechanical wrap, not a
@@ -792,11 +1008,11 @@ const StorageAdapter = {
     return this._json(`/api/settings/check?path=${encoded}`);
   },
 
-  async saveSettings(storagePath, copyCurrentData = false) {
+  async saveSettings(storagePath, copyCurrentData = false, renameCurrent = false) {
     return this._json("/api/settings", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ storage_path: storagePath, copy_current: copyCurrentData }),
+      body: JSON.stringify({ storage_path: storagePath, copy_current: copyCurrentData, rename_current: renameCurrent }),
     });
   },
 
@@ -966,6 +1182,22 @@ const StorageAdapter = {
 
   async getDefaultDownloadFolder() {
     return this._json("/api/default-download-folder");
+  },
+
+  // HEIC -> JPG converter (heic_to_jpg.py): start a background job, then poll it.
+  async startHeicToJpg(opts) {
+    const res = await fetch(API_BASE + "/api/tools/heic-to-jpg", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(opts),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    return data.job_id;
+  },
+  async heicToJpgStatus(jobId) {
+    const res = await fetch(API_BASE + "/api/tools/heic-to-jpg/" + jobId);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    return data;
   },
 
   async browseFolder(path) {
@@ -1164,6 +1396,22 @@ const StorageAdapter = {
     }
     return res.json();   // { ok, doc_id, name, size, node_id, updated }
   },
+  // Build + file the QC Review Report PDF for a QC Review folder.
+  // attachDocIds: ids of the inspection reports to attach (null = all, [] = none).
+  async qcReviewReport(nodeId, attachDocIds = null) {
+    const res = await fetch(API_BASE + "/api/nodes/" + nodeId + "/qc-review-report", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(attachDocIds ? { attach_doc_ids: attachDocIds } : {}),
+    });
+    if (!res.ok) {
+      let detail = "";
+      try { detail = (await res.json()).error || ""; } catch {}
+      throw new Error(detail || tOutsideReact(`生成质检审核报告失败: HTTP ${res.status}`, `QC Review Report failed: HTTP ${res.status}`));
+    }
+    return res.json();   // { ok, doc_id, name, size, pages, node_id, updated }
+  },
+
   async saveNodeDescriptionPdf(nodeId, { text, title = "", reuse = true } = {}) {
     const res = await fetch(API_BASE + "/api/nodes/" + nodeId + "/save-description-pdf", {
       method: "POST",
@@ -1657,13 +1905,40 @@ const getNumericParamValue = (metaVal, { field = "actual" } = {}) => {
 // red: due within 1 day or overdue · yellow: within 1 week · blue: within 2 weeks.
 // Colors were deliberately picked from very different hues (not a red→yellow
 // ramp) since adjacent-hue tiers (e.g. red vs. orange) were hard to tell apart.
-const urgencyTier = (dueDateStr) => {
+// `remindDays` is the item's own lead time (default 14 -> the 1/7/14-day tiers
+// above). A longer lead time (e.g. 180 for a passport) widens the yellow band
+// proportionally: red <= 1 day, yellow <= max(7, lead/4), blue <= lead.
+const DEFAULT_REMIND_DAYS = 14;
+const REMIND_DAYS_OPTIONS = [7, 14, 30, 60, 90, 180, 365];
+const urgencyTier = (dueDateStr, remindDays) => {
   if (!dueDateStr) return null;
+  const lead = Number(remindDays) > 0 ? Number(remindDays) : DEFAULT_REMIND_DAYS;
   const days = Math.ceil((new Date(dueDateStr + "T23:59:59") - new Date()) / 86400000);
   if (days <= 1) return "red";
-  if (days <= 7) return "yellow";
-  if (days <= 14) return "blue";
+  if (days <= Math.max(7, Math.ceil(lead / 4))) return "yellow";
+  if (days <= lead) return "blue";
   return null;
+};
+
+// Next occurrence of a repeating due date ("YYYY-MM-DD"). Month steps clamp to
+// the last day of the target month (Jan 31 + 1 month = Feb 28/29). If the
+// stored date is long past, keeps stepping until it lands after today.
+const REPEAT_MONTHS = { monthly: 1, quarterly: 3, yearly: 12 };
+const rollDueDate = (dueDateStr, repeat) => {
+  const step = REPEAT_MONTHS[repeat];
+  if (!dueDateStr || !step) return "";
+  const [y0, m0, d0] = dueDateStr.split("-").map(Number);
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  let k = 1, out;
+  do {
+    const total = (m0 - 1) + step * k;
+    const y = y0 + Math.floor(total / 12), m = ((total % 12) + 12) % 12;
+    const d = Math.min(d0, new Date(y, m + 1, 0).getDate());
+    out = new Date(y, m, d);
+    k++;
+  } while (out <= today && k < 600);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${out.getFullYear()}-${pad(out.getMonth() + 1)}-${pad(out.getDate())}`;
 };
 
 const URGENCY_ROW_CLASSES = {
@@ -2136,6 +2411,11 @@ const TreeNode = ({
             {node.sn && (
               <span className="ml-1.5 text-[12px] text-amber-700 font-mono">· {node.sn}</span>
             )}
+            {node.dueDate && (
+              <span className="ml-1.5 text-[12px] text-stone-700" title={t("文件夹到期日", "Due Date-Folder")}>
+                <Clock size={10} className="inline -mt-0.5" /> {node.dueDate}
+              </span>
+            )}
             {docCount > 0 && (
               <span className={`ml-1.5 text-[12px] ${isRecycleBin ? "text-stone-600" : "text-stone-700"}`}>{t(`(${docCount} 份文档)`, `(${docCount} docs)`)}</span>
             )}
@@ -2570,7 +2850,7 @@ const VoiceMicButton = ({ onFinalTranscript, title, className = "" }) => {
  * UI: DOCUMENT VIEWER
  * =============================================================================
  */
-const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyParameter, onSaveLocalParams, onSaveParams, onSaveDescription, onSaveTextAsDoc, onUpdateMeta, derivedDocs = [], onOpenAISettings, nodeId, onPrevDoc, onNextDoc }) => {
+const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyParameter, onSaveLocalParams, onSaveParams, onSaveDescription, onSaveTextAsDoc, onPasteDescriptionImage, onUpdateMeta, derivedDocs = [], onOpenAISettings, nodeId, onPrevDoc, onNextDoc, qcNode, onSaveQcReview, onQcReport }) => {
   const { t } = useLang();
   const isImage = doc?.mime?.startsWith("image/");
   const isPdf = doc?.mime === "application/pdf";
@@ -2598,8 +2878,9 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
   const [barcodeScanning, setBarcodeScanning] = useState(false);
   const [barcodeError, setBarcodeError] = useState("");
   const [barcodeResult, setBarcodeResult] = useState(null);   // { results: [{type, data}], saved }
-  // Side panel: null (closed) | "text" (OCR text) | "keys" (key-param extract) | "desc" (description) | "ask" (AI Q&A) | "meta" (metadata) | "search" (find text, PDF only)
+  // Side panel: null (closed) | "text" (OCR text) | "keys" (key-param extract) | "desc" (description) | "ask" (AI Q&A) | "meta" (metadata) | "qc" (QC Review form, side by side with the file) | "search" (find text, PDF only)
   const [panelMode, setPanelMode] = useState(null);
+  const [translateOn, setTranslateOn] = useState(false);
   const [copied, setCopied] = useState(false);
   const [saved, setSaved] = useState(false);
 
@@ -2772,6 +3053,16 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
   const _vw = typeof window !== "undefined" ? window.innerWidth : winRect.w;
   const _vh = typeof window !== "undefined" ? window.innerHeight : winRect.h;
   const rect = maximized ? { x: 0, y: 0, w: _vw, h: _vh } : winRect;
+  // Opening the QC Review panel: make the window (nearly) page width and split it
+  // half file / half form, left to right. The divider can still be dragged afterwards.
+  useEffect(() => {
+    if (panelMode !== "qc") return;
+    const vw = window.innerWidth;
+    const w = maximized ? vw : Math.max(winRect.w, vw - 32);
+    if (!maximized) setWinRect((r) => ({ ...r, x: Math.round((vw - w) / 2), w }));
+    setPanelW(Math.round(w / 2));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [panelMode]);
 
   const _clampRect = (r) => {
     const w = Math.min(Math.max(VIEWER_MIN_W, r.w), _vw);
@@ -3075,7 +3366,7 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
   const polishProvider = aiSettings.configured ? "gemini" : "deepseek";
 
   const runPolish = async () => {
-    const text = description.trim();
+    const text = stripDescriptionHtml(description).trim();
     if (!text || polishing || !aiPolishReady) return;
     setPolishing(true); setPolishError(""); setPolishResult(null);
     try {
@@ -3089,14 +3380,17 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
   };
   const acceptPolish = () => {
     if (!polishResult) return;
-    setDescription(polishResult.text);
+    // Preserve any screenshots already in the description -- the AI only
+    // ever sees/returns plain text (see runPolish above), so a straight
+    // replace would otherwise silently drop them.
+    setDescription(mergeDescriptionImages(description, polishResult.text));
     setDescSaved(false);
     setPolishResult(null);
   };
 
   // --- AI "check Chinese typos" for the description ---------------------------
   const runTypoCheck = async () => {
-    const text = description.trim();
+    const text = stripDescriptionHtml(description).trim();
     if (!text || typoChecking || !aiPolishReady) return;
     setTypoChecking(true); setTypoError(""); setTypoIssues(null);
     try {
@@ -3156,8 +3450,12 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
       : null) || null;
 
   const saveAsNewDoc = async (rawText, source) => {
-    const text = (rawText || "").trim();
-    if (!text || !onSaveTextAsDoc || savingNewDoc) return;
+    // The description may hold sanitized HTML (embedded screenshots) -- the
+    // .txt export below can only hold plain text, but the index write to
+    // onSaveDescription must keep the original so images aren't dropped
+    // from the live description just because it was also exported.
+    const plainText = (source === "desc" ? stripDescriptionHtml(rawText) : (rawText || "")).trim();
+    if (!plainText || !onSaveTextAsDoc || savingNewDoc) return;
 
     const existing = existingDerivedDoc(source);
     let title = "";
@@ -3178,10 +3476,10 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
       // the field is repopulated (and searchable) next time the doc is opened
       // -- that's what lets a later edit accumulate onto the same .txt file.
       if (source === "desc" && onSaveDescription) {
-        try { await onSaveDescription(doc.id, text); setDescSaved(true); } catch {}
+        try { await onSaveDescription(doc.id, rawText); setDescSaved(true); } catch {}
       }
       const res = await onSaveTextAsDoc(doc.id, {
-        text,
+        text: plainText,
         title,
         source: normSource(source),
         reuse: !!existing,
@@ -3465,14 +3763,14 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
           <div className="absolute inset-0 z-40" style={{ cursor: winInteractCursor }} />
         )}
         <div
-          className="flex items-center justify-between px-4 py-3 border-b border-stone-200 cursor-move select-none shrink-0"
+          className="flex flex-wrap items-center justify-between gap-y-2 px-4 py-3 border-b border-stone-200 cursor-move select-none shrink-0"
           onMouseDown={onWinMoveStart}
         >
           <div className="min-w-0">
             <div className="text-base font-medium text-stone-900 truncate">{doc.name}</div>
             <div className="text-[13px] text-stone-700 font-mono">{doc.id}</div>
           </div>
-          <div className="flex gap-2 shrink-0">
+          <div className="flex flex-wrap justify-end gap-2 min-w-0 ml-auto [&>*]:whitespace-nowrap">
             <button
               onClick={() => setPanelMode(panelMode === "desc" ? null : "desc")}
               title={t("添加或编辑描述，描述内容可被搜索", "Add or edit a description — descriptions are searchable")}
@@ -3483,6 +3781,18 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
             >
               <Edit2 size={13} /> {doc.description ? t("编辑描述", "Edit description") : t("添加描述", "Add description")}
             </button>
+            {onSaveQcReview && (
+              <button
+                onClick={() => setPanelMode(panelMode === "qc" ? null : "qc")}
+                title={t("在文件旁边填写/查看此文件的质检审核", "Fill in / view this file's QC Review right beside the file")}
+                className={"text-sm px-3 py-1.5 rounded flex items-center gap-1.5 border " +
+                  (panelMode === "qc"
+                    ? "border-amber-500 text-amber-900 bg-amber-200"
+                    : "border-amber-400 text-amber-900 bg-amber-50 hover:bg-amber-100")}
+              >
+                <ListChecks size={13} /> {doc.qcReview ? t("质检审核", "QC Review") : t("添加质检审核", "Add QC Review")}
+              </button>
+            )}
             {onUpdateMeta && (
               <button
                 onClick={() => setPanelMode(panelMode === "meta" ? null : "meta")}
@@ -3551,6 +3861,18 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
                 {ocrRunning
                   ? (<><Loader size={13} className="animate-spin" /> {t("识别中…", "Recognizing…")}</>)
                   : (<><ScanText size={13} /> {doc.ocrText ? t("重新 OCR", "Re-run OCR") : t("提取文字 (OCR)", "Extract text (OCR)")}</>)}
+              </button>
+            )}
+            {isPdf && (
+              <button
+                onClick={() => setTranslateOn((v) => !v)}
+                title={t("在右侧显示中文翻译，左右同步滚动", "Show a Chinese translation on the right, scrolling in sync with the PDF")}
+                className={"text-sm px-3 py-1.5 rounded flex items-center gap-1.5 border " +
+                  (translateOn
+                    ? "border-emerald-400 text-emerald-800 bg-emerald-100"
+                    : "border-emerald-300 text-emerald-800 bg-emerald-50 hover:bg-emerald-100")}
+              >
+                {t("中文翻译", "Translate")}
               </button>
             )}
             {isPdf && (
@@ -3715,6 +4037,8 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
                 <img src={viewUrl} alt={doc.name} className="max-w-full max-h-full object-contain"
                   onError={() => setImgLoadError(true)} />
               </div>
+            ) : isPdf && translateOn ? (
+              <PdfTranslateSplit key={doc.id} docId={doc.id} url={doc.dataUrl} onClose={() => setTranslateOn(false)} />
             ) : isPdf ? (
               <iframe
                 key={pdfJumpPage ? `pdf-jump-${pdfJumpNonce}` : "pdf-default"}
@@ -3930,12 +4254,12 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
               )}
 
               <div className="flex-1 min-h-0 overflow-auto p-3">
-                <textarea
-                  value={description}
-                  onChange={(e) => { setDescription(e.target.value); setDescSaved(false); }}
-                  placeholder={t("为这张照片添加描述或备注，保存后可在搜索中找到…", "Add a description or note for this photo — once saved it's searchable…")}
-                  spellCheck={false}
-                  className="w-full h-full resize-none text-sm leading-relaxed text-stone-800 outline-none"
+                <DescriptionEditor
+                  value={descriptionToEditableHtml(description)}
+                  onChange={(html) => { setDescription(html); setDescSaved(false); }}
+                  onPasteImage={onPasteDescriptionImage ? (blob) => onPasteDescriptionImage(nodeId, blob) : undefined}
+                  placeholder={t("为这张照片添加描述或备注，保存后可在搜索中找到…（可直接粘贴截图）", "Add a description or note for this photo — once saved it's searchable… (you can paste a screenshot directly)")}
+                  className="w-full h-full text-sm leading-relaxed text-stone-800 outline-none"
                 />
               </div>
 
@@ -4057,6 +4381,22 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
                   </div>
                 )}
               </div>
+            </div>
+          )}
+
+          {panelMode === "qc" && (
+            <div
+              className={"min-h-0 flex flex-col bg-white overflow-y-auto " + (poppedOut ? "flex-1" : "shrink-0")}
+              style={poppedOut ? undefined : { width: panelW }}
+            >
+              <div className="flex items-center justify-between px-3 py-2 border-b border-stone-200 bg-amber-50 sticky top-0 z-10">
+                <div className="flex items-center gap-1.5 text-sm font-medium text-amber-900">
+                  <ListChecks size={13} /> {t("质检审核", "QC Review")}
+                </div>
+                <button onClick={() => setPanelMode(null)} className="text-stone-600 hover:text-stone-700"><X size={14} /></button>
+              </div>
+              <QcReviewFields key={doc.id} docId={doc.id} qc={qcOfDoc(doc)} onSave={onSaveQcReview} />
+              {qcNode && onQcReport && <QcReportButton nodeId={qcNode.id} onReport={onQcReport} />}
             </div>
           )}
 
@@ -5298,6 +5638,7 @@ const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree,
         entry.sn || "",
         entry.ocrText || "",
         entry.description || "",
+        ...Object.values(entry.qcReview || {}),   // QC Review: Inspection/SN/Equipment/WO-PO, dates, observation, mitigation, result
         ...Object.keys(entry.metadata || {}),
         ...Object.values(entry.metadata || {}).map((v) => {
           if (v && typeof v === "object") return `${v.design || ""} ${v.actual || ""}`;
@@ -5332,7 +5673,9 @@ const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree,
     if (!trimmed) return [];
     const words = trimmed.split(/\s+/).filter(Boolean);
     return scopeFolders.filter((node) => {
-      const name = (node.name || "").toLowerCase();
+      // QC Review folders are also findable by their review fields (AN/SN/PN/WON,
+      // Date Reviewed, Reviewed By, Observation, Mitigation, Review Result).
+      const name = (node.name + " " + (node.qcGeneralComment || "")).toLowerCase();
       if (matchMode === "phrase") return name.includes(trimmed);
       if (matchMode === "or") return words.some((w) => name.includes(w));
       return words.every((w) => name.includes(w));
@@ -5586,7 +5929,7 @@ const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree,
               <div className="font-medium text-stone-800 truncate">{r.name}</div>
               <div className="font-mono text-[12px] text-stone-700 mt-0.5">{r.id}</div>
               {r.description && (
-                <div className="text-[12px] text-stone-700 mt-0.5 line-clamp-2">{r.description}</div>
+                <div className="text-[12px] text-stone-700 mt-0.5 line-clamp-2">{stripDescriptionHtml(r.description, t("[截图]", "[screenshot]"))}</div>
               )}
               {refs.length === 0 && (
                 <div className="text-[12px] text-amber-700 mt-0.5 italic">{t("未引用", "Unreferenced")}</div>
@@ -5634,7 +5977,7 @@ const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree,
  *     organized them).
  * =============================================================================
  */
-const DatabookPanel = ({ tree, docIndex, getPathFor, formatBytes, onOpenDoc }) => {
+const DatabookPanel = ({ tree, docIndex, getPathFor, formatBytes, onOpenDoc, onDocsChanged }) => {
   const { t } = useLang();
   // "manual": existing per-document tree-checkbox selection → PDF.
   // "byFolder": pick one folder, auto-organize its subfolders as chapters → Word.
@@ -5824,6 +6167,8 @@ const DatabookPanel = ({ tree, docIndex, getPathFor, formatBytes, onOpenDoc }) =
       a.remove();
       URL.revokeObjectURL(url);
       setGenerated(true);
+      // The server files the saved copy into the tree's "databook" folder.
+      if (res.headers.get("X-Databook-Tree-Updated") && onDocsChanged) onDocsChanged();
     } catch (e) {
       setError(e.message);
     } finally {
@@ -5975,7 +6320,7 @@ const DatabookPanel = ({ tree, docIndex, getPathFor, formatBytes, onOpenDoc }) =
       </div>
 
       {mode === "byFolder" ? (
-        <DatabookByFolderPanel tree={tree} docIndex={docIndex} formatBytes={formatBytes} onOpenDoc={onOpenDoc} />
+        <DatabookByFolderPanel tree={tree} docIndex={docIndex} formatBytes={formatBytes} onOpenDoc={onOpenDoc} onDocsChanged={onDocsChanged} />
       ) : (
       <>
       {/* Toolbar */}
@@ -6085,13 +6430,13 @@ const DatabookPanel = ({ tree, docIndex, getPathFor, formatBytes, onOpenDoc }) =
             ) : (
               <input
                 type="file"
-                accept="application/pdf,image/*"
+                accept="application/pdf,image/*,.doc,.docx,.ppt,.pptx"
                 onChange={(e) => setFrontPageFile(e.target.files?.[0] || null)}
                 className="w-full text-sm mb-1 file:mr-2 file:px-2 file:py-1 file:border file:border-stone-300 file:rounded file:bg-white file:text-sm file:cursor-pointer hover:file:bg-stone-50"
               />
             )}
             <div className="text-[12px] text-stone-700 mb-3 leading-tight">
-              {t("将作为第 1 页插入，位于自动生成的封面/目录页之前。Word/Pages 文档请先导出为 PDF。", "Inserted as page 1, before the auto-generated cover/table-of-contents page. Export Word/Pages documents to PDF first.")}
+              {t("将作为第 1 页插入，位于自动生成的封面/目录页之前。支持 PDF、Word、PowerPoint 和图片。", "Inserted as page 1, before the auto-generated cover/table-of-contents page. PDF, Word, PowerPoint and images are supported.")}
             </div>
 
             <div className="text-sm text-stone-700 bg-stone-50 border border-stone-200 rounded p-2 mb-3">
@@ -6164,7 +6509,7 @@ const DatabookPanel = ({ tree, docIndex, getPathFor, formatBytes, onOpenDoc }) =
  * page(s) (image/PDF) become the leading page(s); with none, page 1 is
  * left blank. Server-side layout lives in databook.build_databook_docx.
  */
-const DatabookByFolderPanel = ({ tree, docIndex, formatBytes, onOpenDoc }) => {
+const DatabookByFolderPanel = ({ tree, docIndex, formatBytes, onOpenDoc, onDocsChanged }) => {
   const { t } = useLang();
   const [selectedNodeId, setSelectedNodeId] = useState(null);
   const [expanded, setExpanded] = useState(new Set());
@@ -6305,6 +6650,8 @@ const DatabookByFolderPanel = ({ tree, docIndex, formatBytes, onOpenDoc }) => {
       a.remove();
       URL.revokeObjectURL(url);
       setGenerated(true);
+      // The server files the saved copy into the tree's "databook" folder.
+      if (res.headers.get("X-Databook-Tree-Updated") && onDocsChanged) onDocsChanged();
     } catch (e) {
       setError(e.message);
     } finally {
@@ -6382,7 +6729,7 @@ const DatabookByFolderPanel = ({ tree, docIndex, formatBytes, onOpenDoc }) => {
             </div>
 
             <label className="block text-sm uppercase tracking-wider text-stone-700 mb-1.5">
-              {t("封面页", "Cover page(s)")} <span className="text-stone-600 normal-case tracking-normal">{t("（可选，可多张，PDF 或图片）", "(optional, one or more, PDF or image)")}</span>
+              {t("封面页", "Cover page(s)")} <span className="text-stone-600 normal-case tracking-normal">{t("（可选，可多张，PDF、Word、PPT 或图片）", "(optional, one or more: PDF, Word, PPT or image)")}</span>
             </label>
             {coverFiles.length > 0 && (
               <div className="space-y-1 mb-1">
@@ -6404,14 +6751,14 @@ const DatabookByFolderPanel = ({ tree, docIndex, formatBytes, onOpenDoc }) => {
             <input
               type="file"
               multiple
-              accept="application/pdf,image/*"
+              accept="application/pdf,image/*,.doc,.docx,.ppt,.pptx"
               onChange={(e) => setCoverFiles((prev) => [...prev, ...Array.from(e.target.files || [])])}
               className="w-full text-sm mb-1 file:mr-2 file:px-2 file:py-1 file:border file:border-stone-300 file:rounded file:bg-white file:text-sm file:cursor-pointer hover:file:bg-stone-50"
             />
             <div className="text-[12px] text-stone-700 mb-3 leading-tight">
               {t(
-                "未提供封面时，第 1 页将留空。Word/Pages 文档请先导出为 PDF。",
-                "With no cover supplied, page 1 is left blank. Export Word/Pages documents to PDF first."
+                "未提供封面时，第 1 页将留空。",
+                "With no cover supplied, page 1 is left blank."
               )}
             </div>
 
@@ -7240,6 +7587,109 @@ const CombineProjectsSummaryLines = ({ t, s }) => (
   </ul>
 );
 
+/* =============================================================================
+ * HEIC -> JPG CONVERTER (runs heic_to_jpg.py on the server): pick a folder of
+ * iPhone HEIC photos, convert them all to JPG (EXIF kept, rotation applied).
+ * Works on files on disk -- add the resulting JPGs to DMS with Upload file/folder.
+ * =============================================================================
+ */
+const HeicToJpgDialog = ({ onClose }) => {
+  const { t } = useLang();
+  const [folder, setFolder] = useState("");
+  const [output, setOutput] = useState("");
+  const [recursive, setRecursive] = useState(true);
+  const [quality, setQuality] = useState(92);
+  const [overwrite, setOverwrite] = useState(false);
+  const [delOrig, setDelOrig] = useState(false);
+  const [browse, setBrowse] = useState(null);      // null | "folder" | "output"
+  const [job, setJob] = useState(null);            // last status from the server
+  const [running, setRunning] = useState(false);
+  const [err, setErr] = useState("");
+  const pollRef = useRef(null);
+  useEffect(() => () => { if (pollRef.current) clearTimeout(pollRef.current); }, []);
+
+  const run = async () => {
+    setErr(""); setJob(null); setRunning(true);
+    try {
+      const id = await StorageAdapter.startHeicToJpg({ folder: folder.trim(), output: output.trim(), recursive, quality, overwrite, delete_original: delOrig });
+      const poll = async () => {
+        try {
+          const st = await StorageAdapter.heicToJpgStatus(id);
+          setJob(st);
+          if (st.state === "running") { pollRef.current = setTimeout(poll, 700); return; }
+          if (st.state === "error") setErr(st.error || "Conversion failed");
+          setRunning(false);
+        } catch (e) { setErr(e.message || String(e)); setRunning(false); }
+      };
+      poll();
+    } catch (e) { setErr(e.message || String(e)); setRunning(false); }
+  };
+
+  const inp = "w-full px-2 py-1 border border-stone-300 rounded text-sm bg-white";
+  const res = job && job.result;
+  const pct = job && job.total ? Math.round((job.done / job.total) * 100) : 0;
+  return (
+    <div className="fixed inset-0 z-[70] bg-black/40 flex items-center justify-center p-4">
+      <div className="bg-white rounded shadow-2xl border border-stone-300 w-full max-w-xl max-h-[88vh] flex flex-col">
+        <div className="flex items-center px-4 py-2.5 border-b border-stone-200">
+          <div className="font-bold text-stone-800">{t("HEIC 转 JPG", "Convert HEIC to JPG")}</div>
+          <button onClick={onClose} disabled={running} className="ml-auto p-1 text-stone-600 hover:text-stone-800 disabled:opacity-40"><X size={16} /></button>
+        </div>
+        <div className="px-4 py-3 overflow-auto space-y-3 text-sm">
+          <div className="text-[13px] text-stone-600">{t("把文件夹中的 iPhone HEIC 照片批量转换为 JPG（保留拍摄时间、GPS 等信息，并自动校正方向）。转换后可用“上传文件/文件夹”导入 DMS。", "Batch-convert iPhone HEIC photos in a folder to JPG (date, GPS and other EXIF are kept; orientation is corrected). Afterwards use Upload file/folder to add the JPGs to DMS.")}</div>
+          <div>
+            <label className="block font-bold text-stone-700 mb-1">{t("HEIC 照片所在文件夹", "Folder with the HEIC photos")}</label>
+            <div className="flex gap-1.5">
+              <input value={folder} onChange={(e) => setFolder(e.target.value)} placeholder="/Users/…/Pictures" className={inp} />
+              <button onClick={() => setBrowse("folder")} disabled={running} className="px-2 border border-stone-300 rounded hover:bg-stone-50 shrink-0 disabled:opacity-50">{t("浏览…", "Browse…")}</button>
+            </div>
+          </div>
+          <div>
+            <label className="block font-bold text-stone-700 mb-1">{t("输出文件夹（可留空：JPG 放在原照片旁边）", "Output folder (optional — blank puts each JPG next to its HEIC)")}</label>
+            <div className="flex gap-1.5">
+              <input value={output} onChange={(e) => setOutput(e.target.value)} className={inp} />
+              <button onClick={() => setBrowse("output")} disabled={running} className="px-2 border border-stone-300 rounded hover:bg-stone-50 shrink-0 disabled:opacity-50">{t("浏览…", "Browse…")}</button>
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5">
+            <label className="flex items-center gap-1.5"><input type="checkbox" checked={recursive} onChange={(e) => setRecursive(e.target.checked)} /> {t("包含子文件夹", "Include subfolders")}</label>
+            <label className="flex items-center gap-1.5"><input type="checkbox" checked={overwrite} onChange={(e) => setOverwrite(e.target.checked)} /> {t("覆盖已存在的 JPG", "Overwrite existing JPGs")}</label>
+            <label className="flex items-center gap-1.5 text-red-700"><input type="checkbox" checked={delOrig} onChange={(e) => setDelOrig(e.target.checked)} /> {t("转换成功后删除原 HEIC", "Delete the HEIC after converting")}</label>
+            <label className="flex items-center gap-1.5">{t("质量", "Quality")}
+              <input type="number" min={1} max={100} value={quality} onChange={(e) => setQuality(Number(e.target.value) || 92)} className="w-16 px-1.5 py-0.5 border border-stone-300 rounded" /></label>
+          </div>
+          {running && job && (
+            <div>
+              <div className="h-2 bg-stone-200 rounded overflow-hidden"><div className="h-full bg-amber-500" style={{ width: pct + "%" }} /></div>
+              <div className="text-[12px] text-stone-600 mt-1">{job.done} / {job.total} · {job.message}</div>
+            </div>
+          )}
+          {err && <div className="text-xs p-2 rounded border border-red-300 bg-red-50 text-red-700">{err}</div>}
+          {res && (
+            <div className="text-xs p-2 rounded border border-emerald-300 bg-emerald-50 text-emerald-900 space-y-1">
+              {res.total === 0
+                ? <div>{t("该文件夹中没有 HEIC/HEIF 照片。", "No HEIC/HEIF photos were found in that folder.")}</div>
+                : <div className="font-medium">{t(`完成：转换 ${res.converted} 张，跳过 ${res.skipped} 张，失败 ${res.failed} 张。`, `Done: ${res.converted} converted, ${res.skipped} skipped, ${res.failed} failed.`)}</div>}
+              {res.items.filter((i) => i.status === "failed").slice(0, 10).map((i) => <div key={i.src} className="text-red-700 break-all">{i.src}: {i.error}</div>)}
+            </div>
+          )}
+        </div>
+        <div className="px-4 py-2.5 border-t border-stone-200 flex justify-end gap-2">
+          <button onClick={onClose} disabled={running} className="px-3 py-1 text-sm border border-stone-300 rounded hover:bg-stone-50 disabled:opacity-50">{res ? t("关闭", "Close") : t("取消", "Cancel")}</button>
+          <button onClick={run} disabled={running || !folder.trim()} className="px-3 py-1 text-sm bg-amber-600 text-white rounded hover:bg-amber-700 disabled:opacity-50 flex items-center gap-1.5">
+            {running && <Loader size={13} className="animate-spin" />}{running ? t("转换中…", "Converting…") : t("开始转换", "Convert")}
+          </button>
+        </div>
+      </div>
+      {browse && (
+        <FolderBrowserModal startPath={(browse === "folder" ? folder : output) || ""}
+          onSelect={(p) => { if (p) (browse === "folder" ? setFolder : setOutput)(p); setBrowse(null); }}
+          onClose={() => setBrowse(null)} />
+      )}
+    </div>
+  );
+};
+
 const CombineProjectsModal = ({ onClose, onProjectChanged }) => {
   const { t } = useLang();
   const [sources, setSources] = useState([]); // string[] of other projects' storage paths
@@ -7400,6 +7850,344 @@ const CombineProjectsModal = ({ onClose, onProjectChanged }) => {
  */
 const ASKAI_DIALOG_MIN_W = 420;
 const ASKAI_DIALOG_MIN_H = 360;
+// "Upload Eq Record": pick an equipment folder (its name is the assembly
+// number, AN), optionally fill SN (serial number) and PN (part name), then
+// pick a file and review it. The file is stored in that AN folder renamed to
+// AN^SN^PN^original-name. AN/SN/PN stay filled in after each upload, so the
+// next file starts from the same values.
+const EqRecordUploadDialog = ({ open, tree, docIndex, defaultNodeId, onUpload, onClose, mode = "eq" }) => {
+  const { t } = useLang();
+  const isQc = mode === "qc";   // QC Review: adds WON to the file name
+  const [nodeId, setNodeId] = useState("");
+  const [filter, setFilter] = useState("");
+  const [sn, setSn] = useState("");
+  const [pn, setPn] = useState("");
+  const [won, setWon] = useState("");
+  const [file, setFile] = useState(null);
+  const [previewUrl, setPreviewUrl] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState(null); // {ok, text}
+  const fileInputRef = useRef(null);
+  const multiInputRef = useRef(null);
+  // "Upload by file name" batch: [{file, an, sn, pn, folder, error, status}]
+  const [batch, setBatch] = useState([]);
+  // Window geometry: draggable by the title bar, resizable from any edge/corner.
+  const [rect, setRect] = useState(() => {
+    const vw = typeof window !== "undefined" ? window.innerWidth : 1280;
+    const vh = typeof window !== "undefined" ? window.innerHeight : 800;
+    const w = Math.min(1000, vw - 32), h = Math.round(vh * 0.85);
+    return { x: Math.round((vw - w) / 2), y: Math.round((vh - h) / 2), w, h };
+  });
+  const [interacting, setInteracting] = useState(null); // null | "move" | resize dir (n,s,e,w,ne,...)
+
+  const startInteract = (mode) => (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const start = { mx: e.clientX, my: e.clientY, ...rect };
+    setInteracting(mode);
+    const MIN_W = 520, MIN_H = 320;
+    const onMove = (ev) => {
+      const dx = ev.clientX - start.mx, dy = ev.clientY - start.my;
+      setRect(() => {
+        if (mode === "move") {
+          return {
+            ...start,
+            x: Math.max(40 - start.w, Math.min(window.innerWidth - 40, start.x + dx)),
+            y: Math.max(0, Math.min(window.innerHeight - 40, start.y + dy)),
+          };
+        }
+        let { x, y, w, h } = start;
+        if (mode.includes("e")) w = Math.max(MIN_W, start.w + dx);
+        if (mode.includes("s")) h = Math.max(MIN_H, start.h + dy);
+        if (mode.includes("w")) { w = Math.max(MIN_W, start.w - dx); x = start.x + start.w - w; }
+        if (mode.includes("n")) { h = Math.max(MIN_H, start.h - dy); y = Math.max(0, start.y + start.h - h); h = start.y + start.h - y; }
+        return { x, y, w, h };
+      });
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      setInteracting(null);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
+  const folders = useMemo(() => {
+    const out = [];
+    const walk = (n, path) => {
+      for (const c of n.children || []) {
+        const p = [...path, c.name];
+        out.push({ id: c.id, name: c.name, label: p.join(" / ") });
+        walk(c, p);
+      }
+    };
+    if (tree) walk(tree, []);
+    return out;
+  }, [tree]);
+
+  useEffect(() => {
+    if (!open) return;
+    setMessage(null);
+    setFile(null);
+    setBatch([]);
+    setFilter("");
+    setNodeId((cur) => cur || (defaultNodeId && defaultNodeId !== tree?.id ? defaultNodeId : ""));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  useEffect(() => {
+    if (!file) { setPreviewUrl(""); return; }
+    const u = URL.createObjectURL(file);
+    setPreviewUrl(u);
+    return () => URL.revokeObjectURL(u);
+  }, [file]);
+
+  if (!open) return null;
+
+  const clean = (v) => (v || "").replace(/[\\/:*?"<>|^\r\n]/g, "").trim();
+  const folder = folders.find((f) => f.id === nodeId);
+  const newName = file && folder
+    ? `${clean(folder.name)}^${clean(sn)}^${clean(pn)}^${isQc ? clean(won) + "^" : ""}${file.name}` : "";
+  const shown = filter.trim()
+    ? folders.filter((f) => f.label.toLowerCase().includes(filter.trim().toLowerCase()) || f.id === nodeId)
+    : folders;
+  const ext = file ? file.name.split(".").pop().toLowerCase() : "";
+  const isPdf = file && (file.type === "application/pdf" || ext === "pdf");
+  const isImg = file && file.type.startsWith("image/") && !["heic", "heif"].includes(ext);
+  const isTxt = file && (file.type.startsWith("text/") || ["txt", "csv", "log"].includes(ext));
+
+  const doUpload = async () => {
+    if (!folder || !file) return;
+    const dup = (docIndex || []).find((d) => d.name === newName && d.size === file.size);
+    if (dup && !window.confirm(t(`"${newName}" 已存在，仍要再次上传吗？`, `"${newName}" already exists. Upload it again anyway?`))) return;
+    setBusy(true);
+    setMessage(null);
+    try {
+      // window.File: this app's own `File` icon component shadows the global constructor.
+      const renamed = new window.File([file], newName, { type: file.type, lastModified: file.lastModified });
+      await onUpload(folder.id, renamed, false, { an: clean(folder.name), sn: clean(sn), pn: clean(pn), won: clean(won) });
+      setMessage({ ok: true, text: t(`已保存到 ${folder.label}：${newName}`, `Saved to ${folder.label}: ${newName}`) });
+      setFile(null);   // AN / SN / PN deliberately kept for the next file
+    } catch (e) {
+      setMessage({ ok: false, text: e.message || String(e) });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // Parse "AN^SN^PN.ext" (Eq Record) or "AN^SN^PN^WON.ext" (QC Review). "^" is the
+  // separator because a WON (or part name) can itself contain hyphens. The last
+  // field takes everything left over. AN must match a folder name.
+  const parseBatch = (files) => {
+    const need = isQc ? 4 : 3;
+    const fmt = isQc ? "Inspection^SN^Equipment Description^WO/PO" : "AN^SN^PN";
+    const rows = files.map((f) => {
+      const base = f.name.replace(/\.[^.]+$/, "");
+      const parts = base.split("^");
+      if (parts.length < need) return { file: f, error: t(`文件名不符合 ${fmt} 格式`, `Name isn't in ${fmt} format`) };
+      const head = parts.slice(0, need - 1).map(clean);
+      const last = clean(parts.slice(need - 1).join("^"));
+      const [an, sn, pn0] = head;
+      const pn = isQc ? pn0 : last;
+      const wonV = isQc ? last : "";
+      if (!an) return { file: f, an, sn, pn, won: wonV, error: t("AN 为空", "AN is empty") };
+      const hits = folders.filter((x) => clean(x.name).toLowerCase() === an.toLowerCase());
+      if (hits.length === 0) return { file: f, an, sn, pn, won: wonV, error: t(`找不到文件夹 "${an}"`, `No folder named "${an}"`) };
+      if (hits.length > 1) return { file: f, an, sn, pn, won: wonV, error: t(`有多个名为 "${an}" 的文件夹`, `Several folders named "${an}"`) };
+      // The file name already is in the AN^SN^PN[^WON] format, so keep it as the stored name.
+      return { file: f, an, sn, pn, won: wonV, folder: hits[0], newName: f.name };
+    });
+    setBatch(rows);
+    setFile(null);
+    setMessage(null);
+  };
+
+  const doBatchUpload = async () => {
+    setBusy(true);
+    setMessage(null);
+    const next = [...batch];
+    let ok = 0, fail = 0;
+    for (let i = 0; i < next.length; i++) {
+      const r = next[i];
+      if (!r.folder || r.status === "done") continue;
+      if ((docIndex || []).some((d) => d.name === r.newName && d.size === r.file.size)) {
+        next[i] = { ...r, status: "skipped" };
+        setBatch([...next]);
+        continue;
+      }
+      try {
+        const renamed = new window.File([r.file], r.newName, { type: r.file.type, lastModified: r.file.lastModified });
+        await onUpload(r.folder.id, renamed, true, { an: r.an, sn: r.sn, pn: r.pn, won: r.won });
+        next[i] = { ...r, status: "done" };
+        ok++;
+      } catch (e) {
+        next[i] = { ...r, status: "failed", error: e.message || String(e) };
+        fail++;
+      }
+      setBatch([...next]);
+    }
+    setMessage({ ok: fail === 0, text: t(`已上传 ${ok} 个文件，失败 ${fail} 个。`, `Uploaded ${ok} file(s), ${fail} failed.`) });
+    setBusy(false);
+  };
+
+  const inputCls = "w-full px-2 py-1 border border-stone-300 rounded text-sm bg-white";
+  return (
+    <div className={"fixed inset-0 z-[70] bg-black/40 " + (interacting ? "select-none" : "")}>
+      <div
+        className="absolute bg-white rounded shadow-2xl border border-stone-300 flex flex-col"
+        style={{ left: rect.x, top: rect.y, width: rect.w, height: rect.h }}
+      >
+        <div
+          onMouseDown={startInteract("move")}
+          onDoubleClick={() => {
+            const vw = window.innerWidth, vh = window.innerHeight;
+            const w = Math.min(1000, vw - 32), h = Math.round(vh * 0.85);
+            setRect({ x: Math.round((vw - w) / 2), y: Math.round((vh - h) / 2), w, h });
+          }}
+          className="flex items-center px-4 py-2 border-b border-stone-200 shrink-0 cursor-move select-none"
+          title={t("拖动标题栏可移动窗口，双击还原", "Drag the title bar to move; double-click to reset")}
+        >
+          <div className="font-bold text-stone-800">{isQc ? t("上传质检审核记录", "Upload QC Review") : t("上传设备记录", "Upload Eq Record")}</div>
+          <button onClick={onClose} onMouseDown={(e) => e.stopPropagation()} className="ml-auto p-1 text-stone-600 hover:text-stone-800" title={t("关闭", "Close")}><X size={16} /></button>
+        </div>
+        <div className="flex-1 min-h-0 flex">
+          <div className="w-80 shrink-0 p-4 border-r border-stone-200 overflow-auto space-y-3 text-sm">
+            <div>
+              <label className="block font-bold text-stone-700 mb-1">{isQc ? t("检验项目（文件夹）", "Inspection (folder)") : t("AN（装配号 / 文件夹）", "AN (assembly number / folder)")}</label>
+              <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder={t("筛选文件夹…", "Filter folders…")} className={inputCls + " mb-1"} />
+              <select value={nodeId} onChange={(e) => setNodeId(e.target.value)} className={inputCls}>
+                <option value="">{t("— 选择文件夹 —", "— select a folder —")}</option>
+                {shown.map((f) => <option key={f.id} value={f.id}>{f.label}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="block font-bold text-stone-700 mb-1">{isQc ? t("SN（序列号：被检设备的出厂序列号）", "SN (Serial Number of the inspected equipment)") : t("SN（序列号）", "SN (serial number)")}</label>
+              <input value={sn} onChange={(e) => setSn(e.target.value)} placeholder={t("可留空", "optional")} className={inputCls} />
+            </div>
+            <div>
+              <label className="block font-bold text-stone-700 mb-1">{isQc ? t("设备描述", "Equipment Description") : t("PN（零件名称）", "PN (part name)")}</label>
+              <input value={pn} onChange={(e) => setPn(e.target.value)} placeholder={t("可留空", "optional")} className={inputCls} />
+            </div>
+            {isQc && (
+              <div>
+                <label className="block font-bold text-stone-700 mb-1">{t("WO/PO（工单号 / 采购订单号）", "WO/PO (Work Order Number / Purchase Order)")}</label>
+                <input value={won} onChange={(e) => setWon(e.target.value)} placeholder={t("可留空", "optional")} className={inputCls} />
+              </div>
+            )}
+            <div>
+              <input ref={fileInputRef} type="file" className="hidden"
+                onChange={(e) => { setFile(e.target.files?.[0] || null); setBatch([]); setMessage(null); e.target.value = ""; }} />
+              <button onClick={() => fileInputRef.current?.click()} disabled={!folder || busy}
+                className="w-full px-3 py-1.5 border border-amber-400 text-amber-800 bg-amber-50 hover:bg-amber-100 rounded disabled:opacity-40 flex items-center justify-center gap-1.5">
+                <Upload size={13} /> {file ? t("重新选择文件…", "Choose a different file…") : t("选择文件…", "Choose file…")}
+              </button>
+              {!folder && <div className="text-xs text-stone-500 mt-1">{t("请先选择 AN 文件夹。", "Select an AN folder first.")}</div>}
+            </div>
+            <div className="pt-2 border-t border-stone-200">
+              <input ref={multiInputRef} type="file" multiple className="hidden"
+                onChange={(e) => { parseBatch(Array.from(e.target.files || [])); e.target.value = ""; }} />
+              <button onClick={() => multiInputRef.current?.click()} disabled={busy}
+                className="w-full px-3 py-1.5 border border-amber-400 text-amber-800 bg-amber-50 hover:bg-amber-100 rounded disabled:opacity-40 flex items-center justify-center gap-1.5">
+                <Upload size={13} /> {t("按文件名上传", "Upload by file name")}
+              </button>
+              <div className="text-xs text-stone-500 mt-1">{isQc
+                ? t("选择多个文件，文件名格式：检验项目^SN^设备描述^WO/PO（如 A100^SN001^轴承^WO-2026-01.pdf），自动填入各字段。", "Pick multiple files named Inspection^SN^Equipment Description^WO/PO (e.g. A100^SN001^Bearing^WO-2026-01.pdf); the fields are filled in automatically.")
+                : t("选择多个文件，文件名格式：AN^SN^PN（如 A100^SN001^轴承.pdf），自动填入 AN / SN / PN。", "Pick multiple files named AN^SN^PN (e.g. A100^SN001^Bearing.pdf); AN / SN / PN are filled in automatically.")}</div>
+            </div>
+            {batch.length > 0 && (
+              <button onClick={doBatchUpload} disabled={busy || !batch.some((r) => r.folder && !r.status)}
+                className="w-full px-3 py-1.5 bg-amber-600 text-white rounded hover:bg-amber-700 disabled:opacity-50 flex items-center justify-center gap-1.5">
+                {busy ? <Loader size={13} className="animate-spin" /> : <Upload size={13} />}
+                {t(`上传 ${batch.filter((r) => r.folder && !r.status).length} 个文件`, `Upload ${batch.filter((r) => r.folder && !r.status).length} file(s)`)}
+              </button>
+            )}
+            {file && (
+              <div className="p-2 bg-stone-50 border border-stone-200 rounded space-y-1">
+                <div className="text-xs text-stone-500">{t("将保存为：", "Will be saved as:")}</div>
+                <div className="font-mono text-xs break-all text-stone-900">{newName}</div>
+                <div className="flex gap-1.5 pt-1">
+                  <button onClick={doUpload} disabled={busy}
+                    className="flex-1 px-3 py-1.5 bg-amber-600 text-white rounded hover:bg-amber-700 disabled:opacity-50 flex items-center justify-center gap-1.5">
+                    {busy ? <Loader size={13} className="animate-spin" /> : <Upload size={13} />} {t("上传", "Upload")}
+                  </button>
+                  <a href={previewUrl} target="_blank" rel="noopener noreferrer"
+                    className="px-2 py-1.5 border border-stone-300 rounded hover:bg-white flex items-center" title={t("在新窗口打开查看", "Open in a new window to review")}>
+                    <ExternalLink size={13} />
+                  </a>
+                </div>
+              </div>
+            )}
+            {message && (
+              <div className={"text-xs p-2 rounded border " + (message.ok ? "bg-emerald-50 border-emerald-300 text-emerald-800" : "bg-red-50 border-red-300 text-red-700")}>
+                {message.text}
+                {message.ok && <div className="mt-1 text-stone-600">{t("可继续选择下一个文件，AN / SN / PN 已保留。", "Choose the next file — AN / SN / PN are kept.")}</div>}
+              </div>
+            )}
+          </div>
+          <div className="flex-1 min-w-0 bg-stone-100 relative">
+            {batch.length > 0 ? (
+              <div className="absolute inset-0 overflow-auto bg-white">
+                <table className="w-full text-xs">
+                  <thead className="sticky top-0 bg-stone-100 text-left">
+                    <tr><th className="p-2">{t("文件", "File")}</th><th className="p-2">{isQc ? "Inspection" : "AN"}</th><th className="p-2">SN</th><th className="p-2">{isQc ? "Equipment Description" : "PN"}</th>{isQc && <th className="p-2">WO/PO</th>}<th className="p-2">{t("状态", "Status")}</th></tr>
+                  </thead>
+                  <tbody>
+                    {batch.map((r, i) => (
+                      <tr key={i} className="border-t border-stone-200 align-top">
+                        <td className="p-2 break-all">{r.file.name}</td>
+                        <td className="p-2">{r.an}</td>
+                        <td className="p-2">{r.sn}</td>
+                        <td className="p-2 break-all">{r.pn}</td>
+                        {isQc && <td className="p-2 break-all">{r.won}</td>}
+                        <td className={"p-2 " + (r.status === "done" ? "text-emerald-700" : r.error ? "text-red-600" : r.status === "skipped" ? "text-stone-500" : "text-stone-700")}>
+                          {r.status === "done" ? t("已上传", "Uploaded")
+                            : r.status === "skipped" ? t("已存在，跳过", "Already exists, skipped")
+                            : r.error ? r.error
+                            : r.folder.label}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : !file ? (
+              <div className="absolute inset-0 flex items-center justify-center text-stone-500 text-sm p-6 text-center">
+                {t("选择文件后可在此处预览内容。", "Choose a file to review its contents here.")}
+              </div>
+            ) : isImg ? (
+              <img src={previewUrl} alt={file.name} className="absolute inset-0 w-full h-full object-contain bg-white" />
+            ) : (isPdf || isTxt) ? (
+              <iframe src={previewUrl} title={file.name} className="absolute inset-0 w-full h-full border-0 bg-white" />
+            ) : (
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-stone-600 text-sm p-6 text-center">
+                <div>{t("此文件类型无法在此预览。", "This file type can't be previewed here.")}</div>
+                <a href={previewUrl} download={file.name} className="text-amber-700 hover:text-amber-900 underline">{t("下载查看", "Download to view")}</a>
+              </div>
+            )}
+            {/* Keeps the preview iframe from swallowing mouse events mid-drag/resize */}
+            {interacting && <div className="absolute inset-0" />}
+          </div>
+        </div>
+        {/* Resize handles: four edges + four corners */}
+        {[
+          ["n", "top-0 left-2 right-2 h-1.5 cursor-ns-resize"],
+          ["s", "bottom-0 left-2 right-2 h-1.5 cursor-ns-resize"],
+          ["w", "left-0 top-2 bottom-2 w-1.5 cursor-ew-resize"],
+          ["e", "right-0 top-2 bottom-2 w-1.5 cursor-ew-resize"],
+          ["nw", "top-0 left-0 w-3 h-3 cursor-nwse-resize"],
+          ["ne", "top-0 right-0 w-3 h-3 cursor-nesw-resize"],
+          ["sw", "bottom-0 left-0 w-3 h-3 cursor-nesw-resize"],
+          ["se", "bottom-0 right-0 w-4 h-4 cursor-nwse-resize"],
+        ].map(([dir, cls]) => (
+          <div key={dir} onMouseDown={startInteract(dir)} className={"absolute z-10 " + cls} />
+        ))}
+      </div>
+    </div>
+  );
+};
+
 const FolderAskAIDialog = ({ open, node, tree, docIndex, onClose, onOpenDoc, onOpenAISettings, onDocsChanged }) => {
   const { t } = useLang();
   const docsById = useMemo(() => new Map((docIndex || []).map((d) => [d.id, d])), [docIndex]);
@@ -7615,6 +8403,7 @@ const FolderAskAIDialog = ({ open, node, tree, docIndex, onClose, onOpenDoc, onO
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
+      if (onDocsChanged) onDocsChanged();   // server files the copy into the "databook" folder
     } catch (e) {
       setErr(e.message || String(e));
     } finally {
@@ -10963,6 +11752,14 @@ const pageForOffset = (pageRanges, offset) => {
  * =============================================================================
  */
 let _pdfjsLoadPromise = null;
+// Decoder/font assets for scanned PDFs (JBIG2/JPX need the wasm decoders)
+// and non-embedded fonts -- without these such pages render blank.
+const pdfJsAssetOpts = () => ({
+  wasmUrl: `${API_BASE}/vendor/pdfjs/wasm/`,
+  cMapUrl: `${API_BASE}/vendor/pdfjs/cmaps/`,
+  cMapPacked: true,
+  standardFontDataUrl: `${API_BASE}/vendor/pdfjs/standard_fonts/`,
+});
 const loadPdfJs = () => {
   if (!_pdfjsLoadPromise) {
     _pdfjsLoadPromise = (async () => {
@@ -10999,7 +11796,7 @@ const loadPdfJs = () => {
 // this page has pdf.js's own embedded text layer (silently does nothing for
 // a scanned/OCR-only page -- the page jump above already got the user
 // there, so nothing regresses).
-const PdfViewerPanel = ({ url, jumpToPage, highlightText, jumpNonce }) => {
+const PdfViewerPanel = ({ url, jumpToPage, highlightText, jumpNonce, onViewerReady }) => {
   const { t } = useLang();
   const containerRef = useRef(null);
   const viewerDivRef = useRef(null);
@@ -11045,7 +11842,7 @@ const PdfViewerPanel = ({ url, jumpToPage, highlightText, jumpNonce }) => {
 
         instanceRef.current = { pdfjsLib, pdfjsViewer, eventBus, linkService, findController, pdfViewer };
 
-        const doc = await pdfjsLib.getDocument({ url }).promise;
+        const doc = await pdfjsLib.getDocument({ url, ...pdfJsAssetOpts() }).promise;
         if (cancelled) { doc.destroy(); return; }
         instanceRef.current.doc = doc;
         pdfViewer.setDocument(doc);
@@ -11053,12 +11850,14 @@ const PdfViewerPanel = ({ url, jumpToPage, highlightText, jumpNonce }) => {
         setPageInfo({ page: 1, count: doc.numPages });
         setPageInput("1");
         setReady(true);
+        if (onViewerReady) onViewerReady({ pdfViewer, eventBus, doc, container: containerRef.current });
       } catch (e) {
         if (!cancelled) setError(e?.message || String(e));
       }
     })();
     return () => {
       cancelled = true;
+      if (onViewerReady) onViewerReady(null);
       const inst = instanceRef.current;
       instanceRef.current = null;
       try { inst?.pdfViewer?.setDocument(null); } catch {}
@@ -11132,6 +11931,268 @@ const PdfViewerPanel = ({ url, jumpToPage, highlightText, jumpNonce }) => {
             {t("加载失败：", "Failed to load: ")}{error}
           </div>
         )}
+      </div>
+    </div>
+  );
+};
+
+// Target languages for the PDF translation pane. Chinese first (the app's
+// main use), then every other major language alphabetically by English name.
+// `name` is what the AI is told; `label` is the native name shown in the menu.
+const TRANSLATE_LANGUAGES = [
+  { name: "Simplified Chinese (简体中文)", label: "中文（简体）" },
+  { name: "Traditional Chinese (繁體中文)", label: "中文（繁體）" },
+  ...[
+    ["Afrikaans", "Afrikaans"], ["Arabic", "العربية"], ["Bengali", "বাংলা"], ["Bulgarian", "Български"],
+    ["Cantonese (粵語)", "粵語"], ["Catalan", "Català"], ["Croatian", "Hrvatski"], ["Czech", "Čeština"],
+    ["Danish", "Dansk"], ["Dutch", "Nederlands"], ["English", "English"], ["Estonian", "Eesti"],
+    ["Filipino", "Filipino"], ["Finnish", "Suomi"], ["French", "Français"], ["German", "Deutsch"],
+    ["Greek", "Ελληνικά"], ["Gujarati", "ગુજરાતી"], ["Hebrew", "עברית"], ["Hindi", "हिन्दी"],
+    ["Hungarian", "Magyar"], ["Indonesian", "Bahasa Indonesia"], ["Italian", "Italiano"], ["Japanese", "日本語"],
+    ["Kannada", "ಕನ್ನಡ"], ["Korean", "한국어"], ["Latvian", "Latviešu"], ["Lithuanian", "Lietuvių"],
+    ["Malay", "Bahasa Melayu"], ["Malayalam", "മലയാളം"], ["Marathi", "मराठी"], ["Norwegian", "Norsk"],
+    ["Persian", "فارسی"], ["Polish", "Polski"], ["Portuguese", "Português"], ["Punjabi", "ਪੰਜਾਬੀ"],
+    ["Romanian", "Română"], ["Russian", "Русский"], ["Serbian", "Српски"], ["Slovak", "Slovenčina"],
+    ["Slovenian", "Slovenščina"], ["Spanish", "Español"], ["Swahili", "Kiswahili"], ["Swedish", "Svenska"],
+    ["Tamil", "தமிழ்"], ["Telugu", "తెలుగు"], ["Thai", "ไทย"], ["Turkish", "Türkçe"],
+    ["Ukrainian", "Українська"], ["Urdu", "اردو"], ["Vietnamese", "Tiếng Việt"],
+  ].map(([name, label]) => ({ name, label: name === label ? name : `${label} (${name.replace(/ \(.*\)/, "")})` })),
+];
+
+// Side-by-side "original | Chinese translation" view for a PDF. The left pane
+// is the pdf.js viewer; the right pane lists one translated block per page
+// (translated lazily, only the pages near what's on screen). Scrolling either
+// pane scrolls the other to the same page and the same fraction through it,
+// so the Chinese always lines up with the English being read.
+const PdfTranslateSplit = ({ docId, url, onClose }) => {
+  const { t } = useLang();
+  const [viewer, setViewer] = useState(null);
+  const [provider, setProvider] = useState("gemini");
+  const [language, setLanguage] = useState(TRANSLATE_LANGUAGES[0].name);
+  const [fontPct, setFontPct] = useState(100);
+  const [trans, setTrans] = useState({});      // page -> {status, text, error}
+  const [heights, setHeights] = useState([]);
+  const [curPage, setCurPage] = useState(1);
+  const rightRef = useRef(null);
+  const transRef = useRef({});
+  const lockRef = useRef({ owner: null, until: 0 });
+  const curPageRef = useRef(1);
+  const chainRef = useRef(Promise.resolve());
+  const providerRef = useRef("gemini");
+  const languageRef = useRef(TRANSLATE_LANGUAGES[0].name);
+  const pageCount = viewer?.doc?.numPages || 0;
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      const g = await StorageAdapter.getAISettings("gemini").catch(() => ({}));
+      if (!alive || g.configured) return;
+      const d = await StorageAdapter.getAISettings("deepseek").catch(() => ({}));
+      if (alive && d.configured) setProvider("deepseek");
+    })();
+    return () => { alive = false; };
+  }, []);
+
+  const setPageState = (p, v) => {
+    transRef.current = { ...transRef.current, [p]: v };
+    setTrans(transRef.current);
+  };
+
+  const loadPage = (p) => {
+    const cur = transRef.current[p];
+    if (cur && cur.status !== "error") return;
+    if (cur && cur.status === "loading") return;
+    setPageState(p, { status: "loading" });
+    const prov = providerRef.current;
+    const lang = languageRef.current;
+    const stale = () => providerRef.current !== prov || languageRef.current !== lang;
+    chainRef.current = chainRef.current.then(async () => {
+      if (stale()) return;
+      // Dropped from the queue if the user has scrolled far away meanwhile.
+      if (Math.abs(p - curPageRef.current) > 3) { setPageState(p, undefined); return; }
+      try {
+        let text = "";
+        try {
+          const page = await viewer.doc.getPage(p);
+          const tc = await page.getTextContent();
+          text = tc.items.map((it) => (it.str || "") + (it.hasEOL ? "\n" : "")).join("");
+        } catch {}
+        const res = await fetch(`${API_BASE}/api/docs/${docId}/translate-page`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ page: p, text, provider: prov, language: lang }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (stale()) return;
+        if (res.status === 422) { setPageState(p, { status: "empty" }); return; }
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+        setPageState(p, { status: "done", text: data.text });
+      } catch (e) {
+        if (!stale()) setPageState(p, { status: "error", error: e.message || String(e) });
+      }
+    });
+  };
+
+  const ensureNear = (page) => {
+    if (!viewer) return;
+    for (let p = Math.max(1, page - 1); p <= Math.min(pageCount, page + 2); p++) loadPage(p);
+  };
+
+  useEffect(() => {
+    providerRef.current = provider;
+    languageRef.current = language;
+    transRef.current = {};
+    setTrans({});
+    chainRef.current = Promise.resolve();
+    ensureNear(curPageRef.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [provider, language, viewer]);
+
+  // Left pane page geometry (so each right-hand block starts out the same
+  // height as the page it translates), current page, and scroll syncing.
+  useEffect(() => {
+    if (!viewer) return;
+    const { pdfViewer, eventBus, container } = viewer;
+    const measure = () => {
+      const hs = [];
+      for (let i = 0; i < pdfViewer.pagesCount; i++) {
+        const pv = pdfViewer.getPageView(i);
+        hs.push(pv?.div ? pv.div.offsetHeight : 0);
+      }
+      setHeights((prev) => (prev.length === hs.length && prev.every((h, i) => h === hs[i]) ? prev : hs));
+    };
+    const onPage = (e) => {
+      curPageRef.current = e.pageNumber;
+      setCurPage(e.pageNumber);
+      ensureNear(e.pageNumber);
+    };
+    measure();
+    eventBus.on("pagesinit", measure);
+    eventBus.on("scalechanging", measure);
+    eventBus.on("pagerendered", measure);
+    eventBus.on("pagechanging", onPage);
+    const ro = new ResizeObserver(measure);
+    ro.observe(container);
+
+    const onLeftScroll = () => {
+      const lk = lockRef.current, now = Date.now();
+      if (lk.owner === "right" && now < lk.until) return;
+      const right = rightRef.current;
+      if (!right) return;
+      const n = pdfViewer.pagesCount;
+      const s = container.scrollTop;
+      let i = 0;
+      for (let k = 0; k < n; k++) {
+        const d = pdfViewer.getPageView(k)?.div;
+        if (d && d.offsetTop <= s + 1) i = k; else break;
+      }
+      const d = pdfViewer.getPageView(i)?.div;
+      const blk = right.querySelector(`[data-page="${i + 1}"]`);
+      if (!d || !blk) return;
+      const frac = Math.max(0, Math.min(1, (s - d.offsetTop) / Math.max(1, d.offsetHeight)));
+      lockRef.current = { owner: "left", until: now + 120 };
+      right.scrollTop = blk.offsetTop + frac * blk.offsetHeight;
+    };
+    container.addEventListener("scroll", onLeftScroll, { passive: true });
+    return () => {
+      container.removeEventListener("scroll", onLeftScroll);
+      ro.disconnect();
+      try {
+        eventBus.off("pagesinit", measure);
+        eventBus.off("scalechanging", measure);
+        eventBus.off("pagerendered", measure);
+        eventBus.off("pagechanging", onPage);
+      } catch {}
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [viewer]);
+
+  const onRightScroll = () => {
+    const lk = lockRef.current, now = Date.now();
+    if (lk.owner === "left" && now < lk.until) return;
+    const right = rightRef.current;
+    if (!right || !viewer) return;
+    const { pdfViewer, container } = viewer;
+    const s = right.scrollTop;
+    const blocks = right.querySelectorAll("[data-page]");
+    let blk = blocks[0];
+    for (const b of blocks) { if (b.offsetTop <= s + 1) blk = b; else break; }
+    if (!blk) return;
+    const i = Number(blk.dataset.page) - 1;
+    const d = pdfViewer.getPageView(i)?.div;
+    if (!d) return;
+    const frac = Math.max(0, Math.min(1, (s - blk.offsetTop) / Math.max(1, blk.offsetHeight)));
+    lockRef.current = { owner: "right", until: now + 120 };
+    container.scrollTop = d.offsetTop + frac * d.offsetHeight;
+  };
+
+  const pages = [];
+  for (let p = 1; p <= pageCount; p++) pages.push(p);
+
+  return (
+    <div className="w-full h-full flex bg-white">
+      <div className="w-1/2 min-w-0 h-full border-r border-stone-300">
+        <PdfViewerPanel url={url} onViewerReady={setViewer} />
+      </div>
+      <div className="w-1/2 min-w-0 h-full flex flex-col">
+        <div className="flex items-center gap-2 px-2 py-1 border-b border-stone-200 bg-emerald-50 text-sm shrink-0">
+          <select
+            value={language}
+            onChange={(e) => setLanguage(e.target.value)}
+            className="px-1 py-0.5 border border-stone-300 rounded bg-white font-bold text-emerald-800 max-w-[11rem]"
+            title={t("翻译成哪种语言", "Language to translate into")}
+          >
+            {TRANSLATE_LANGUAGES.map((l) => <option key={l.name} value={l.name}>{l.label}</option>)}
+          </select>
+          <span className="text-stone-600 whitespace-nowrap">{t(`第 ${curPage} / ${pageCount || "—"} 页`, `Page ${curPage} / ${pageCount || "—"}`)}</span>
+          <div className="w-px h-4 bg-stone-300" />
+          <button onClick={() => setFontPct((f) => Math.max(50, f - 10))} className="w-6 h-6 leading-none border border-stone-300 rounded hover:bg-white" title={t("缩小文字", "Smaller text")}>−</button>
+          <span className="text-stone-700 w-10 text-center">{fontPct}%</span>
+          <button onClick={() => setFontPct((f) => Math.min(300, f + 10))} className="w-6 h-6 leading-none border border-stone-300 rounded hover:bg-white" title={t("放大文字", "Larger text")}>+</button>
+          <select
+            value={provider}
+            onChange={(e) => setProvider(e.target.value)}
+            className="ml-auto px-1 py-0.5 border border-stone-300 rounded bg-white"
+            title={t("翻译所用的 AI", "AI used for translating")}
+          >
+            <option value="gemini">Gemini</option>
+            <option value="deepseek">DeepSeek</option>
+          </select>
+          <button onClick={onClose} className="p-1 text-stone-600 hover:text-stone-800" title={t("关闭翻译", "Close translation")}>
+            <X size={13} />
+          </button>
+        </div>
+        <div ref={rightRef} onScroll={onRightScroll} className="relative flex-1 min-h-0 overflow-auto bg-stone-100">
+          {!viewer && (
+            <div className="p-4 text-sm text-stone-600">{t("加载文档中…", "Loading document…")}</div>
+          )}
+          {pages.map((p) => {
+            const st = trans[p];
+            return (
+              <div key={p} data-page={p} className="box-border border-b border-stone-300 bg-white px-4 py-3"
+                style={{ minHeight: heights[p - 1] || 200 }}>
+                <div className="text-xs font-bold text-stone-500 mb-1">{t(`第 ${p} 页`, `Page ${p}`)}</div>
+                {(!st || st.status === "loading") && (
+                  <div className="text-sm text-stone-500 flex items-center gap-1.5">
+                    <Loader size={12} className="animate-spin" /> {t("翻译中…", "Translating…")}
+                  </div>
+                )}
+                {st?.status === "done" && (
+                  <div className="leading-relaxed text-stone-900 whitespace-pre-wrap break-words" style={{ fontSize: `${15 * fontPct / 100}px` }}>{st.text}</div>
+                )}
+                {st?.status === "empty" && (
+                  <div className="text-sm text-stone-500">{t("（此页没有可翻译的文字）", "(No translatable text on this page)")}</div>
+                )}
+                {st?.status === "error" && (
+                  <div className="text-sm text-red-600">
+                    {st.error}{" "}
+                    <button onClick={() => loadPage(p)} className="underline text-amber-700">{t("重试", "Retry")}</button>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
       </div>
     </div>
   );
@@ -11523,6 +12584,9 @@ const DocumentCard = ({
   const [snDraft, setSnDraft] = useState("");
   const [editingDue, setEditingDue] = useState(false);
   const [dueDraft, setDueDraft] = useState("");
+  const [remindDraft, setRemindDraft] = useState(DEFAULT_REMIND_DAYS);
+  const [repeatDraft, setRepeatDraft] = useState("");
+  const [labelDraft, setLabelDraft] = useState("");
   const [editingDocDate, setEditingDocDate] = useState(false);
   const [docDateDraft, setDocDateDraft] = useState("");
   const [showSendPhone, setShowSendPhone] = useState(false);
@@ -11580,12 +12644,15 @@ const DocumentCard = ({
   const startEditDue = (e) => {
     e.stopPropagation();
     setDueDraft(doc.dueDate || "");
+    setRemindDraft(doc.remindDays || DEFAULT_REMIND_DAYS);
+    setRepeatDraft(doc.repeat || "");
+    setLabelDraft(doc.dueLabel || "");
     setEditingDue(true);
     openDocForReference();
     onMarkWorked && onMarkWorked();
   };
   const commitDue = () => {
-    onUpdateDueDate(dueDraft);
+    onUpdateDueDate(dueDraft, { remindDays: remindDraft, repeat: repeatDraft, dueLabel: labelDraft });
     setEditingDue(false);
   };
   const cancelDue = () => setEditingDue(false);
@@ -11709,7 +12776,7 @@ const DocumentCard = ({
                 <span className={`flex items-center gap-1 px-1 rounded not-italic ${
                   scheduleMode && urgency ? URGENCY_ROW_CLASSES[urgency] : "text-stone-700"
                 }`} title={scheduleMode && urgency ? t(URGENCY_LABELS[urgency].zh, URGENCY_LABELS[urgency].en) : t("到期日", "Due date")}>
-                  <Clock size={9} /> {t("到期：", "Due: ")}{doc.dueDate}
+                  <Clock size={9} /> {doc.dueLabel ? `${doc.dueLabel}：` : t("到期：", "Due: ")}{doc.dueDate}{doc.repeat ? " ↻" : ""}
                 </span>
               </>
             )}
@@ -11992,6 +13059,32 @@ const DocumentCard = ({
               {t("取消", "Cancel")}
             </button>
           </div>
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 mt-2 text-sm text-stone-700">
+            <label className="flex items-center gap-1">
+              {t("提前提醒", "Remind")}
+              <select value={remindDraft} onChange={(e) => setRemindDraft(Number(e.target.value))}
+                className="text-sm px-1.5 py-0.5 border border-stone-300 rounded">
+                {(REMIND_DAYS_OPTIONS.includes(remindDraft) ? REMIND_DAYS_OPTIONS : [...REMIND_DAYS_OPTIONS, remindDraft].sort((a, b) => a - b)).map((n) => (
+                  <option key={n} value={n}>{t(`${n} 天`, `${n} days`)}</option>
+                ))}
+              </select>
+            </label>
+            <label className="flex items-center gap-1">
+              {t("重复", "Repeat")}
+              <select value={repeatDraft} onChange={(e) => setRepeatDraft(e.target.value)}
+                className="text-sm px-1.5 py-0.5 border border-stone-300 rounded">
+                <option value="">{t("不重复", "Never")}</option>
+                <option value="monthly">{t("每月", "Monthly")}</option>
+                <option value="quarterly">{t("每季度", "Quarterly")}</option>
+                <option value="yearly">{t("每年", "Yearly")}</option>
+              </select>
+            </label>
+            <input
+              type="text" value={labelDraft} onChange={(e) => setLabelDraft(e.target.value)}
+              placeholder={t("备注（如：护照到期、保险续保）", "Label (e.g. passport expiry, policy renewal)")}
+              className="flex-1 min-w-[180px] text-sm px-2 py-0.5 border border-stone-300 rounded focus:outline-none focus:border-amber-600"
+            />
+          </div>
           <div className="text-[12px] text-stone-700 mt-1.5 leading-snug">
             {t("留空并保存可清除到期日。开启右上角【日程】模式后，临近或超过到期日的文档与所在文件夹会自动变色提醒。", "Leave blank and save to clear the due date. With Schedule mode (top right) enabled, documents and folders approaching or past their due date are automatically color-coded.")}
           </div>
@@ -12116,6 +13209,50 @@ const DocumentGridTile = ({
   const [thumbError, setThumbError] = useState(false);
   const Icon = isImage ? ImageIcon : FileText;
 
+  // PDFs: render page 1 with pdf.js onto a canvas, lazily once the tile
+  // scrolls into view (a big folder shouldn't parse every PDF up front).
+  const isPdfDoc = doc.mime === "application/pdf" || _ext === "pdf";
+  const pdfBoxRef = useRef(null);
+  const pdfCanvasRef = useRef(null);
+  const [pdfThumbReady, setPdfThumbReady] = useState(false);
+  const [pdfVisible, setPdfVisible] = useState(false);
+  useEffect(() => {
+    if (!isPdfDoc || !pdfBoxRef.current) return;
+    const io = new IntersectionObserver((entries) => {
+      if (entries.some((en) => en.isIntersecting)) { setPdfVisible(true); io.disconnect(); }
+    }, { rootMargin: "200px" });
+    io.observe(pdfBoxRef.current);
+    return () => io.disconnect();
+  }, [isPdfDoc]);
+  useEffect(() => {
+    if (!isPdfDoc || !pdfVisible) return;
+    let cancelled = false;
+    let task = null;
+    let pdf = null;
+    (async () => {
+      try {
+        const { pdfjsLib } = await loadPdfJs();
+        task = pdfjsLib.getDocument({ url: `${API_BASE}/api/docs/${doc.id}`, ...pdfJsAssetOpts() });
+        pdf = await task.promise;
+        const page = await pdf.getPage(1);
+        if (cancelled) return;
+        const base = page.getViewport({ scale: 1 });
+        // Render at ~2x a 340px tile for crisp xlarge thumbnails.
+        const scale = Math.min(3, 680 / Math.max(base.width, base.height));
+        const vp = page.getViewport({ scale });
+        const canvas = pdfCanvasRef.current;
+        if (!canvas) return;
+        canvas.width = vp.width;
+        canvas.height = vp.height;
+        await page.render({ canvasContext: canvas.getContext("2d"), viewport: vp }).promise;
+        if (!cancelled) setPdfThumbReady(true);
+      } catch {
+        if (!cancelled) setThumbError(true);
+      }
+    })();
+    return () => { cancelled = true; try { task && task.destroy(); } catch {} };
+  }, [isPdfDoc, pdfVisible, doc.id]);
+
   const showCheckbox = faceSelectMode || selectMode;
   const isChecked = faceSelectMode ? faceSelected : selected;
   const toggleChecked = faceSelectMode ? onToggleFaceSelect : onToggleSelect;
@@ -12160,8 +13297,15 @@ const DocumentGridTile = ({
             : <Square size={16} className="text-stone-500 bg-white/80 rounded" />}
         </div>
       )}
-      <div className="relative w-full aspect-square rounded bg-stone-100 flex items-center justify-center overflow-hidden">
-        {thumbUrl && !thumbError ? (
+      <div ref={pdfBoxRef} className="relative w-full aspect-square rounded bg-stone-100 flex items-center justify-center overflow-hidden">
+        {isPdfDoc && !thumbError && (
+          <canvas
+            ref={pdfCanvasRef}
+            className="max-w-full max-h-full bg-white"
+            style={{ display: pdfThumbReady ? "block" : "none" }}
+          />
+        )}
+        {isPdfDoc && !thumbError && pdfThumbReady ? null : thumbUrl && !thumbError ? (
           <img
             src={thumbUrl}
             alt={doc.name}
@@ -12243,7 +13387,9 @@ const SettingsScreen = ({ initialPath, currentPath, isInitialSetup, onSaved, onC
         }
       }
 
-      const r = await StorageAdapter.saveSettings(trimmed, copyCurrentData);
+      // New location has no DMS data: rename the existing folder to it (all
+      // files move along); the server falls back to copying if it can't.
+      const r = await StorageAdapter.saveSettings(trimmed, copyCurrentData, copyCurrentData);
       onSaved(r.resolved_path);
     } catch (e) {
       setError(e.message);
@@ -12929,78 +14075,304 @@ const HierarchyImportDialog = ({ open, onClose, onImported, tree, defaultTargetN
   );
 };
 
-// ---- Due-Documents List Dialog ---------------------------------------------
-// Opened by the "日程" (Schedule) toggle: lists every document due within
-// the urgency window (red/yellow/blue), most-urgent-first. Clicking a row
-// navigates to that document's folder and opens it for full editing.
-const DueDocsListDialog = ({ open, items, getNodePath, onClose, onOpenItem }) => {
+// ---- Due-Date List Dialog --------------------------------------------------
+// Opened by the "日程" (Schedule) toggle. Lists due dates either by file or by
+// folder (toggle at the top). Items with a due date come first (soonest
+// first; urgency-tinted when within the 2-week window), then a second group
+// of items with no due date. Clicking a row navigates to that folder / opens
+// that document.
+const DUE_LIST_NO_DUE_CAP = 500; // rendering cap for the (potentially huge) "no due date" group
+const DueDocsListDialog = ({ open, docs, folders, scopeName, getNodePath, onClose, onOpenItem, onOpenFolder, onDone, onBulkSet, undoCount = 0, onUndoBulk }) => {
   const { t } = useLang();
+  const [level, setLevel] = useState("file"); // "file" | "folder"
+  const [showAllNoDue, setShowAllNoDue] = useState(false);
+  // "Show only due soon": hide undated items and anything outside its reminder window.
+  const [dueSoonOnly, setDueSoonOnly] = useState(false);
+  // Bulk "set reminder" panel: applies to every dated document in the current
+  // scope (selected folder + subfolders). Two-step: Apply -> confirm with count.
+  const [bulkOpen, setBulkOpen] = useState(false);
+  const [bulkRemind, setBulkRemind] = useState(30);
+  const [bulkRepeat, setBulkRepeat] = useState("__keep");
+  const [bulkConfirm, setBulkConfirm] = useState(false);
+  const [bulkDone, setBulkDone] = useState(null); // number applied, for feedback
+  const [undoMsg, setUndoMsg] = useState("");
+  const undoBtn = undoCount > 0 && (
+    <button
+      onClick={async () => {
+        const r = await onUndoBulk();
+        setBulkDone(null);
+        setUndoMsg(r.skipped
+          ? t(`已撤销 ${r.restored} 份，跳过 ${r.skipped} 份（之后又被单独修改过）`, `Undid ${r.restored}; skipped ${r.skipped} edited since`)
+          : t(`已撤销 ${r.restored} 份文档的修改`, `Undid changes to ${r.restored} document(s)`));
+      }}
+      className="text-stone-700 hover:text-red-700 hover:underline"
+      title={t("恢复上一次批量设置前每份文档的提醒天数和重复设置（之后单独改过的文档会被跳过）", "Restore each document's reminder settings from before the last bulk change (documents edited since are skipped)")}
+    >
+      ↶ {t(`撤销上次批量修改（${undoCount} 份）`, `Undo last bulk change (${undoCount})`)}
+    </button>
+  );
+  const bulkIds = useMemo(
+    () => [...new Set(docs.filter((d) => d.dueDate).map((d) => d.id))],
+    [docs]
+  );
+  useEffect(() => { if (!open) { setBulkOpen(false); setBulkConfirm(false); setBulkDone(null); setUndoMsg(""); } }, [open]);
+  useEffect(() => { if (open) setShowAllNoDue(false); }, [open, level]);
+
+  // Draggable (title bar) / resizable (right edge, bottom edge, corner)
+  // window -- same pattern as the Ask AI dialog. Geometry persists across
+  // close/reopen for the session.
+  const [pos, setPos] = useState({ x: null, y: null });
+  const [size, setSize] = useState(() => ({
+    w: Math.min(900, window.innerWidth - 48),
+    h: Math.min(Math.round(window.innerHeight * 0.85), window.innerHeight - 48),
+  }));
+  // True only when the current press began on the backdrop itself, so a drag
+  // that starts on the window (move/resize) and is released over the backdrop
+  // doesn't count as a backdrop click and close the dialog.
+  const backdropDownRef = useRef(false);
+  const [colW, setColW] = useState([330, 330, 150]); // px widths of the three columns
+  // Dragging an edge moves the boundary between column i and column i+1
+  // (the neighbour absorbs the change, so the total width is unchanged).
+  // The last column has no neighbour, so it just grows/shrinks the table.
+  const onColResizeStart = (i) => (e) => {
+    e.preventDefault(); e.stopPropagation();
+    const startX = e.clientX, orig = colW.slice();
+    const MIN = 60;
+    trackMouse((ev) => {
+      let dx = ev.clientX - startX;
+      if (i < orig.length - 1) {
+        dx = Math.max(MIN - orig[i], Math.min(dx, orig[i + 1] - MIN));
+        setColW(orig.map((v, j) => (j === i ? v + dx : j === i + 1 ? v - dx : v)));
+      } else {
+        setColW(orig.map((v, j) => (j === i ? Math.max(MIN, v + dx) : v)));
+      }
+    });
+  };
+  const dragRef = useRef(null);
+  const rawPos = pos.x != null ? pos : {
+    x: (window.innerWidth - size.w) / 2,
+    y: (window.innerHeight - size.h) / 2,
+  };
+  const curPos = {
+    x: Math.min(Math.max(rawPos.x, -(size.w - 120)), window.innerWidth - 120),
+    y: Math.min(Math.max(rawPos.y, 0), Math.max(0, window.innerHeight - 60)),
+  };
+  const trackMouse = (onMove) => {
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      dragRef.current = null;
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+  const onDragStart = (e) => {
+    if (e.target.closest("button")) return; // don't drag from the toggle / close buttons
+    e.preventDefault();
+    dragRef.current = { startX: e.clientX, startY: e.clientY, origX: curPos.x, origY: curPos.y };
+    trackMouse((ev) => {
+      const d = dragRef.current; if (!d) return;
+      setPos({ x: d.origX + (ev.clientX - d.startX), y: d.origY + (ev.clientY - d.startY) });
+    });
+  };
+  const onResizeStart = (axis) => (e) => {
+    e.preventDefault(); e.stopPropagation();
+    dragRef.current = { startX: e.clientX, startY: e.clientY, origW: size.w, origH: size.h };
+    trackMouse((ev) => {
+      const d = dragRef.current; if (!d) return;
+      const dx = ev.clientX - d.startX, dy = ev.clientY - d.startY;
+      setSize({
+        w: axis !== "y" ? Math.min(window.innerWidth, Math.max(ASKAI_DIALOG_MIN_W, d.origW + dx)) : d.origW,
+        h: axis !== "x" ? Math.min(window.innerHeight, Math.max(260, d.origH + dy)) : d.origH,
+      });
+    });
+  };
+
+  const { dated, undated } = useMemo(() => {
+    const src = level === "folder" ? folders : docs;
+    const withTier = src.map((x) => ({ ...x, tier: urgencyTier(x.dueDate, x.remindDays) }));
+    return {
+      dated: withTier
+        .filter((x) => x.dueDate && (!dueSoonOnly || x.tier))
+        .sort((a, b) => a.dueDate.localeCompare(b.dueDate)),
+      undated: dueSoonOnly ? [] : withTier.filter((x) => !x.dueDate),
+    };
+  }, [level, docs, folders, dueSoonOnly]);
+
   if (!open) return null;
+  const isFolder = level === "folder";
+  const shownUndated = showAllNoDue ? undated : undated.slice(0, DUE_LIST_NO_DUE_CAP);
+  const openRow = (x) => (isFolder ? onOpenFolder(x) : onOpenItem(x));
+
+  const renderRow = (x) => {
+    const path = getNodePath(x.folderId) || "—";
+    return (
+      <tr key={x.key || x.id} onClick={() => openRow(x)} className="border-b border-stone-100 hover:bg-amber-50 cursor-pointer">
+        <td className="px-5 py-2 text-stone-700 text-sm truncate" title={path}>{isFolder ? x.name : path}</td>
+        {!isFolder && (
+          <td className="px-2 py-2 truncate" title={x.name}>
+            <span className="flex items-center gap-1.5 min-w-0">
+              {x.tier && <span className={`w-2 h-2 rounded-full shrink-0 ${URGENCY_DOT_CLASSES[x.tier]}`} />}
+              <span className={`${x.tier ? URGENCY_TEXT_CLASSES[x.tier] : "text-stone-800"} hover:underline truncate`}>{x.name}</span>
+            </span>
+          </td>
+        )}
+        {isFolder && (
+          <td className="px-2 py-2 text-stone-600 text-sm truncate" title={path}>{path}</td>
+        )}
+        <td className="px-2 py-2 font-mono text-sm whitespace-nowrap">
+          {x.dueDate || <span className="text-stone-500 font-sans">—</span>}
+          {x.tier && <span className="text-stone-600 block text-[12px] font-sans">{t(URGENCY_LABELS[x.tier].zh, URGENCY_LABELS[x.tier].en)}</span>}
+          {!isFolder && x.dueDate && onDone && (
+            <button
+              onClick={(e) => { e.stopPropagation(); onDone(x.id); }}
+              className="mt-0.5 text-[12px] font-sans text-emerald-700 hover:underline"
+              title={x.repeat ? t("完成，并顺延到下一个周期", "Done -- roll to the next occurrence") : t("完成，清除到期日", "Done -- clear the due date")}
+            >
+              ✓ {t("完成", "Done")}{x.repeat ? " ↻" : ""}
+            </button>
+          )}
+        </td>
+      </tr>
+    );
+  };
+  const groupHeader = (label, count) => (
+    <tr className="bg-stone-100 border-b border-stone-200">
+      <td colSpan={3} className="px-5 py-1.5 text-[12px] uppercase tracking-wider font-semibold text-stone-700">{label}（{count}）</td>
+    </tr>
+  );
+
   return (
     <div
-      className="fixed inset-0 bg-stone-900/70 z-50 flex items-center justify-center p-4"
-      onClick={onClose}
+      className="fixed inset-0 bg-stone-900/70 z-50"
+      onMouseDown={(e) => { backdropDownRef.current = e.target === e.currentTarget; }}
+      onClick={(e) => { if (e.target === e.currentTarget && backdropDownRef.current) onClose(); }}
     >
       <div
-        className="bg-white w-full max-w-3xl rounded shadow-2xl flex flex-col max-h-[85vh]"
+        className="fixed bg-white rounded shadow-2xl flex flex-col overflow-hidden"
+        style={{ left: curPos.x, top: curPos.y, width: size.w, height: size.h }}
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="px-5 py-4 border-b border-stone-200 flex items-center justify-between">
+        <div
+          className="px-5 py-4 border-b border-stone-200 flex items-center justify-between gap-3 cursor-move select-none shrink-0"
+          onMouseDown={onDragStart}
+        >
           <div>
             <div className="text-[12px] tracking-[0.2em] uppercase text-stone-700 mb-0.5">{t("日程", "Schedule")}</div>
-            <h2 className="text-base font-semibold text-stone-900">{t("临近到期文档", "Documents due soon")}（{items.length}）</h2>
+            <h2 className="text-base font-semibold text-stone-900">{t("到期日列表", "Due dates")}{scopeName && <span className="font-normal text-stone-700"> · {scopeName} {t("及其所有子文件夹", "and all subfolders")}</span>}</h2>
           </div>
-          <button onClick={onClose} className="text-stone-600 hover:text-stone-800 p-1"><X size={16} /></button>
+          <div className="flex items-center gap-2">
+            <label className="flex items-center gap-1.5 text-sm text-stone-700 cursor-pointer select-none"
+              title={t("只显示已过期或进入提醒期的项目，并隐藏没有到期日的项目", "Only show overdue items and items inside their reminder window; hide items with no due date")}>
+              <input type="checkbox" checked={dueSoonOnly} onChange={(e) => setDueSoonOnly(e.target.checked)} />
+              {t("只看即将到期", "Show only due soon")}
+            </label>
+            <div className="flex border border-stone-300 rounded overflow-hidden text-sm">
+              {[["folder", t("按文件夹", "By folder")], ["file", t("按文件", "By file")]].map(([k, label]) => (
+                <button
+                  key={k}
+                  onClick={() => setLevel(k)}
+                  className={`px-3 py-1 ${level === k ? "bg-amber-100 text-amber-800 font-medium" : "text-stone-700 hover:bg-amber-50"}`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            <button onClick={onClose} className="text-stone-600 hover:text-stone-800 p-1"><X size={16} /></button>
+          </div>
+        </div>
+
+        <div className="px-5 py-2 border-b border-stone-200 bg-stone-50 shrink-0 text-sm">
+          {!bulkOpen ? (
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+            <button onClick={() => { setBulkOpen(true); setBulkConfirm(false); setBulkDone(null); setUndoMsg(""); }}
+              className="text-amber-700 hover:underline"
+              title={t("为当前文件夹（含子文件夹）中所有有到期日的文档统一设置提前提醒天数", "Set the reminder lead time for every dated document in this folder (including subfolders)")}>
+              {t("批量设置提醒…", "Set reminder for all documents here…")}
+            </button>
+            {undoBtn}
+            {undoMsg && <span className="text-emerald-700">✓ {undoMsg}</span>}
+            </div>
+          ) : (
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+              <span className="text-stone-700">{t(`将应用到 ${scopeName || ""} 及子文件夹中 ${bulkIds.length} 份有到期日的文档：`, `Applies to ${bulkIds.length} dated document(s) in ${scopeName || ""} and subfolders:`)}</span>
+              <label className="flex items-center gap-1">{t("提前提醒", "Remind")}
+                <select value={bulkRemind} onChange={(e) => { setBulkRemind(Number(e.target.value)); setBulkConfirm(false); }} className="px-1.5 py-0.5 border border-stone-300 rounded">
+                  {REMIND_DAYS_OPTIONS.map((n) => <option key={n} value={n}>{t(`${n} 天`, `${n} days`)}</option>)}
+                </select>
+              </label>
+              <label className="flex items-center gap-1">{t("重复", "Repeat")}
+                <select value={bulkRepeat} onChange={(e) => { setBulkRepeat(e.target.value); setBulkConfirm(false); }} className="px-1.5 py-0.5 border border-stone-300 rounded">
+                  <option value="__keep">{t("保持不变", "Keep as is")}</option>
+                  <option value="">{t("不重复", "Never")}</option>
+                  <option value="monthly">{t("每月", "Monthly")}</option>
+                  <option value="quarterly">{t("每季度", "Quarterly")}</option>
+                  <option value="yearly">{t("每年", "Yearly")}</option>
+                </select>
+              </label>
+              {!bulkConfirm ? (
+                <button disabled={!bulkIds.length} onClick={() => setBulkConfirm(true)}
+                  className="px-3 py-0.5 bg-amber-600 hover:bg-amber-700 disabled:opacity-40 text-white rounded">{t("应用", "Apply")}</button>
+              ) : (
+                <button onClick={async () => { await onBulkSet(bulkIds, { remindDays: bulkRemind, repeat: bulkRepeat }); setUndoMsg(""); setBulkDone(bulkIds.length); setBulkConfirm(false); }}
+                  className="px-3 py-0.5 bg-red-600 hover:bg-red-700 text-white rounded">
+                  {t(`确认修改 ${bulkIds.length} 份文档`, `Confirm: change ${bulkIds.length} document(s)`)}
+                </button>
+              )}
+              <button onClick={() => { setBulkOpen(false); setBulkConfirm(false); }} className="px-2 py-0.5 border border-stone-300 hover:bg-stone-100 rounded">{t("取消", "Cancel")}</button>
+              {bulkDone != null && <span className="text-emerald-700">✓ {t(`已更新 ${bulkDone} 份文档`, `Updated ${bulkDone} document(s)`)}</span>}
+              {undoBtn}
+              {undoMsg && <span className="text-emerald-700">✓ {undoMsg}</span>}
+              {!bulkIds.length && <span className="text-stone-600">{t("此范围内没有带到期日的文档。", "No dated documents in this scope.")}</span>}
+            </div>
+          )}
         </div>
 
         <div className="flex-1 overflow-x-auto overflow-y-auto">
-          {items.length === 0 ? (
-            <div className="px-5 py-10 text-center text-base text-stone-700">
-              {t("暂无 2 周内到期的文档。", "No documents due within 2 weeks.")}
-            </div>
-          ) : (
-            <table className="w-full text-base table-fixed min-w-[640px]">
-              <colgroup>
-                <col className="w-[38%]" />
-                <col className="w-[38%]" />
-                <col className="w-[140px]" />
-              </colgroup>
-              <thead className="sticky top-0 bg-stone-50 text-[12px] uppercase tracking-wider text-stone-700 border-b border-stone-200">
+          <table className="text-base table-fixed" style={{ width: colW[0] + colW[1] + colW[2], minWidth: "100%" }}>
+            <colgroup>
+              {colW.map((w, i) => <col key={i} style={{ width: w }} />)}
+            </colgroup>
+            <thead className="sticky top-0 bg-stone-50 text-[12px] uppercase tracking-wider text-stone-700 border-b border-stone-200">
+              <tr>
+                {[
+                  [t("文件夹", "Folder"), "px-5"],
+                  [isFolder ? t("路径", "Path") : t("文档名", "Document name"), "px-2"],
+                  [t("到期日", "Due date"), "px-2"],
+                ].map(([label, pad], i) => (
+                  <th key={i} className={`relative text-left ${pad} py-2 font-medium`}>
+                    {label}
+                    <span
+                      onMouseDown={onColResizeStart(i)}
+                      title={t("拖动调整列宽", "Drag to resize column")}
+                      className="absolute top-0 right-0 w-1.5 h-full cursor-col-resize hover:bg-amber-300"
+                    />
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {groupHeader(t("有到期日", "With due date"), dated.length)}
+              {dated.length === 0
+                ? <tr><td colSpan={3} className="px-5 py-4 text-center text-sm text-stone-600">{dueSoonOnly ? t("此文件夹（含子文件夹）中没有即将到期的项目。", "Nothing due soon in this folder (including subfolders).") : t("暂无。", "None.")}</td></tr>
+                : dated.map(renderRow)}
+              {!dueSoonOnly && groupHeader(t("无到期日", "No due date"), undated.length)}
+              {shownUndated.map(renderRow)}
+              {undated.length > shownUndated.length && (
                 <tr>
-                  <th className="text-left px-5 py-2 font-medium">{t("文件夹", "Folder")}</th>
-                  <th className="text-left px-2 py-2 font-medium">{t("文档名", "Document name")}</th>
-                  <th className="text-left px-2 py-2 font-medium">{t("到期日", "Due date")}</th>
+                  <td colSpan={3} className="px-5 py-3 text-center">
+                    <button onClick={() => setShowAllNoDue(true)} className="text-sm text-amber-700 hover:underline">
+                      {t(`显示全部 ${undated.length} 项`, `Show all ${undated.length}`)}
+                    </button>
+                  </td>
                 </tr>
-              </thead>
-              <tbody>
-                {items.map((doc) => {
-                  const folderPath = getNodePath(doc.folderId) || "—";
-                  return (
-                    <tr
-                      key={doc.id}
-                      onClick={() => onOpenItem(doc)}
-                      className="border-b border-stone-100 hover:bg-amber-50 cursor-pointer"
-                    >
-                      <td className="px-5 py-2 text-stone-700 text-sm truncate" title={folderPath}>
-                        {folderPath}
-                      </td>
-                      <td className="px-2 py-2 truncate" title={doc.name}>
-                        <span className="flex items-center gap-1.5 min-w-0">
-                          <span className={`w-2 h-2 rounded-full shrink-0 ${URGENCY_DOT_CLASSES[doc.tier]}`} />
-                          <span className={`${URGENCY_TEXT_CLASSES[doc.tier]} hover:underline truncate`}>{doc.name}</span>
-                        </span>
-                      </td>
-                      <td className="px-2 py-2 font-mono text-sm whitespace-nowrap">
-                        {doc.dueDate}
-                        <span className="text-stone-600 block text-[12px] font-sans">{t(URGENCY_LABELS[doc.tier].zh, URGENCY_LABELS[doc.tier].en)}</span>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          )}
+              )}
+            </tbody>
+          </table>
         </div>
+        <div onMouseDown={onResizeStart("x")} className="absolute top-0 right-0 w-1.5 h-full cursor-ew-resize z-30" />
+        <div onMouseDown={onResizeStart("y")} className="absolute bottom-0 left-0 w-full h-1.5 cursor-ns-resize z-30" />
+        <div onMouseDown={onResizeStart("xy")} className="absolute bottom-0 right-0 w-4 h-4 cursor-nwse-resize z-30" />
       </div>
     </div>
   );
@@ -16022,6 +17394,250 @@ const LinkPicker = ({
 };
 
 /* =============================================================================
+ * QC REVIEW -- every inspection report (file) has its own QC Review (doc.qcReview:
+ * Inspection / SN / Equipment Description / WO/PO + Date Reviewed, Reviewed By,
+ * Observation, Mitigation, Review Result), shown beside the file in the viewer.
+ * A folder carries a General Comment (node.qcGeneralComment) and generates the
+ * QC Review Report, which lists the review of every file under that folder
+ * (subfolders included) followed by the files themselves. Identity fields not
+ * yet filled in are read from the file name: Inspection^SN^Equipment Description^...
+ * =============================================================================
+ */
+const QC_RESULTS = ["Pass", "Fail", "Conditional", "Pending"];
+const EMPTY_QC = { an: "", sn: "", pn: "", won: "", dateReviewed: "", reviewedBy: "", observation: "", mitigation: "", result: "" };
+
+// Inspection / SN / Equipment Description from a file name like
+// "Inspection^SN^Equipment Description^...", used until the review is filled in.
+const qcFromFileName = (name) => {
+  const parts = String(name || "").replace(/\.[^.]+$/, "").split("^");
+  return parts.length >= 3 ? { an: parts[0].trim(), sn: parts[1].trim(), pn: parts[2].trim() } : {};
+};
+const qcOfDoc = (doc) => ({ ...EMPTY_QC, ...qcFromFileName(doc && doc.name), ...((doc && doc.qcReview) || {}) });
+
+// Autosave: calls save() shortly after `dirty` becomes true (and again on every
+// further change of `value`), and flushes on unmount, so nothing typed is lost
+// whether or not the user ever clicks Save.
+const useAutosave = (dirty, value, save, delay = 600) => {
+  const saveRef = useRef(save); saveRef.current = save;
+  const dirtyRef = useRef(dirty); dirtyRef.current = dirty;
+  useEffect(() => {
+    if (!dirty) return;
+    const id = setTimeout(() => saveRef.current(), delay);
+    return () => clearTimeout(id);
+  }, [dirty, value, delay]);
+  useEffect(() => () => { if (dirtyRef.current) saveRef.current(); }, []);
+};
+const SaveStatus = ({ dirty, justSaved }) => {
+  const { t } = useLang();
+  return (
+    <span className="text-[11px] text-stone-500">
+      {dirty ? t("正在自动保存…", "Saving automatically…") : justSaved ? t("已自动保存 ✓", "Saved automatically ✓") : t("修改后自动保存，也可在搜索中找到", "Changes save automatically and are searchable")}
+    </span>
+  );
+};
+
+// Per-file form (mount with key={docId}: unmounting flushes any pending save).
+const QcReviewFields = ({ docId, qc: initial, onSave }) => {
+  const { t } = useLang();
+  const [qc, setQc] = useState({ ...EMPTY_QC, ...(initial || {}) });
+  const [dirty, setDirty] = useState(false);
+  const [justSaved, setJustSaved] = useState(false);
+  const set = (k, v) => { setQc((p) => ({ ...p, [k]: v })); setDirty(true); setJustSaved(false); };
+  const save = async () => { await onSave(docId, qc); setDirty(false); setJustSaved(true); };
+  useAutosave(dirty, qc, save);
+  const inp = "w-full px-2 py-1 border border-stone-300 rounded text-sm bg-white";
+  const lab = "block text-[12px] font-bold text-stone-700 mb-0.5";
+  return (
+    <div className="p-3 space-y-2.5 text-sm">
+      <div className="grid grid-cols-2 gap-2.5">
+        <div><label className={lab}>{t("检验项目 (Inspection)", "Inspection")}</label><input className={inp} value={qc.an} onChange={(e) => set("an", e.target.value)} /></div>
+        <div><label className={lab}>{t("SN（序列号：被检设备的出厂序列号）", "SN (Serial Number of the inspected equipment)")}</label><input className={inp} value={qc.sn} onChange={(e) => set("sn", e.target.value)} /></div>
+        <div><label className={lab}>{t("设备描述", "Equipment Description")}</label><input className={inp} value={qc.pn} onChange={(e) => set("pn", e.target.value)} /></div>
+        <div><label className={lab}>{t("WO/PO（工单号 / 采购订单号）", "WO/PO (Work Order Number / Purchase Order)")}</label><input className={inp} value={qc.won} onChange={(e) => set("won", e.target.value)} /></div>
+      </div>
+      <div className="grid grid-cols-2 gap-2.5">
+        <div><label className={lab}>{t("审核日期", "Date Reviewed")}</label><input type="date" className={inp} value={qc.dateReviewed} onChange={(e) => set("dateReviewed", e.target.value)} /></div>
+        <div><label className={lab}>{t("审核人", "Reviewed By")}</label><input className={inp} value={qc.reviewedBy} onChange={(e) => set("reviewedBy", e.target.value)} /></div>
+      </div>
+      <div><label className={lab}>{t("观察结果", "Observation")}</label><textarea rows={4} className={inp} value={qc.observation} onChange={(e) => set("observation", e.target.value)} /></div>
+      <div><label className={lab}>{t("缓解措施", "Mitigation")}</label><textarea rows={3} className={inp} value={qc.mitigation} onChange={(e) => set("mitigation", e.target.value)} /></div>
+      <div><label className={lab}>{t("审核结果", "Review Result")}</label>
+        <select className={inp} value={qc.result} onChange={(e) => set("result", e.target.value)}>
+          <option value="">{t("— 选择 —", "— select —")}</option>
+          {QC_RESULTS.map((r) => <option key={r} value={r}>{r}</option>)}
+        </select>
+      </div>
+      <SaveStatus dirty={dirty} justSaved={justSaved} />
+    </div>
+  );
+};
+
+// Dialog shown by every "Generate QC Review Report" button: pick which of the
+// folder's inspection reports (files, subfolders included) to attach after the
+// review pages -- all, some, or none. The cover pages always list every file.
+const QcReportDialog = ({ node, docIndex, onGenerate, onCancel }) => {
+  const { t } = useLang();
+  const files = useMemo(() => {
+    const byId = new Map((docIndex || []).map((d) => [d.id, d]));
+    const out = [], seen = new Set();
+    const walk = (n, rel) => {
+      for (const ref of n.documents || []) {
+        const d = byId.get(ref.id);
+        if (d && !seen.has(d.id) && d.sourceFeature !== "qc_review_report") { seen.add(d.id); out.push({ id: d.id, name: d.name, folder: rel, reviewed: !!d.qcReview }); }
+      }
+      for (const c of n.children || []) walk(c, (rel ? rel + " / " : "") + c.name);
+    };
+    walk(node, "");
+    return out;
+  }, [node, docIndex]);
+  const existing = (docIndex || []).find((d) => d.derivedFromNode === node.id && d.sourceFeature === "qc_review_report");
+  const [picked, setPicked] = useState(() => new Set(files.map((f) => f.id)));
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const toggle = (id) => setPicked((p) => { const n = new Set(p); n.has(id) ? n.delete(id) : n.add(id); return n; });
+  const go = async () => {
+    setBusy(true); setErr("");
+    try { await onGenerate(files.filter((f) => picked.has(f.id)).map((f) => f.id)); }
+    catch (e) { setErr(e.message || String(e)); setBusy(false); }
+  };
+  return (
+    <div className="fixed inset-0 z-[95] bg-black/40 flex items-center justify-center p-4">
+      <div className="bg-white rounded shadow-2xl border border-stone-300 w-full max-w-xl max-h-[85vh] flex flex-col">
+        <div className="px-4 py-2.5 border-b border-stone-200 font-bold text-stone-800 flex items-center gap-1.5">
+          <ListChecks size={14} /> {t("生成质检审核报告", "Generate QC Review Report")}
+          <span className="text-[12px] font-normal text-stone-500 truncate">· {node.name}</span>
+        </div>
+        <div className="px-4 py-3 overflow-auto text-sm space-y-2">
+          <div className="text-stone-700">{t("选择要附在报告后面的实际检验报告（审核汇总页始终列出全部文件）：", "Choose which inspection reports to attach after the review pages (the review pages always list every file):")}</div>
+          <div className="flex items-center gap-3 text-[12px]">
+            <button onClick={() => setPicked(new Set(files.map((f) => f.id)))} className="text-amber-800 hover:underline">{t("全选", "Select all")}</button>
+            <button onClick={() => setPicked(new Set())} className="text-amber-800 hover:underline">{t("全不选（仅审核汇总页）", "None (review pages only)")}</button>
+            <span className="ml-auto text-stone-500">{t(`已选 ${picked.size} / ${files.length}`, `${picked.size} of ${files.length} selected`)}</span>
+          </div>
+          <div className="border border-stone-200 rounded divide-y divide-stone-100 max-h-[45vh] overflow-auto">
+            {files.map((f) => (
+              <label key={f.id} className="flex items-start gap-2 px-2 py-1.5 hover:bg-amber-50 cursor-pointer">
+                <input type="checkbox" className="mt-0.5" checked={picked.has(f.id)} onChange={() => toggle(f.id)} />
+                <span className="min-w-0">
+                  <span className="block break-all">{f.name}</span>
+                  <span className="block text-[11px] text-stone-500">{f.folder || t("本文件夹", "this folder")}{f.reviewed ? "" : " · " + t("尚未填写审核", "no review filled in yet")}</span>
+                </span>
+              </label>
+            ))}
+            {files.length === 0 && <div className="p-3 text-stone-500">{t("此文件夹中没有文件。", "There are no files in this folder.")}</div>}
+          </div>
+          {existing && <div className="text-xs p-2 rounded border border-amber-300 bg-amber-50 text-amber-900">{t(`本文件夹已有报告“${existing.name}”，生成后将覆盖它。`, `This folder already has "${existing.name}" — generating will overwrite it.`)}</div>}
+          {err && <div className="text-xs p-2 rounded border border-red-300 bg-red-50 text-red-700">{err}</div>}
+        </div>
+        <div className="px-4 py-2.5 border-t border-stone-200 flex justify-end gap-2">
+          <button onClick={onCancel} disabled={busy} className="px-3 py-1 text-sm border border-stone-300 rounded hover:bg-stone-50 disabled:opacity-50">{t("取消", "Cancel")}</button>
+          <button onClick={go} disabled={busy || files.length === 0} className="px-3 py-1 text-sm bg-amber-600 text-white rounded hover:bg-amber-700 disabled:opacity-50 flex items-center gap-1.5">
+            {busy && <Loader size={13} className="animate-spin" />}
+            {busy ? t("正在生成…", "Generating…") : (existing ? t("生成并覆盖", "Generate & overwrite") : t("生成", "Generate"))}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// "Generate QC Review Report" for a folder, usable from the viewer's QC panel.
+const QcReportButton = ({ nodeId, onReport }) => {
+  const { t } = useLang();
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState(null);
+  const run = async () => {
+    setBusy(true); setMsg(null);
+    try {
+      const r = await onReport(nodeId);
+      if (!r) return;   // declined to overwrite
+      setMsg({ ok: true, text: t(`已生成并保存到该文件夹：${r.name}（${r.pages} 页）`, `Report saved in the folder: ${r.name} (${r.pages} pages)`) });
+    } catch (e) { setMsg({ ok: false, text: e.message || String(e) }); }
+    finally { setBusy(false); }
+  };
+  return (
+    <div className="px-3 pb-3 space-y-2">
+      <button onClick={run} disabled={busy}
+        className="text-sm px-3 py-1 border border-sky-300 text-sky-800 bg-sky-50 hover:bg-sky-100 rounded flex items-center gap-1 disabled:opacity-50"
+        title={t("生成该文件夹（含子文件夹）全部文件的质检审核报告 PDF，并保存到该文件夹", "Build the QC Review Report PDF for this folder (every file under it, incl. subfolders) and file it in the folder")}>
+        {busy ? <Loader size={12} className="animate-spin" /> : <FileText size={12} />} {t("生成质检审核报告", "Generate QC Review Report")}
+      </button>
+      {msg && <div className={"text-xs p-2 rounded border " + (msg.ok ? "bg-emerald-50 border-emerald-300 text-emerald-800" : "bg-red-50 border-red-300 text-red-700")}>{msg.text}</div>}
+    </div>
+  );
+};
+
+// Folder-level QC section: General Comment + the list of every file under the
+// folder (subfolders included) that has a QC Review + "Generate QC Review Report".
+const qcDocsUnder = (node, docIndex) => {
+  const byId = new Map((docIndex || []).map((d) => [d.id, d]));
+  const seen = new Set();
+  return collectAllDocIds(node).filter((id) => !seen.has(id) && seen.add(id))
+    .map((id) => byId.get(id)).filter((d) => d && d.sourceFeature !== "qc_review_report");
+};
+
+const QcFolderPanel = ({ node, docIndex, onSaveComment, onReport }) => {
+  const { t } = useLang();
+  const [comment, setComment] = useState(node.qcGeneralComment || "");
+  const [dirty, setDirty] = useState(false);
+  const [justSaved, setJustSaved] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState(null);
+  useEffect(() => { setComment(node.qcGeneralComment || ""); setDirty(false); setJustSaved(false); setMsg(null); }, [node.id]);
+  const rows = useMemo(() => qcDocsUnder(node, docIndex).filter((d) => d.qcReview), [node, docIndex]);
+  const save = async () => { await onSaveComment(node.id, comment); setDirty(false); setJustSaved(true); };
+  useAutosave(dirty, comment, save);
+  if (!rows.length && !node.qcGeneralComment) return null;
+  const report = async () => {
+    setBusy(true); setMsg(null);
+    try {
+      if (dirty) { await onSaveComment(node.id, comment); setDirty(false); }
+      const r = await onReport(node.id);
+      if (!r) return;   // declined to overwrite
+      setMsg({ ok: true, text: t(`已生成并保存到本文件夹：${r.name}（${r.pages} 页）`, `Report saved in this folder: ${r.name} (${r.pages} pages)`) });
+    } catch (e) {
+      setMsg({ ok: false, text: e.message || String(e) });
+    } finally { setBusy(false); }
+  };
+  return (
+    <section className="mb-5 border border-amber-300 rounded-lg overflow-hidden">
+      <div className="flex items-center gap-1.5 px-3 py-2 border-b border-amber-200 bg-amber-50 text-sm font-semibold uppercase tracking-wider text-amber-900">
+        <ListChecks size={13} /> {t("质检审核", "QC Review")}
+        <span className="text-[12px] font-normal normal-case tracking-normal text-stone-600">· {t(`${rows.length} 份已审核`, `${rows.length} file(s) reviewed`)}</span>
+      </div>
+      <div className="p-3 space-y-2 text-sm">
+        {rows.length > 0 && (
+          <table className="w-full text-xs border border-stone-200">
+            <thead className="bg-stone-100 text-left"><tr><th className="p-1.5">SN</th><th className="p-1.5">{t("设备描述", "Equipment Description")}</th><th className="p-1.5">WO/PO</th><th className="p-1.5">{t("结果", "Result")}</th></tr></thead>
+            <tbody>
+              {rows.map((d) => { const q = qcOfDoc(d); return (
+                <tr key={d.id} className="border-t border-stone-200">
+                  <td className="p-1.5">{q.sn}</td><td className="p-1.5">{q.pn}</td><td className="p-1.5">{q.won}</td><td className="p-1.5">{q.result}</td>
+                </tr>
+              ); })}
+            </tbody>
+          </table>
+        )}
+        <div>
+          <label className="block text-[12px] font-bold text-stone-700 mb-0.5">{t("总体意见 (General Comment)", "General Comment")}</label>
+          <textarea rows={3} value={comment} onChange={(e) => { setComment(e.target.value); setDirty(true); setJustSaved(false); }}
+            className="w-full px-2 py-1 border border-stone-300 rounded text-sm bg-white" />
+        </div>
+        <div className="flex items-center gap-2 flex-wrap">
+          <SaveStatus dirty={dirty} justSaved={justSaved} />
+          <button onClick={report} disabled={busy}
+            className="text-sm px-3 py-1 border border-sky-300 text-sky-800 bg-sky-50 hover:bg-sky-100 rounded flex items-center gap-1 disabled:opacity-50"
+            title={t("生成包含总体意见和本文件夹（含子文件夹）每个文件的质检审核的 PDF，并附上这些文件，保存到本文件夹", "Build a PDF with the General Comment and the QC Review of every file in this folder (incl. subfolders), followed by the files, and file it here")}>
+            {busy ? <Loader size={12} className="animate-spin" /> : <FileText size={12} />} {t("生成质检审核报告", "Generate QC Review Report")}
+          </button>
+        </div>
+        {msg && <div className={"text-xs p-2 rounded border " + (msg.ok ? "bg-emerald-50 border-emerald-300 text-emerald-800" : "bg-red-50 border-red-300 text-red-700")}>{msg.text}</div>}
+      </div>
+    </section>
+  );
+};
+
+/* =============================================================================
  * FOLDER/COMPONENT-LEVEL DESCRIPTION PANEL
  * Same feature set as the document viewer's Description panel (voice
  * dictation, AI organize/polish, AI Chinese-typo check, save-and-index,
@@ -16029,7 +17645,7 @@ const LinkPicker = ({
  * description as a standalone PDF filed into the folder.
  * =============================================================================
  */
-const NodeDescriptionPanel = ({ node, derivedDocs = [], onSaveDescription, onSaveTextAsDoc, onSaveDescPdf, onOpenAISettings }) => {
+const NodeDescriptionPanel = ({ node, derivedDocs = [], onSaveDescription, onSaveTextAsDoc, onSaveDescPdf, onPasteDescriptionImage, onOpenAISettings }) => {
   const { t } = useLang();
 
   const [description, setDescription] = useState(node.description || "");
@@ -16099,7 +17715,7 @@ const NodeDescriptionPanel = ({ node, derivedDocs = [], onSaveDescription, onSav
   const polishProvider = aiSettings.configured ? "gemini" : "deepseek";
 
   const runPolish = async () => {
-    const text = description.trim();
+    const text = stripDescriptionHtml(description).trim();
     if (!text || polishing || !aiPolishReady) return;
     setPolishing(true); setPolishError(""); setPolishResult(null);
     try {
@@ -16113,13 +17729,16 @@ const NodeDescriptionPanel = ({ node, derivedDocs = [], onSaveDescription, onSav
   };
   const acceptPolish = () => {
     if (!polishResult) return;
-    setDescription(polishResult.text);
+    // Preserve any screenshots already in the description -- the AI only
+    // ever sees/returns plain text (see runPolish above), so a straight
+    // replace would otherwise silently drop them.
+    setDescription(mergeDescriptionImages(description, polishResult.text));
     setDescSaved(false);
     setPolishResult(null);
   };
 
   const runTypoCheck = async () => {
-    const text = description.trim();
+    const text = stripDescriptionHtml(description).trim();
     if (!text || typoChecking || !aiPolishReady) return;
     setTypoChecking(true); setTypoError(""); setTypoIssues(null);
     try {
@@ -16158,7 +17777,10 @@ const NodeDescriptionPanel = ({ node, derivedDocs = [], onSaveDescription, onSav
   const existingDerivedDoc = (feature) => (derivedDocs || []).find((e) => (e.sourceFeature || "") === feature) || null;
 
   const saveAsNewDoc = async () => {
-    const text = description.trim();
+    // See DocumentViewer's saveAsNewDoc: description may hold sanitized
+    // HTML (embedded screenshots) -- the .txt export needs plain text, but
+    // the index/tree write must keep the original so images aren't dropped.
+    const text = stripDescriptionHtml(description).trim();
     if (!text || !onSaveTextAsDoc || savingNewDoc) return;
     const existing = existingDerivedDoc("node_description");
     let title = "";
@@ -16173,7 +17795,7 @@ const NodeDescriptionPanel = ({ node, derivedDocs = [], onSaveDescription, onSav
     }
     setSavingNewDoc(true); setNewDocMsg(null);
     try {
-      if (onSaveDescription) { try { await onSaveDescription(node.id, text); setDescSaved(true); } catch {} }
+      if (onSaveDescription) { try { await onSaveDescription(node.id, description); setDescSaved(true); } catch {} }
       const res = await onSaveTextAsDoc(node.id, { text, title, reuse: !!existing });
       setNewDocMsg({ name: res.name, updated: !!res.updated });
       setTimeout(() => setNewDocMsg(null), 4000);
@@ -16185,12 +17807,12 @@ const NodeDescriptionPanel = ({ node, derivedDocs = [], onSaveDescription, onSav
   };
 
   const saveAsPdf = async () => {
-    const text = description.trim();
+    const text = stripDescriptionHtml(description).trim();
     if (!text || !onSaveDescPdf || savingPdf) return;
     const existing = existingDerivedDoc("node_description_pdf");
     setSavingPdf(true); setPdfMsg(null);
     try {
-      if (onSaveDescription) { try { await onSaveDescription(node.id, text); setDescSaved(true); } catch {} }
+      if (onSaveDescription) { try { await onSaveDescription(node.id, description); setDescSaved(true); } catch {} }
       const res = await onSaveDescPdf(node.id, { text, reuse: true });
       setPdfMsg({ name: res.name, updated: !!res.updated || !!existing });
       setTimeout(() => setPdfMsg(null), 4000);
@@ -16240,7 +17862,7 @@ const NodeDescriptionPanel = ({ node, derivedDocs = [], onSaveDescription, onSav
         <div className="flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wider text-stone-700">
           <Edit2 size={13} /> {t("描述", "Description")}
         </div>
-        <span className="text-[12px] text-stone-600">
+        <span className="text-[12px] text-stone-600 flex items-center gap-3">
           {node.description ? t("已索引", "Indexed") : t("未保存", "Not saved")}
         </span>
       </div>
@@ -16350,13 +17972,12 @@ const NodeDescriptionPanel = ({ node, derivedDocs = [], onSaveDescription, onSav
       {typoError && <div className="px-3 py-1 text-[12px] text-red-600 bg-red-50 border-b border-red-100">{typoError}</div>}
 
       <div className="p-3">
-        <textarea
-          value={description}
-          onChange={(e) => { setDescription(e.target.value); setDescSaved(false); }}
-          placeholder={t("为该文件夹/组件添加描述，保存后可在搜索中找到…", "Add a description for this folder/component — once saved it's searchable…")}
-          spellCheck={false}
-          rows={4}
-          className="w-full resize-y text-sm leading-relaxed text-stone-800 outline-none border border-stone-200 rounded p-2"
+        <DescriptionEditor
+          value={descriptionToEditableHtml(description)}
+          onChange={(html) => { setDescription(html); setDescSaved(false); }}
+          onPasteImage={onPasteDescriptionImage ? (blob) => onPasteDescriptionImage(node.id, blob) : undefined}
+          placeholder={t("为该文件夹/组件添加描述，保存后可在搜索中找到…（可直接粘贴截图）", "Add a description for this folder/component — once saved it's searchable… (you can paste a screenshot directly)")}
+          className="w-full min-h-[6rem] text-sm leading-relaxed text-stone-800 outline-none border border-stone-200 rounded p-2"
         />
       </div>
 
@@ -16645,9 +18266,11 @@ function DMS({ storagePath, onChangeFolder }) {
     const map = new Map();
     const walk = (node) => {
       if (!node) return;
-      let worst = null;
+      // The folder's own "Due Date-Folder" counts alongside its documents' dates.
+      let worst = urgencyTier(node.dueDate);
       (node.documents || []).forEach((d) => {
-        const t = urgencyTier(docIndexById.get(d.id)?.dueDate);
+        const de = docIndexById.get(d.id);
+        const t = urgencyTier(de?.dueDate, de?.remindDays);
         if (t && (!worst || URGENCY_RANK[t] > URGENCY_RANK[worst])) worst = t;
       });
       map.set(node.id, worst);
@@ -16663,6 +18286,10 @@ function DMS({ storagePath, onChangeFolder }) {
   const [textTreeCopied, setTextTreeCopied] = useState(false);
   const [showPlotDialog, setShowPlotDialog] = useState(false); // parameter-vs-time chart
   const [showAskAIDialog, setShowAskAIDialog] = useState(false); // folder-level "Ask AI"
+  const [showEqRecordDialog, setShowEqRecordDialog] = useState(false);
+  const [showQcUploadDialog, setShowQcUploadDialog] = useState(false);
+  const [qcReportBusy, setQcReportBusy] = useState(false);
+  const [showHeicDialog, setShowHeicDialog] = useState(false);
   const [verifyDatesQueue, setVerifyDatesQueue] = useState(null); // docs with an auto-detected date to confirm after upload
   // { duplicates, allFiles, targetNodeId, mirror? }. `mirror` is only set
   // for the "upload as sources" flow — { tree, fileNodeId } — where each
@@ -16969,6 +18596,14 @@ function DMS({ storagePath, onChangeFolder }) {
   // like docViewMode above rather than reset per session -- defaults to
   // "small" so it doesn't change the size of every existing grid view the
   // first time this ships; "large" is an opt-in upgrade.
+  // Hides everything above "Attached documents" (breadcrumb, title,
+  // description editor) so the document grid gets the whole panel.
+  const [topCollapsed, setTopCollapsed] = useState(() => {
+    try { return localStorage.getItem("dms:top-collapsed") === "1"; } catch { return false; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("dms:top-collapsed", topCollapsed ? "1" : "0"); } catch {}
+  }, [topCollapsed]);
   const [gridThumbSize, setGridThumbSize] = useState(() => {
     try {
       const saved = localStorage.getItem("dms:grid-thumb-size");
@@ -17411,20 +19046,27 @@ function DMS({ storagePath, onChangeFolder }) {
   const getNodePath = (nodeId) => getNodePathFrom(tree, nodeId);
   const selectedNode = tree && selectedId ? findNode(tree, selectedId) : null;
 
-  // All documents with a due date within the "日程" urgency window, most
-  // urgent first (red > yellow > blue), then soonest-due within a tier.
-  // docIndex is already the flat, whole-project document list, so no
-  // separate tree walk is needed — see `getNodePathFrom` above for the
-  // per-row folder path.
-  const dueDocsList = useMemo(() => {
-    return docIndex
-      .map((d) => ({ ...d, tier: urgencyTier(d.dueDate), folderId: d.originalNodeId || d.nodeId }))
-      .filter((d) => d.tier)
-      .sort((a, b) =>
-        URGENCY_RANK[b.tier] - URGENCY_RANK[a.tier] ||
-        (a.dueDate || "").localeCompare(b.dueDate || "")
-      );
-  }, [docIndex]);
+  // Scope of the "日程" list dialog: the currently selected folder plus every
+  // subfolder below it (the whole tree when nothing is selected). Documents
+  // are collected from each folder's own attachment list, so a document
+  // linked into several folders in scope appears once per placement; the
+  // hidden recycle bin is skipped.
+  const dueScope = useMemo(() => {
+    const root = (tree && selectedId && findNode(tree, selectedId)) || tree;
+    const folders = [];
+    const docs = [];
+    const walk = (n) => {
+      if (!n || n.name === NOT_SHOW_FOLDER_NAME) return;
+      folders.push({ id: n.id, name: n.name, dueDate: n.dueDate || "", folderId: n.id });
+      (n.documents || []).forEach((d) => {
+        const e = docIndexById.get(d.id);
+        if (e) docs.push({ ...e, key: n.id + ":" + e.id, folderId: n.id });
+      });
+      (n.children || []).forEach(walk);
+    };
+    walk(root);
+    return { rootName: root ? root.name : "", folders, docs };
+  }, [tree, selectedId, docIndexById]);
 
   const toggleExpand = (id) => {
     setExpandedIds((prev) => {
@@ -17856,7 +19498,7 @@ function DMS({ storagePath, onChangeFolder }) {
     // snapshot from before those folders existed, so its diff-and-merge
     // step at the end would never find them and any doc references
     // pointed at them would silently vanish instead of attaching.
-    { skipDuplicates = false, routeMode = "year-month", baseTreeOverride = null, extraText = "" } = {}
+    { skipDuplicates = false, routeMode = "year-month", baseTreeOverride = null, extraText = "", exactName = false, qcReview = null } = {}
   ) => {
     console.log(`[DMS] uploadFilesToNode called, target=${targetNodeId}, files=${files.length}, mode=${routeMode}`);
     if (!files.length) return;
@@ -17906,6 +19548,7 @@ function DMS({ storagePath, onChangeFolder }) {
     const pendingDateVerification = [];
     setUploadStatus({ done: 0, total: filesToProcess.length, phase: "上传" });
     const failedFiles = [];
+    let persistFailed = false;
 
     // Periodic checkpointing -- link+index each file's already-saved-to-disk
     // upload into the tree/docIndex every CHECKPOINT_FILES files (or
@@ -18066,7 +19709,9 @@ function DMS({ storagePath, onChangeFolder }) {
       const capturedDate = photoDate && photoDate.day
         ? `${photoDate.year}-${photoDate.month}-${photoDate.day}` : null;
       const safeExtraText = extraText ? extraText.replace(/[\\/:*?"<>|]/g, "").trim() : "";
-      if (capturedDate && !file.name.startsWith(capturedDate)) {
+      if (exactName) {
+        // keep file.name verbatim (Eq Record's AN^SN^PN^name format)
+      } else if (capturedDate && !file.name.startsWith(capturedDate)) {
         uploadName = safeExtraText ? `${capturedDate}-${safeExtraText}-${file.name}` : `${capturedDate}-${file.name}`;
       } else if (!capturedDate && safeExtraText) {
         uploadName = `${safeExtraText}-${file.name}`;
@@ -18128,6 +19773,7 @@ function DMS({ storagePath, onChangeFolder }) {
         ...(uploadResult.lat != null && uploadResult.lon != null
           ? { lat: uploadResult.lat, lon: uploadResult.lon } : {}),
         ...(targetNodeSn ? { sn: targetNodeSn } : autoSn ? { sn: autoSn } : {}),
+        ...(qcReview ? { qcReview } : {}),
         // The server scanned the document's own text for a date (see
         // find_document_date in pdf_extraction.py). Stored as unverified
         // until the user confirms/edits it in the review dialog below, or
@@ -18181,7 +19827,8 @@ function DMS({ storagePath, onChangeFolder }) {
           `${pendingIndexEntries.length} 个文件已保存到磁盘，但因无法确认最新的索引状态，本次未能将它们关联到文件夹中（本次上传中已完成关联的文件不受影响）。请稍后重新上传本文件夹以完成剩余文件——已关联的文件会被自动跳过。`,
           `${pendingIndexEntries.length} file(s) were saved to disk, but couldn't be linked into the folder because the latest index state couldn't be verified (files already linked earlier in this upload are unaffected). Please upload this folder again shortly to finish the rest — already-linked files will be skipped automatically.`
         ));
-        return;
+        persistFailed = true;
+        return false;
       }
       console.log("[DMS] ✓ Upload complete");
       if (pendingDateVerification.length > 0) {
@@ -18190,6 +19837,7 @@ function DMS({ storagePath, onChangeFolder }) {
     } catch (e) {
       console.error("[DMS] ✗ Failed to persist tree/index after upload:", e);
       alert(t("文件已上传，但无法保存索引：", "Files were uploaded, but the index could not be saved: ") + e.message);
+      persistFailed = true;
     } finally {
       releaseUploadWakeLock();
       setUploadStatus(null);
@@ -18197,6 +19845,8 @@ function DMS({ storagePath, onChangeFolder }) {
         alert(t(`${failedFiles.length} 个文件上传失败（已跳过）：\n${failedFiles.join("\n")}`, `${failedFiles.length} file(s) failed to upload (skipped):\n${failedFiles.join("\n")}`));
       }
     }
+    // true only when every file was saved AND linked into the tree/index
+    return failedFiles.length === 0 && !persistFailed;
   };
 
   // Given a batch of files picked via a `webkitdirectory` input (so each
@@ -18471,6 +20121,14 @@ function DMS({ storagePath, onChangeFolder }) {
   // (document cards, search results, the databook, the folder plot dialog,
   // the due-docs list, ...) -- marking lastWorkedDocId here, once, covers
   // all of them, instead of needing every call site to remember to do it.
+  // Re-read the tree + doc index after the server adds docs/folders itself
+  // (e.g. a generated databook filed into the "databook" folder).
+  const refreshTreeAndDocIndex = async () => {
+    const { tree: freshTree } = await StorageAdapter.getTree();
+    if (freshTree) setTree(freshTree);
+    setDocIndex(await StorageAdapter.listDocumentIndex());
+  };
+
   const openDoc = (docId) => {
     const meta = docIndex.find((d) => d.id === docId);
     if (!meta) return;
@@ -18494,6 +20152,7 @@ function DMS({ storagePath, onChangeFolder }) {
       metadata: meta.metadata || {},
       ocrText: meta.ocrText || "",
       description: meta.description || "",
+      qcReview: meta.qcReview || null,
       lat: meta.lat != null ? meta.lat : null,
       lon: meta.lon != null ? meta.lon : null,
       localKeyParams: Array.isArray(meta.localKeyParams) ? meta.localKeyParams : [],
@@ -18596,6 +20255,61 @@ function DMS({ storagePath, onChangeFolder }) {
       setTimeout(() => setPasteStatus(null), 3000);
       alert(t("截图保存失败：", "Failed to save the screenshot: ") + e.message);
     }
+  };
+
+  // Paste-a-screenshot-inline-into-a-Description-field: same clipboard ->
+  // server round trip as handlePasteScreenshot above, but stores a raw PNG
+  // image document (as_image: true) instead of converting to PDF, since
+  // only a real image file can be referenced by a description's <img> tag
+  // (see DescriptionEditor/sanitizeDescriptionHtml). The image becomes a
+  // normal, visible document in targetNodeId's own folder -- same
+  // recycle-bin/delete lifecycle as any other upload, no separate cleanup
+  // needed -- and is additionally referenced inline from the description.
+  // Returns the new doc's id so the caller can build its <img src>.
+  const handlePasteDescriptionImage = async (targetNodeId, imageBlob) => {
+    if (!targetNodeId) throw new Error(t("请先选择一个文件夹。", "Please select a folder first."));
+    const targetNode = findNode(tree, targetNodeId);
+    const reader = new FileReader();
+    const dataUrl = await new Promise((res, rej) => {
+      reader.onload = () => res(reader.result);
+      reader.onerror = rej;
+      reader.readAsDataURL(imageBlob);
+    });
+    const base64 = dataUrl.split(",")[1];
+
+    const res = await fetch("/api/paste-screenshot", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        image_data: base64,
+        node_id: targetNodeId,
+        folder_name: (targetNode && targetNode.name) || "截图",
+        as_image: true,
+      }),
+    });
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.error || "Unknown error");
+
+    const docId = data.doc_id;
+    const newTree = updateNodeInTree(tree, targetNodeId, (n) => ({
+      ...n,
+      documents: [...(n.documents || []), { id: docId }],
+    }));
+    const newIndex = [
+      ...docIndex,
+      {
+        id: docId,
+        name: data.name,
+        mime: data.mime || "image/png",
+        size: data.size,
+        uploadedAt: new Date().toISOString(),
+        originalNodeId: targetNodeId,
+        metadata: {},
+      },
+    ];
+    await persistTree(newTree);
+    await persistIndex(newIndex);
+    return docId;
   };
 
   // Listen for Ctrl+V / Cmd+V paste events when a folder is selected
@@ -19140,11 +20854,73 @@ function DMS({ storagePath, onChangeFolder }) {
 
   // Update a document's due date (used by the "日程" scheduling feature).
   // Empty string clears the due date.
-  const updateDocDueDate = async (docId, dueDate) => {
-    const newIndex = docIndex.map((e) =>
-      e.id === docId ? { ...e, dueDate: dueDate || undefined } : e
-    );
+  // `extras` = optional { remindDays, repeat, dueLabel }; an empty/default
+  // value clears that field. Clearing the date clears all three.
+  const updateDocDueDate = async (docId, dueDate, extras) => {
+    const newIndex = docIndex.map((e) => {
+      if (e.id !== docId) return e;
+      const next = { ...e, dueDate: dueDate || undefined };
+      if (!dueDate) {
+        next.remindDays = undefined; next.repeat = undefined; next.dueLabel = undefined;
+      } else if (extras) {
+        next.remindDays = Number(extras.remindDays) > 0 && Number(extras.remindDays) !== DEFAULT_REMIND_DAYS ? Number(extras.remindDays) : undefined;
+        next.repeat = REPEAT_MONTHS[extras.repeat] ? extras.repeat : undefined;
+        next.dueLabel = (extras.dueLabel || "").trim() || undefined;
+      }
+      return next;
+    });
     await persistIndex(newIndex);
+  };
+
+  // Bulk-set reminder lead time (and optionally repeat) on the given docs in a
+  // single index write. Only touches docs that already have a due date.
+  // Remembers the previous values (in memory, last change only) so
+  // undoLastBulkReminder can restore them.
+  const [lastBulk, setLastBulk] = useState(null); // [{ id, prev:{remindDays,repeat}, applied:{remindDays,repeat} }] | null
+  const bulkSetDocReminder = async (docIds, { remindDays, repeat }) => {
+    const ids = new Set(docIds);
+    const lead = Number(remindDays) > 0 && Number(remindDays) !== DEFAULT_REMIND_DAYS ? Number(remindDays) : undefined;
+    const snapshot = [];
+    const newIndex = docIndex.map((e) => {
+      if (!ids.has(e.id) || !e.dueDate) return e;
+      const next = { ...e, remindDays: lead };
+      if (repeat !== "__keep") next.repeat = REPEAT_MONTHS[repeat] ? repeat : undefined;
+      snapshot.push({
+        id: e.id,
+        prev: { remindDays: e.remindDays, repeat: e.repeat },
+        applied: { remindDays: next.remindDays, repeat: next.repeat },
+      });
+      return next;
+    });
+    await persistIndex(newIndex);
+    setLastBulk(snapshot);
+  };
+  // Restores the previous values, skipping any document whose reminder was
+  // edited again since the bulk change. Returns { restored, skipped }.
+  const undoLastBulkReminder = async () => {
+    if (!lastBulk) return { restored: 0, skipped: 0 };
+    const byId = new Map(lastBulk.map((x) => [x.id, x]));
+    let restored = 0, skipped = 0;
+    const newIndex = docIndex.map((e) => {
+      const x = byId.get(e.id);
+      if (!x) return e;
+      if (e.remindDays !== x.applied.remindDays || e.repeat !== x.applied.repeat) { skipped++; return e; }
+      restored++;
+      return { ...e, remindDays: x.prev.remindDays, repeat: x.prev.repeat };
+    });
+    await persistIndex(newIndex);
+    setLastBulk(null);
+    return { restored, skipped };
+  };
+
+  // "Done" on a due item: repeating items roll to their next date, one-off
+  // items have the due date cleared.
+  const markDocDueDone = async (docId) => {
+    const e = docIndexById.get(docId);
+    if (!e) return;
+    await updateDocDueDate(docId, rollDueDate(e.dueDate, e.repeat), {
+      remindDays: e.remindDays, repeat: e.repeat, dueLabel: e.dueLabel,
+    });
   };
 
   // Update a document's own date (used as the time axis by the parameter-
@@ -19257,6 +21033,36 @@ function DMS({ storagePath, onChangeFolder }) {
   const handleSaveNodeDescription = async (nodeId, description) => {
     const newTree = updateNodeInTree(tree, nodeId, (n) => ({ ...n, description: description || "" }));
     await persistTree(newTree);
+  };
+
+  // QC Review: one per file (doc.qcReview) + a General Comment per folder
+  // (node.qcGeneralComment); the QC Review Report is built at folder level.
+  const handleSaveDocQcReview = async (docId, qc) => {
+    const newIndex = docIndex.map((e) => e.id === docId ? { ...e, qcReview: qc } : e);
+    await persistIndex(newIndex);
+    setViewerDoc((cur) => (cur && cur.id === docId ? { ...cur, qcReview: qc } : cur));
+  };
+  const handleSaveQcGeneralComment = async (nodeId, text) => {
+    await persistTree(updateNodeInTree(tree, nodeId, (n) => ({ ...n, qcGeneralComment: text || "" })));
+  };
+  // Opens the "which reports to attach" dialog; resolves with the generated
+  // report's info, or null if the user cancels.
+  const qcDialogCb = useRef(null);
+  const [qcReportDialog, setQcReportDialog] = useState(null);   // {nodeId}
+  const handleQcReport = (nodeId) => new Promise((resolve) => {
+    qcDialogCb.current = resolve;
+    setQcReportDialog({ nodeId });
+  });
+  const runQcReport = async (nodeId, attachDocIds) => {
+    await new Promise((r) => setTimeout(r, 800));   // let a just-typed review finish autosaving
+    const res = await StorageAdapter.qcReviewReport(nodeId, attachDocIds);
+    await refreshTreeAndDocIndex();
+    setQcReportDialog(null);
+    if (qcDialogCb.current) { qcDialogCb.current(res); qcDialogCb.current = null; }
+  };
+  const cancelQcReport = () => {
+    setQcReportDialog(null);
+    if (qcDialogCb.current) { qcDialogCb.current(null); qcDialogCb.current = null; }
   };
 
   // Save/overwrite a folder's Description as a .txt or PDF document filed
@@ -19594,19 +21400,29 @@ function DMS({ storagePath, onChangeFolder }) {
                   >
                     <Folder size={11} /> {t("新建文件夹", "New folder")}
                   </button>
-                  <label
-                    className={`text-[13px] px-2 py-1 border border-stone-300 rounded flex items-center gap-1 ${
-                      selectedNode ? "hover:bg-amber-50 hover:border-amber-400 cursor-pointer" : "opacity-40 cursor-not-allowed"
-                    }`}
-                    title={t("上传一个或多个文档到选中节点", "Upload one or more documents to the selected node")}
+                  <button
+                    onClick={() => setShowEqRecordDialog(true)}
+                    disabled={!tree}
+                    className="text-[13px] px-2 py-1 border border-stone-300 hover:bg-amber-50 hover:border-amber-400 rounded flex items-center gap-1 disabled:opacity-40"
+                    title={t("按 AN^SN^PN^原文件名 的格式命名并上传设备记录到对应 AN 文件夹", "Upload an equipment record, renamed AN^SN^PN^original name, into its AN folder")}
                   >
-                    <Upload size={11} /> {t("上传文档", "Upload document")}
-                    <input
-                      type="file" multiple
-                      className="hidden" disabled={!selectedNode}
-                      onChange={handleUpload}
-                    />
-                  </label>
+                    <Upload size={11} /> {t("上传设备记录", "Upload Eq Record")}
+                  </button>
+                  <button
+                    onClick={() => setShowQcUploadDialog(true)}
+                    disabled={!tree}
+                    className="text-[13px] px-2 py-1 border border-stone-300 hover:bg-amber-50 hover:border-amber-400 rounded flex items-center gap-1 disabled:opacity-40"
+                    title={t("上传质检审核记录：文件名 检验项目^SN^设备描述^WO/PO，直接保存到对应文件夹", "Upload QC Review records: file names Inspection^SN^Equipment Description^WO/PO, filed directly in the matching folder")}
+                  >
+                    <ListChecks size={11} /> {t("上传质检审核", "Upload QC Review")}
+                  </button>
+                  <button
+                    onClick={() => setShowHeicDialog(true)}
+                    className="text-[13px] px-2 py-1 border border-stone-300 hover:bg-amber-50 hover:border-amber-400 rounded flex items-center gap-1"
+                    title={t("把文件夹中的 iPhone HEIC 照片批量转换为 JPG", "Batch-convert iPhone HEIC photos in a folder to JPG")}
+                  >
+                    <ImageIcon size={11} /> {t("HEIC 转 JPG", "HEIC → JPG")}
+                  </button>
                   <button
                     onClick={() => selectedId && setRenamingId(selectedId)}
                     disabled={!selectedNode}
@@ -19616,18 +21432,10 @@ function DMS({ storagePath, onChangeFolder }) {
                     <Edit2 size={11} /> {t("重命名", "Rename")}
                   </button>
                   <button
-                    onClick={() => selectedId && handleDeleteNode(selectedId)}
-                    disabled={!selectedNode || selectedId === tree?.id}
-                    className="text-[13px] px-2 py-1 border border-stone-300 hover:bg-red-50 hover:border-red-400 hover:text-red-700 rounded flex items-center gap-1 disabled:opacity-40"
-                    title={t("删除选中节点及其子树", "Delete the selected node and its subtree")}
-                  >
-                    <Trash2 size={11} /> {t("删除", "Delete")}
-                  </button>
-                  <button
                     onClick={() => { setTextTreeCopied(false); setShowTextTree(true); }}
                     disabled={!tree}
                     className="text-[13px] px-2 py-1 border border-stone-300 hover:bg-amber-50 hover:border-amber-400 rounded flex items-center gap-1 disabled:opacity-40"
-                    title={t("以文本树形式查看 / 复制 / 导出整个结构", "View / copy / export the whole structure as a text tree")}
+                    title={t("以文本树形式查看 / 复制 / 导出当前选中文件夹的结构", "View / copy / export the current folder's structure as a text tree")}
                   >
                     <ListTree size={11} /> {t("文本树", "Text tree")}
                   </button>
@@ -19773,6 +21581,7 @@ function DMS({ storagePath, onChangeFolder }) {
                 getPathFor={(id) => getNodePathFrom(tree, id)}
                 formatBytes={formatBytes}
                 onOpenDoc={openDoc}
+                onDocsChanged={refreshTreeAndDocIndex}
               />
             )}
             {tab === "people" && (
@@ -19806,7 +21615,8 @@ function DMS({ storagePath, onChangeFolder }) {
 
         <main className="flex-1 overflow-auto" onDragOver={handlePanelDragOver} onDrop={handlePanelDrop}>
           {selectedNode ? (
-            <div className="max-w-4xl mx-auto p-6">
+            <div className="max-w-none mx-auto p-6">
+              {!topCollapsed && (<>
               <div className="text-[13px] text-stone-700 mb-3 font-mono">{getNodePath(selectedId)}</div>
 
               <div className="border-b border-stone-300 pb-4 mb-5">
@@ -19855,6 +21665,28 @@ function DMS({ storagePath, onChangeFolder }) {
                           className="flex-1 min-w-0 text-base border border-stone-300 rounded px-2 py-1 font-mono"
                         />
                         <VoiceMicButton onFinalTranscript={(chunk) => updateNodeMeta({ sn: appendWithSpace(selectedNode.sn || "", chunk) })} />
+                      </div>
+                    </div>
+                    <div>
+                      <label className="text-[12px] uppercase tracking-wider text-stone-700 block mb-0.5">
+                        {t("文件夹到期日（Due Date-Folder）", "Due Date-Folder")}
+                      </label>
+                      <div className="flex gap-1.5 items-center">
+                        <input
+                          type="date"
+                          value={selectedNode.dueDate || ""}
+                          onChange={(e) => updateNodeMeta({ dueDate: e.target.value || undefined })}
+                          className="text-base border border-stone-300 rounded px-2 py-1"
+                        />
+                        {selectedNode.dueDate && (
+                          <button
+                            type="button"
+                            onClick={() => updateNodeMeta({ dueDate: undefined })}
+                            className="text-sm px-2 py-1 border border-stone-300 hover:bg-red-50 hover:border-red-300 text-stone-700 rounded whitespace-nowrap"
+                          >
+                            {t("清除", "Clear")}
+                          </button>
+                        )}
                       </div>
                     </div>
                     <div className="pt-2 mt-1 border-t border-amber-200/70 space-y-3">
@@ -19946,8 +21778,16 @@ function DMS({ storagePath, onChangeFolder }) {
                           SN · {selectedNode.sn}
                         </div>
                       )}
+                      {selectedNode.dueDate && (
+                        <div className="text-base text-stone-700 mt-0.5 flex items-center gap-1">
+                          <Clock size={13} /> {t("文件夹到期日：", "Due Date-Folder: ")}{selectedNode.dueDate}
+                        </div>
+                      )}
                       {selectedNode.description && (
-                        <p className="text-base text-stone-700 mt-1">{selectedNode.description}</p>
+                        <p
+                          className="text-base text-stone-700 mt-1"
+                          dangerouslySetInnerHTML={{ __html: descriptionToEditableHtml(selectedNode.description) }}
+                        />
                       )}
                       {getNodeLogins(selectedNode).length > 0 && (
                         <div className="mt-2 space-y-1.5">
@@ -20018,12 +21858,32 @@ function DMS({ storagePath, onChangeFolder }) {
                 onSaveDescription={handleSaveNodeDescription}
                 onSaveTextAsDoc={handleSaveNodeDescriptionText}
                 onSaveDescPdf={handleSaveNodeDescriptionPdf}
+                onPasteDescriptionImage={handlePasteDescriptionImage}
                 onOpenAISettings={() => setShowAISettings(true)}
               />
+              <QcFolderPanel
+                key={"qc-" + selectedNode.id}
+                node={selectedNode}
+                docIndex={docIndex}
+                onSaveComment={handleSaveQcGeneralComment}
+                onReport={handleQcReport}
+              />
+              </>)}
 
               <section>
+                {/* Heading, action buttons, sort bar and select bar stay pinned while the document grid scrolls */}
+                <div className="sticky top-0 z-20 bg-stone-50 -mx-6 px-6 pt-2 border-b border-stone-200 mb-3">
                 <div className="flex items-center justify-between mb-3">
-                  <h2 className="text-sm font-semibold uppercase tracking-wider text-stone-700">{t("附加文档", "Attached documents")}</h2>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => setTopCollapsed((v) => !v)}
+                      title={topCollapsed ? t("展开上方的标题与描述", "Show the heading and description above") : t("收起上方的标题与描述，给文档更多空间", "Hide the heading and description above to give documents more room")}
+                      className="p-1 rounded border border-stone-300 bg-white text-stone-600 hover:bg-stone-100"
+                    >
+                      {topCollapsed ? <ChevronDown size={14} /> : <ChevronUp size={14} />}
+                    </button>
+                    <h2 className="text-sm font-semibold uppercase tracking-wider text-stone-700">{t("附加文档", "Attached documents")}</h2>
+                  </div>
                   <div className="flex gap-2 flex-wrap">
                     {!faceSelectMode ? (
                       <button
@@ -20062,6 +21922,30 @@ function DMS({ storagePath, onChangeFolder }) {
                       title={t("将此文件夹中的文档合并为一个 PDF 文件", "Merge the documents in this folder into a single PDF file")}
                     >
                       <Layers size={12} /> {t("合并文档", "Merge documents")}
+                    </button>
+                    <button
+                      onClick={async () => {
+                        if (!selectedNode) return;
+                        if (!qcDocsUnder(selectedNode, docIndex).length) {
+                          alert(t("此文件夹及其子文件夹中没有文件。", "There are no files in this folder or its subfolders."));
+                          return;
+                        }
+                        if (qcReportBusy) return;
+                        setQcReportBusy(true);   // big folders take a while: show progress on the button
+                        try {
+                          const r = await handleQcReport(selectedNode.id);
+                          if (r) alert(t(
+                            `✅ 已完成：${r.updated ? "已重新生成并覆盖原报告" : "已生成新报告"}。\n${r.name}（${r.pages} 页）\n点击“确定”关闭此提示，报告在本文件夹的文档列表中。`,
+                            `✅ Done: ${r.updated ? "the QC Review Report was regenerated and the old one overwritten" : "a new QC Review Report was created"}.\n${r.name} (${r.pages} pages)\nClick OK to close this message — the report is in this folder's document list.`));
+                        } catch (e) { alert(e.message || String(e)); }
+                        finally { setQcReportBusy(false); }
+                      }}
+                      disabled={qcReportBusy}
+                      className="text-sm px-3 py-1.5 border border-amber-400 bg-amber-50 hover:bg-amber-100 text-amber-900 rounded cursor-pointer flex items-center gap-1.5 disabled:opacity-60 disabled:cursor-wait"
+                      title={t("生成此文件夹（含子文件夹）全部文件的质检审核报告 PDF，并保存到此文件夹（可选择附上哪些实际检验报告）", "Generate the QC Review Report PDF for this folder (every file under it, incl. subfolders), filed in this folder. You choose which inspection reports to attach.")}
+                    >
+                      {qcReportBusy ? <Loader size={12} className="animate-spin" /> : <ListChecks size={12} />}
+                      {qcReportBusy ? t("正在生成…", "Generating…") : t("质检审核报告", "QC Review Report")}
                     </button>
                     <button
                       onClick={() => setShowConvertToPdfModal(true)}
@@ -20488,6 +22372,8 @@ function DMS({ storagePath, onChangeFolder }) {
                   </div>
                 )}
 
+                </div>
+
                 {(selectedNode.documents || []).length === 0 && (
                   <div className="border border-dashed border-stone-300 rounded p-8 text-center text-base text-stone-700">
                     {t("暂无附加文档。请上传新文件，或使用“链接现有文档”关联文件库中已有的文档。", "No documents attached yet. Upload a new file, or use “Link existing document” to attach one already in the library.")}
@@ -20546,7 +22432,7 @@ function DMS({ storagePath, onChangeFolder }) {
                             return n;
                           })}
                           scheduleMode={scheduleMode}
-                          urgency={urgencyTier(doc.dueDate)}
+                          urgency={urgencyTier(doc.dueDate, doc.remindDays)}
                           isLastWorked={lastWorkedDocId === doc.id}
                           onMarkWorked={() => setLastWorkedDocId(doc.id)}
                           isDragging={docIsDragging}
@@ -20568,10 +22454,10 @@ function DMS({ storagePath, onChangeFolder }) {
                         onUpdateMeta={(m) => updateDocMetadata(doc.id, m, selectedId)}
                         onUpdateName={(newName) => renameDoc(doc.id, newName)}
                         onUpdateSn={(newSn) => updateDocSn(doc.id, newSn)}
-                        onUpdateDueDate={(d) => updateDocDueDate(doc.id, d)}
+                        onUpdateDueDate={(d, extras) => updateDocDueDate(doc.id, d, extras)}
                         onUpdateDocDate={(d) => updateDocDate(doc.id, d)}
                         scheduleMode={scheduleMode}
-                        urgency={urgencyTier(doc.dueDate)}
+                        urgency={urgencyTier(doc.dueDate, doc.remindDays)}
                         keyParameters={keyParameters}
                         formatBytes={formatBytes}
                         onOpenEmailSettings={() => setShowEmailSettings(true)}
@@ -20631,10 +22517,19 @@ function DMS({ storagePath, onChangeFolder }) {
         onSaveParams={handleSaveParams}
         onSaveDescription={handleSaveDescription}
         onSaveTextAsDoc={handleSaveTextAsDoc}
+        onPasteDescriptionImage={handlePasteDescriptionImage}
         onUpdateMeta={viewerDoc ? (m) => handleUpdateDocMeta(viewerDoc.id, m, selectedId) : undefined}
         derivedDocs={viewerDoc ? docIndex.filter((e) => e.derivedFrom === viewerDoc.id) : []}
         onOpenAISettings={() => setShowAISettings(true)}
         nodeId={selectedId}
+        qcNode={viewerDoc ? (() => {
+          // The folder this report is filed in: the one being browsed if it holds
+          // the doc, otherwise the doc's own folder.
+          const cur = selectedNode && (selectedNode.documents || []).some((d) => d.id === viewerDoc.id) ? selectedNode : null;
+          return cur || (viewerDoc.originalNodeId ? findNode(tree, viewerDoc.originalNodeId) : null);
+        })() : null}
+        onSaveQcReview={handleSaveDocQcReview}
+        onQcReport={handleQcReport}
         onPrevDoc={viewerPrevDoc ? () => openDoc(viewerPrevDoc.id) : null}
         onNextDoc={viewerNextDoc ? () => openDoc(viewerNextDoc.id) : null}
       />
@@ -20723,7 +22618,8 @@ function DMS({ storagePath, onChangeFolder }) {
       )}
 
       {showTextTree && (() => {
-        const treeText = buildTreeText(tree, { showMeta: textTreeMeta });
+        const treeRoot = selectedNode || tree;
+        const treeText = buildTreeText(treeRoot, { showMeta: textTreeMeta });
         const copyTree = async () => {
           try {
             await navigator.clipboard.writeText(treeText);
@@ -20735,7 +22631,7 @@ function DMS({ storagePath, onChangeFolder }) {
           const blob = new Blob([treeText], { type: "text/plain;charset=utf-8" });
           const url = URL.createObjectURL(blob);
           const a = document.createElement("a");
-          const base = (tree && tree.name ? tree.name : "tree").replace(/[\\/:*?"<>|]/g, "_");
+          const base = (treeRoot && treeRoot.name ? treeRoot.name : "tree").replace(/[\\/:*?"<>|]/g, "_");
           a.href = url; a.download = `${base}.txt`;
           document.body.appendChild(a); a.click(); a.remove();
           setTimeout(() => URL.revokeObjectURL(url), 1000);
@@ -20807,6 +22703,49 @@ function DMS({ storagePath, onChangeFolder }) {
           if (freshTree) setTree(freshTree);
           const idx = await StorageAdapter.listDocumentIndex();
           setDocIndex(idx);
+        }}
+      />
+
+      <EqRecordUploadDialog
+        open={showEqRecordDialog}
+        tree={tree}
+        docIndex={docIndex}
+        defaultNodeId={selectedId}
+        onClose={() => setShowEqRecordDialog(false)}
+        onUpload={async (nodeId, file, freshTree = false) => {
+          // Batch uploads pass freshTree: this closure's `tree` is stale after the first file.
+          const baseTreeOverride = freshTree ? ((await StorageAdapter.getTree()).tree || null) : null;
+          const ok = await uploadFilesToNode(nodeId, [file], { routeMode: "current-folder", skipDuplicates: true, exactName: true, baseTreeOverride });
+          if (!ok) throw new Error(t("上传未成功，请查看提示信息。", "The upload didn't complete — see the error message."));
+        }}
+      />
+
+      {qcReportDialog && findNode(tree, qcReportDialog.nodeId) && (
+        <QcReportDialog
+          node={findNode(tree, qcReportDialog.nodeId)}
+          docIndex={docIndex}
+          onGenerate={(ids) => runQcReport(qcReportDialog.nodeId, ids)}
+          onCancel={cancelQcReport}
+        />
+      )}
+
+      {showHeicDialog && <HeicToJpgDialog onClose={() => setShowHeicDialog(false)} />}
+
+      <EqRecordUploadDialog
+        mode="qc"
+        open={showQcUploadDialog}
+        tree={tree}
+        docIndex={docIndex}
+        defaultNodeId={selectedId}
+        onClose={() => setShowQcUploadDialog(false)}
+        onUpload={async (anNodeId, file, freshTree = false, meta = {}) => {
+          // Files go straight into the AN folder. Each report gets its own QC
+          // review, pre-filled with the AN / SN / PN / WON from its name.
+          // Batch uploads pass freshTree: this closure's `tree` is stale after the first file.
+          const baseTreeOverride = freshTree ? ((await StorageAdapter.getTree()).tree || null) : null;
+          const qcReview = { ...EMPTY_QC, an: meta.an || "", sn: meta.sn || "", pn: meta.pn || "", won: meta.won || "" };
+          const ok = await uploadFilesToNode(anNodeId, [file], { routeMode: "current-folder", skipDuplicates: true, exactName: true, baseTreeOverride, qcReview });
+          if (!ok) throw new Error(t("上传未成功，请查看提示信息。", "The upload didn't complete — see the error message."));
         }}
       />
 
@@ -20932,10 +22871,17 @@ function DMS({ storagePath, onChangeFolder }) {
 
       <DueDocsListDialog
         open={showDueList}
-        items={dueDocsList}
+        docs={dueScope.docs}
+        folders={dueScope.folders}
+        scopeName={dueScope.rootName}
         getNodePath={getNodePath}
         onClose={() => setShowDueList(false)}
         onOpenItem={handleOpenDueItem}
+        onOpenFolder={(f) => { setShowDueList(false); expandToNode(f.id); }}
+        onDone={markDocDueDone}
+        onBulkSet={bulkSetDocReminder}
+        undoCount={lastBulk ? lastBulk.length : 0}
+        onUndoBulk={undoLastBulkReminder}
       />
 
       <ZipImportDialog

@@ -274,6 +274,63 @@ def _image_to_pdf_bytes(img_path: Path, caption: str, strict: bool = False,
     return buf.getvalue()
 
 
+_OFFICE_EXTS = (".doc", ".docx", ".ppt", ".pptx", ".odt", ".odp", ".rtf")
+
+
+def _find_soffice() -> str | None:
+    """Locate LibreOffice's command-line binary, or None if not installed."""
+    import shutil, os
+    found = shutil.which("soffice") or shutil.which("libreoffice")
+    if found:
+        return found
+    candidates = [
+        "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+        r"C:\Program Files\LibreOffice\program\soffice.exe",
+        r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+    ]
+    return next((c for c in candidates if os.path.exists(c)), None)
+
+
+def is_office_file(mime: str, filename: str) -> bool:
+    mime = (mime or "").lower()
+    name = (filename or "").lower()
+    return name.endswith(_OFFICE_EXTS) or "wordprocessingml" in mime \
+        or "presentationml" in mime or mime in ("application/msword", "application/vnd.ms-powerpoint")
+
+
+def office_to_pdf_bytes(file_bytes: bytes, filename: str) -> bytes:
+    """Convert a Word/PowerPoint file to PDF bytes with headless LibreOffice.
+    Raises ValueError (safe to show the user) if it can't be converted."""
+    import os, subprocess, tempfile
+    from pathlib import Path as _P
+    soffice = _find_soffice()
+    if not soffice:
+        raise ValueError(
+            "Converting Word/PowerPoint needs LibreOffice (free, libreoffice.org), "
+            "which isn't installed. Install it, or export the file to PDF first."
+        )
+    suffix = _P(filename or "cover.docx").suffix or ".docx"
+    with tempfile.TemporaryDirectory() as td:
+        src = _P(td) / ("cover" + suffix)
+        src.write_bytes(file_bytes)
+        env = dict(os.environ)
+        # Without this, LibreOffice renders Chinese as blank boxes on macOS.
+        if os.path.exists("/opt/homebrew/etc/fonts/fonts.conf"):
+            env.setdefault("FONTCONFIG_FILE", "/opt/homebrew/etc/fonts/fonts.conf")
+        try:
+            subprocess.run(
+                [soffice, f"-env:UserInstallation={_P(td, 'lo_profile').as_uri()}",
+                 "--headless", "--convert-to", "pdf", "--outdir", td, str(src)],
+                capture_output=True, timeout=180, env=env,
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            raise ValueError(f"Could not convert {filename or 'the file'} to PDF: {e}")
+        out = _P(td) / "cover.pdf"
+        if not out.exists():
+            raise ValueError(f"Could not convert {filename or 'the file'} to PDF.")
+        return out.read_bytes()
+
+
 def build_front_page_pdf_bytes(file_bytes: bytes, mime: str, filename: str = "") -> bytes:
     """
     Normalize a user-supplied front-page file into page bytes suitable for
@@ -282,6 +339,9 @@ def build_front_page_pdf_bytes(file_bytes: bytes, mime: str, filename: str = "")
     to already be a designed cover/letterhead). Anything else raises
     ValueError with a message safe to show the user directly.
     """
+    if is_office_file(mime, filename):
+        file_bytes = office_to_pdf_bytes(file_bytes, filename)
+        mime, filename = "application/pdf", "cover.pdf"
     mime = (mime or "").lower()
     name = (filename or "").lower()
     is_pdf = mime == "application/pdf" or name.endswith(".pdf")
@@ -322,7 +382,7 @@ def build_front_page_pdf_bytes(file_bytes: bytes, mime: str, filename: str = "")
 
     raise ValueError(
         f"Unsupported front page file type ({mime or name or 'unknown'}). "
-        "Please provide a PDF or image file — export Word/Pages documents to PDF first."
+        "Please provide a PDF, Word, PowerPoint or image file."
     )
 
 
@@ -1281,6 +1341,90 @@ def build_node_description_pdf(node_name: str, node_path: str = "", sn: str = ""
     story.append(HRFlowable(width="100%", thickness=0.5, color=BORDER, spaceAfter=10))
     story.append(Paragraph(_para_text(description or "(no description)"), p_body))
 
+    doc.build(story)
+    return buf.getvalue()
+
+
+def build_qc_review_pdf(node_name: str, node_path: str, general_comment: str, items: list,
+                        generated_at: str = "") -> bytes:
+    """Cover pages of a folder's QC Review Report.
+
+    The report is at folder level: it lists EVERY file under the folder
+    (subfolders included) with its own Inspection, SN, Equipment Description,
+    WO/PO and review fields, plus the folder's General Comment.
+
+    items: [{"folder": str, "name": str, "qc": dict}, ...] one per file; qc
+           holds an, sn, pn, won, dateReviewed, reviewedBy, observation,
+           mitigation, result (any may be missing).
+    """
+    from reportlab.platypus import Table, TableStyle, KeepTogether
+    _init_fonts()
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=letter,
+        leftMargin=MARGIN, rightMargin=MARGIN, topMargin=MARGIN, bottomMargin=MARGIN,
+        title=f"QC Review Report - {node_name}",
+    )
+    styles = getSampleStyleSheet()
+    kicker = ParagraphStyle("QCK", parent=styles["Normal"], fontName=_FONT_BOLD, fontSize=9,
+                            leading=12, textColor=SUBTLE, spaceAfter=2)
+    title = ParagraphStyle("QCT", parent=styles["Normal"], fontName=_FONT_BOLD, fontSize=20,
+                           leading=25, textColor=black, spaceAfter=4)
+    meta = ParagraphStyle("QCM", parent=styles["Normal"], fontName=_FONT, fontSize=9,
+                          leading=13, textColor=SUBTLE, spaceAfter=3)
+    label = ParagraphStyle("QCL", parent=styles["Normal"], fontName=_FONT_BOLD, fontSize=8.5,
+                           leading=11, textColor=SUBTLE)
+    body = ParagraphStyle("QCB", parent=styles["Normal"], fontName=_FONT, fontSize=10.5,
+                          leading=14.5, textColor=black)
+    cell = ParagraphStyle("QCC", parent=styles["Normal"], fontName=_FONT, fontSize=8.5,
+                          leading=11, textColor=black)
+    h2 = ParagraphStyle("QCH", parent=styles["Normal"], fontName=_FONT_BOLD, fontSize=12,
+                        leading=16, textColor=black, spaceBefore=12, spaceAfter=4)
+
+    def P(text, style=body):
+        return Paragraph(_escape(text or "").replace("\n", "<br/>") or "&nbsp;", style)
+
+    story: list = [
+        Paragraph("QC REVIEW REPORT / 质量检验审核报告", kicker),
+        Paragraph(_escape(node_name or "QC Review"), title),
+    ]
+    sub = " · ".join(filter(None, [node_path or "", f"Generated: {generated_at}" if generated_at else ""]))
+    if sub:
+        story.append(Paragraph(_escape(sub), meta))
+    story += [Spacer(1, 0.1 * inch), HRFlowable(width="100%", thickness=0.5, color=BORDER, spaceAfter=6)]
+
+    story.append(Paragraph("General Comment", h2))
+    story.append(P(general_comment or "(none)"))
+
+    story.append(Paragraph(f"Files reviewed ({len(items)})", h2))
+    head = ["#", "File", "SN (Serial Number)", "Equipment Description", "WO/PO", "Date Reviewed", "Reviewed By", "Result"]
+    rows = [[P(h, label) for h in head]]
+    for i, it in enumerate(items):
+        q = it.get("qc") or {}
+        rows.append([P(str(i + 1), cell), P(it.get("name", ""), cell), P(q.get("sn", ""), cell), P(q.get("pn", ""), cell),
+                     P(q.get("won", ""), cell), P(q.get("dateReviewed", ""), cell),
+                     P(q.get("reviewedBy", ""), cell), P(q.get("result", ""), cell)])
+    cw = [0.3, 1.25, 0.85, 1.15, 0.85, 0.85, 0.8, 0.65]
+    t1 = Table(rows, colWidths=[c * inch for c in cw], repeatRows=1)
+    t1.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 0.4, BORDER), ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                            ("BACKGROUND", (0, 0), (-1, 0), HexColor("#f5f5f4")),
+                            ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3)]))
+    story.append(t1)
+
+    story.append(Paragraph("Review details", h2))
+    for i, it in enumerate(items):
+        q = it.get("qc") or {}
+        where = f"{it.get('folder') + ' / ' if it.get('folder') else ''}{it.get('name', '')}"
+        block = [
+            Paragraph(f"{i + 1}. {_escape(where)}", ParagraphStyle("QCD", parent=body, fontName=_FONT_BOLD, fontSize=10)),
+            P(f"Inspection: {q.get('an', '')}   SN: {q.get('sn', '')}   Equipment Description: {q.get('pn', '')}   WO/PO: {q.get('won', '')}", cell),
+        ]
+        block += [P(f"Date Reviewed: {q.get('dateReviewed', '')}   Reviewed By: {q.get('reviewedBy', '')}", cell),
+                  P("Observation: " + (q.get("observation") or "—"), cell),
+                  P("Mitigation: " + (q.get("mitigation") or "—"), cell),
+                  P("Review Result: " + (q.get("result") or "—"), cell)]
+        block.append(Spacer(1, 6))
+        story.append(KeepTogether(block))
     doc.build(story)
     return buf.getvalue()
 

@@ -156,6 +156,71 @@ def extract_keys_with_gemini(image_bytes_list: list[bytes], keys: list[str],
     return results
 
 
+def detect_service_date_with_gemini(image_bytes_list: list[bytes], api_key: str,
+                                     model: str = DEFAULT_MODEL) -> str:
+    """Ask Gemini for the date a service/exam/test was performed, explicitly
+    excluding a date of birth -- unlike extract_keys_with_gemini's generic
+    "find this field's value" prompt, this one exists because a document
+    (e.g. a lab report) can show several dates and the regex-based
+    pdf_extraction.find_document_date() has no way to tell them apart.
+
+    Returns the date as Gemini printed it (e.g. "09/05/2020"), or the literal
+    string "NF" if it found no such date. The caller is expected to run this
+    through pdf_extraction._parse_date_snippet() to normalize it to
+    YYYY-MM-DD -- this function deliberately doesn't parse dates itself, to
+    keep that single well-tested parser as the only place format handling
+    lives.
+    """
+    if not image_bytes_list:
+        raise AIExtractionError("没有可发送给 AI 的页面图像（文档可能不是 PDF 或图片）。")
+    if not api_key:
+        raise AIExtractionError("未配置 Gemini API Key，请先在设置中添加。")
+
+    try:
+        from google import genai
+    except ImportError:
+        raise AIExtractionError(
+            "未安装 google-genai 库。请在运行此程序的 Python 中执行：pip install google-genai")
+
+    prompt = (
+        "This document may show more than one date -- for example the "
+        "patient's date of birth, and the date a service, exam, or test was "
+        "actually performed (often labeled something like \"Service Date\", "
+        "\"Date of Service\", \"Collected\", \"Exam Date\", \"Test Date\", or "
+        "\"Report Date\"). Find ONLY the date the service was performed. Do "
+        "NOT return the date of birth, even if it is the only date present.\n\n"
+        "Respond with ONLY the date exactly as printed in the document (e.g. "
+        "\"09/05/2020\"), or the literal string \"NF\" if no such date "
+        "appears anywhere. No explanation, no extra text."
+    )
+
+    contents = [prompt]
+    for img_bytes in image_bytes_list:
+        contents.append(_image_part(img_bytes))
+
+    client = genai.Client(api_key=api_key)
+    candidates = [model] + [m for m in FALLBACK_MODELS if m != model]
+    response = None
+    last_error = None
+    for candidate in candidates:
+        try:
+            response = client.models.generate_content(model=candidate, contents=contents)
+            last_error = None
+            break
+        except Exception as e:
+            last_error = e
+            msg = str(e)
+            if "NOT_FOUND" in msg or "404" in msg or "no longer available" in msg:
+                continue
+            break
+
+    if last_error is not None:
+        raise AIExtractionError(f"调用 Gemini API 失败：{last_error}")
+
+    raw = (getattr(response, "text", None) or "").strip()
+    return raw or "NF"
+
+
 def _build_cross_doc_prompt(question: str, snippets: list[dict]) -> str:
     """Shared prompt for cross-document Q&A -- same wording regardless of
     which model answers it, so results are comparable across providers."""
@@ -523,6 +588,72 @@ def answer_question_about_document(question: str, doc_name: str, doc_text: str,
     if not answer:
         raise AIExtractionError("AI 未返回有效的回答。")
     return {"answer": answer, "model": model_used}
+
+
+def translate_to_chinese(text: str, api_key: str, provider: str = "gemini",
+                         language: str = "Simplified Chinese (简体中文)") -> dict:
+    """Translate one page's worth of text into `language` (default Simplified
+    Chinese; the name is historical), keeping the original's line/paragraph structure so the result
+    reads alongside the source page. Returns {"text": str, "model": str}."""
+    text = (text or "").strip()
+    if not text:
+        raise AIExtractionError("此页没有可翻译的文字。")
+    if not api_key:
+        label = "DeepSeek" if provider == "deepseek" else "Gemini"
+        raise AIExtractionError(f"未配置 {label} API Key，请先在设置中添加。")
+
+    prompt = (
+        "Translate the following text, extracted from ONE page of a PDF, "
+        f"into {language}.\n\n"
+        "Rules:\n"
+        "- Translate faithfully and completely; do not summarize, add or omit anything.\n"
+        "- Keep the paragraph/line structure, headings, bullet lists and table "
+        "rows in the same order as the source.\n"
+        "- Keep numbers, units, dates, part numbers, names and codes unchanged.\n"
+        "- Text that is already in the target language stays as it is.\n"
+        "- Return ONLY the translation -- no preamble, no notes, no code fences.\n\n"
+        "Text:\n-----\n" + text + "\n-----"
+    )
+
+    if provider == "deepseek":
+        out = _deepseek_chat([{"role": "user", "content": prompt}], api_key, timeout=120).strip()
+        if not out:
+            raise AIExtractionError("AI 未返回有效的翻译。")
+        return {"text": out, "model": DEEPSEEK_DEFAULT_MODEL}
+
+    try:
+        from google import genai
+    except ImportError:
+        raise AIExtractionError(
+            "未安装 google-genai 库。请在运行此程序的 Python 中执行：pip install google-genai")
+
+    client = genai.Client(api_key=api_key)
+    candidates = [DEFAULT_MODEL] + [m for m in FALLBACK_MODELS if m != DEFAULT_MODEL]
+    response = None
+    last_error = None
+    model_used = None
+    for candidate in candidates:
+        try:
+            response = client.models.generate_content(model=candidate, contents=[prompt])
+            model_used = candidate
+            last_error = None
+            break
+        except Exception as e:
+            last_error = e
+            msg = str(e)
+            if "NOT_FOUND" in msg or "404" in msg or "no longer available" in msg:
+                continue
+            break
+    if last_error is not None:
+        raise AIExtractionError(f"调用 Gemini API 失败：{last_error}")
+
+    out = (getattr(response, "text", None) or "").strip()
+    if out.startswith("```"):
+        out = re.sub(r"^```[a-zA-Z]*\n?", "", out)
+        out = re.sub(r"\n?```$", "", out).strip()
+    if not out:
+        raise AIExtractionError("AI 未返回有效的翻译。")
+    return {"text": out, "model": model_used}
 
 
 # Style presets for polish_description_text(). Keep the wording tight -- these

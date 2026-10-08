@@ -3115,10 +3115,34 @@ def set_settings():
     data = request.get_json(force=True) or {}
     new_path = (data.get("storage_path") or "").strip()
     copy_current = bool(data.get("copy_current", False))
+    rename_current = bool(data.get("rename_current", False))
     if not new_path:
         return jsonify({"error": "storage_path is required"}), 400
 
     p = Path(new_path).expanduser().resolve()
+
+    # Rename (move) the existing storage folder to the new path so all loaded
+    # files stay together under the new name, instead of leaving the old
+    # folder behind and creating an empty new one.
+    renamed = False
+    if rename_current:
+        old_root = get_storage_root()
+        try:
+            if (old_root and old_root.is_dir() and old_root != p
+                    and p not in old_root.parents and old_root not in p.parents
+                    and not (p / "index.json").exists()
+                    and (not p.exists() or (p.is_dir() and not any(p.iterdir())))):
+                if p.exists():
+                    p.rmdir()
+                p.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    old_root.rename(p)
+                except OSError:
+                    _shutil.move(str(old_root), str(p))
+                renamed = True
+        except OSError as e:
+            return jsonify({"error": f"Could not rename the storage folder: {e}"}), 400
+
     try:
         p.mkdir(parents=True, exist_ok=True)
         # Probe writability
@@ -3134,7 +3158,7 @@ def set_settings():
     had_existing_data = new_index.exists()
 
     # If asked to migrate and the new folder is empty, copy current index.json
-    if copy_current and not had_existing_data:
+    if copy_current and not had_existing_data and not renamed:
         old_root = get_storage_root()
         if old_root:
             old_index = old_root / "index.json"
@@ -3145,7 +3169,7 @@ def set_settings():
                     pass  # non-fatal — user will see an empty tree instead
 
     set_storage_path(str(p))
-    return jsonify({"ok": True, "resolved_path": str(p), "had_existing_data": had_existing_data})
+    return jsonify({"ok": True, "resolved_path": str(p), "had_existing_data": had_existing_data, "renamed": renamed})
 
 
 # ---- Tree ------------------------------------------------------------------
@@ -3523,6 +3547,68 @@ def _browse_roots() -> list:
                     pass
 
     return roots
+
+
+# ---- HEIC -> JPG converter (the standalone heic_to_jpg.py, run from the UI) ----
+_heic_jobs: dict = {}
+_heic_jobs_lock = _threading.Lock()
+
+
+@app.route("/api/tools/heic-to-jpg", methods=["POST"])
+def post_heic_to_jpg():
+    """Start converting the HEIC/HEIF photos in a folder to JPG in the background.
+
+    Body (JSON): { folder, recursive?, output?, quality?, overwrite?, delete_original? }
+    Returns { ok, job_id }; poll GET /api/tools/heic-to-jpg/<job_id>.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    folder = (data.get("folder") or "").strip()
+    if not folder:
+        return jsonify({"error": "Choose a folder that contains HEIC photos"}), 400
+    src = Path(folder).expanduser()
+    if not src.is_dir():
+        return jsonify({"error": f"Folder not found: {folder}"}), 400
+    try:
+        quality = int(data.get("quality") or 92)
+    except (TypeError, ValueError):
+        quality = 92
+    quality = max(1, min(100, quality))
+    try:
+        import heic_to_jpg
+    except ImportError as e:
+        return jsonify({"error": f"heic_to_jpg module missing: {e}"}), 500
+    if not heic_to_jpg.LIBS_OK:
+        return jsonify({"error": "Missing libraries. Run: pip3 install pillow pillow-heif, then restart DMS."}), 500
+
+    job_id = secrets.token_hex(6)
+    job = {"state": "running", "done": 0, "total": 0, "message": "Scanning…", "result": None, "error": ""}
+    with _heic_jobs_lock:
+        _heic_jobs[job_id] = job
+
+    def _progress(done, total, msg):
+        job.update(done=done, total=total, message=msg)
+
+    def _run():
+        try:
+            job["result"] = heic_to_jpg.run_conversion(
+                [str(src)], bool(data.get("recursive")), (data.get("output") or "").strip() or None,
+                quality, bool(data.get("overwrite")), bool(data.get("delete_original")), progress=_progress)
+            job["state"] = "done"
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            job["state"], job["error"] = "error", str(e)
+
+    _threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"ok": True, "job_id": job_id})
+
+
+@app.route("/api/tools/heic-to-jpg/<job_id>", methods=["GET"])
+def get_heic_to_jpg(job_id):
+    job = _heic_jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Unknown job"}), 404
+    return jsonify(job)
 
 
 @app.route("/api/browse-folder", methods=["GET"])
@@ -5400,7 +5486,16 @@ def open_doc_native(doc_id):
 
 @app.route("/api/paste-screenshot", methods=["POST"])
 def paste_screenshot():
-    """Accept a base64-encoded clipboard image, convert to PDF, save to node folder."""
+    """Accept a base64-encoded clipboard image, save to node folder.
+
+    Normally converts to PDF (the default, for the folder-toolbar/Ctrl+V
+    "paste screenshot as a new document" feature). When `as_image` is true
+    (used when pasting a screenshot inline into a Description field, which
+    needs an <img>-embeddable file, not a PDF), the image is instead
+    re-encoded as PNG and stored as its own image document -- same folder,
+    same doc-tree/index treatment as any other image, just skipping the PDF
+    conversion so it can be referenced directly via /api/docs/<id>.
+    """
     import base64
     from io import BytesIO
 
@@ -5408,6 +5503,7 @@ def paste_screenshot():
     image_b64 = data.get("image_data", "")
     node_id = data.get("node_id", "").strip() or None
     folder_name = data.get("folder_name", "截图").strip() or "截图"
+    as_image = bool(data.get("as_image"))
 
     docs_dir = get_docs_dir()
     if not docs_dir:
@@ -5421,13 +5517,22 @@ def paste_screenshot():
     try:
         from PIL import Image
         img = Image.open(BytesIO(img_bytes))
-        if img.mode in ("RGBA", "LA", "P"):
-            img = img.convert("RGB")
-        pdf_buf = BytesIO()
-        img.save(pdf_buf, "PDF", resolution=150)
-        pdf_bytes = pdf_buf.getvalue()
+        if as_image:
+            if img.mode not in ("RGB", "RGBA"):
+                img = img.convert("RGBA" if "A" in img.mode else "RGB")
+            out_buf = BytesIO()
+            img.save(out_buf, "PNG")
+            out_bytes = out_buf.getvalue()
+            extension, mime = "png", "image/png"
+        else:
+            if img.mode in ("RGBA", "LA", "P"):
+                img = img.convert("RGB")
+            out_buf = BytesIO()
+            img.save(out_buf, "PDF", resolution=150)
+            out_bytes = out_buf.getvalue()
+            extension, mime = "pdf", "application/pdf"
     except Exception as e:
-        return jsonify({"error": f"Image to PDF conversion failed: {e}"}), 500
+        return jsonify({"error": f"Image conversion failed: {e}"}), 500
 
     doc_id = secrets.token_hex(8)
     safe_folder = re.sub(r'[/\\:*?"<>|\x00-\x1f#]', '_', folder_name).strip('. ') or "截图"
@@ -5443,23 +5548,24 @@ def paste_screenshot():
     # Find next available sequence number for this folder prefix (a loose
     # starting count under either on-disk layout -- the while loop below is
     # what actually guarantees no collision).
-    existing = list(docs_dir.rglob(f"*{safe_folder}#*.pdf"))
+    existing = list(docs_dir.rglob(f"*{safe_folder}#*.{extension}"))
     n = len(existing) + 1
-    safe_name = f"{safe_folder}#{n:03d}.pdf"
+    safe_name = f"{safe_folder}#{n:03d}.{extension}"
     while (out_dir / _doc_filename(doc_id, safe_name)).exists() or _doc_display_name_in_use(docs_dir, safe_name):
         n += 1
-        safe_name = f"{safe_folder}#{n:03d}.pdf"
+        safe_name = f"{safe_folder}#{n:03d}.{extension}"
 
     out_path = out_dir / _doc_filename(doc_id, safe_name)
-    out_path.write_bytes(pdf_bytes)
+    out_path.write_bytes(out_bytes)
 
-    print(f"[DMS] paste-screenshot → {out_path.name} ({len(pdf_bytes)} bytes)")
+    print(f"[DMS] paste-screenshot → {out_path.name} ({len(out_bytes)} bytes)")
     return jsonify({
         "ok": True,
         "doc_id": doc_id,
         "name": safe_name,
         "filename": out_path.name,
-        "size": len(pdf_bytes),
+        "size": len(out_bytes),
+        "mime": mime,
     })
 
 
@@ -6069,6 +6175,82 @@ def polish_text():
     })
 
 
+_translate_cache: dict = {}   # (doc_id, page, provider) -> {"text", "model"}
+_TRANSLATE_CACHE_MAX = 500
+
+
+@app.route("/api/docs/<doc_id>/translate-page", methods=["POST"])
+def translate_pdf_page(doc_id):
+    """Translate ONE page of a PDF into Chinese (Gemini or DeepSeek) for the
+    side-by-side translation pane in the document viewer.
+
+    Body: { "page": int (1-based), "text": str|null (page text the client
+    already read with pdf.js; if empty the page is OCR'd server-side),
+    "provider": "gemini"|"deepseek",
+    "language": str (English name of the target language, default
+    "Simplified Chinese (简体中文)") }
+    Returns { ok, page, text, provider, model, cached }.
+    """
+    docs_dir = get_docs_dir()
+    if not docs_dir:
+        return jsonify({"error": "Storage path not configured"}), 503
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        page = int(data.get("page"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Provide a 'page' number"}), 400
+    if page < 1:
+        return jsonify({"error": "Provide a 'page' number"}), 400
+    provider = (data.get("provider") or "gemini").strip().lower()
+    if provider not in ("gemini", "deepseek"):
+        return jsonify({"error": "Unknown provider"}), 400
+
+    language = (data.get("language") or "").strip()[:80] or "Simplified Chinese (简体中文)"
+    key = (doc_id, page, provider, language)
+    hit = _translate_cache.get(key)
+    if hit:
+        return jsonify({"ok": True, "page": page, "provider": provider, "cached": True, **hit})
+
+    cfg = load_config()
+    enc = cfg.get(_ai_key_field(provider), "")
+    label = "DeepSeek" if provider == "deepseek" else "Gemini"
+    if not enc:
+        return jsonify({"error": f"未配置 {label} API Key，请先在设置中添加。"}), 400
+    try:
+        api_key = decrypt_secret(enc)
+    except Exception:
+        return jsonify({"error": "无法读取已保存的 API Key，请重新设置。"}), 400
+
+    text = (data.get("text") or "").strip()
+    if not text:
+        matches = _find_doc_files(docs_dir, doc_id)
+        if not matches:
+            return jsonify({"error": "Document not found"}), 404
+        try:
+            import pdf_extraction
+            text = (pdf_extraction._ocr_page(matches[0], page - 1) or "").strip()
+        except Exception:
+            text = ""
+        if not text:
+            return jsonify({"error": "此页没有可识别的文字（可能是空白页或图片）。", "empty": True}), 422
+    text = text[:20000]
+
+    try:
+        import ai_extraction
+        result = ai_extraction.translate_to_chinese(
+            text, api_key, provider=provider, language=language)
+    except ai_extraction.AIExtractionError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    if len(_translate_cache) >= _TRANSLATE_CACHE_MAX:
+        _translate_cache.pop(next(iter(_translate_cache)))
+    _translate_cache[key] = {"text": result["text"], "model": result.get("model")}
+    return jsonify({"ok": True, "page": page, "provider": provider, "cached": False,
+                    "text": result["text"], "model": result.get("model")})
+
+
 @app.route("/api/check-typos-cn", methods=["POST"])
 def check_typos_cn_route():
     """Proofread a block of Chinese text (e.g. a document's Description) for
@@ -6289,6 +6471,68 @@ def post_doc_extract_keys_ai(doc_id):
         "found_count": found_n,
         "pages_used": len(images),
         "method": "gemini-ai",
+    })
+
+
+@app.route("/api/docs/<doc_id>/detect-service-date-ai", methods=["POST"])
+def post_doc_detect_service_date_ai(doc_id):
+    """AI-assisted re-detection of a document's *service* date (Gemini,
+    opt-in), explicitly distinguishing it from a date of birth -- unlike the
+    upload-time _scan_uploaded_doc_date()/find_document_date() regex scan
+    (page 1 only, no way to tell DOB from a service/exam date apart), this
+    re-scans an already-stored document on demand for the folder-level
+    "AI: detect service date" button.
+
+    Returns { ok, doc_id, found, date (YYYY-MM-DD or None), raw }.
+    """
+    docs_dir = get_docs_dir()
+    if not docs_dir:
+        return jsonify({"error": "Storage path not configured"}), 503
+
+    if "/" in doc_id or "\\" in doc_id or ".." in doc_id:
+        return jsonify({"error": "Invalid doc_id"}), 400
+
+    cfg = load_config()
+    enc = cfg.get("gemini_api_key_enc", "")
+    if not enc:
+        return jsonify({"error": "未配置 Gemini API Key，请先在设置中添加。"}), 400
+    try:
+        api_key = decrypt_secret(enc)
+    except Exception:
+        return jsonify({"error": "无法读取已保存的 API Key，请重新设置。"}), 400
+
+    matches = _find_doc_files(docs_dir, doc_id)
+    if not matches:
+        return jsonify({"error": "Document not found on disk"}), 404
+
+    try:
+        import pdf_extraction
+        images = pdf_extraction.render_pages_for_ai(matches[0], max_pages=3)
+    except Exception as e:
+        return jsonify({"error": f"无法读取文档页面图像：{e}"}), 500
+
+    if not images:
+        return jsonify({"error": "此文档类型不支持 AI 提取（仅支持 PDF 和图片），"
+                                  "或缺少 PDF 渲染库（PyMuPDF）。"}), 400
+
+    try:
+        import ai_extraction
+        raw = ai_extraction.detect_service_date_with_gemini(images, api_key)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    date = None
+    if raw and raw != "NF":
+        parsed = pdf_extraction._parse_date_snippet(raw)
+        if parsed:
+            date, raw = parsed[0], parsed[1]
+
+    return jsonify({
+        "ok": True,
+        "doc_id": doc_id,
+        "found": date is not None,
+        "date": date,
+        "raw": raw,
     })
 
 
@@ -6803,6 +7047,109 @@ def post_node_save_description_pdf(node_id):
     return jsonify({"ok": True, **result})
 
 
+@app.route("/api/nodes/<node_id>/qc-review-report", methods=["POST"])
+def post_node_qc_review_report(node_id):
+    """Build the QC Review Report for a folder and file it into that folder.
+
+    Every file (document) has its own QC Review (entry["qcReview"]:
+    an=Inspection, sn, pn=Equipment Description, won=WO/PO, dateReviewed,
+    reviewedBy, observation, mitigation, result). Inspection / SN / Equipment
+    Description fall back to the file name ("Inspection^SN^Equipment
+    Description^...") when not filled in. The folder contributes its General
+    Comment (node["qcGeneralComment"]). The PDF is a cover (General Comment,
+    a table of ALL files under the folder -- subfolders included -- with SN /
+    Equipment Description / WO/PO + result, and each file's review details)
+    followed by those files themselves. Regenerating overwrites the previous
+    report in place. Returns { ok, doc_id, name, pages }.
+
+    Body (JSON, optional): { "attach_doc_ids": [doc ids] } -- which inspection
+    reports to attach after the cover pages: omitted = all, [] = none (cover
+    pages only), otherwise just those. (Legacy: "include_files": false = none.)
+    The cover's table and details always list every file.
+    """
+    body_json = request.get_json(silent=True) or {}
+    attach_ids = body_json.get("attach_doc_ids")
+    if attach_ids is None and not body_json.get("include_files", True):
+        attach_ids = []
+    attach_set = None if attach_ids is None else set(attach_ids)
+    docs_dir = get_docs_dir()
+    if not docs_dir:
+        return jsonify({"error": "Storage path not configured"}), 503
+    idx = read_index()
+    tree = idx.get("tree")
+    node = _find_node_by_id(tree, node_id) if tree else None
+    if node is None:
+        return jsonify({"error": "Folder not found"}), 404
+
+    doc_index = idx.get("docIndex") or []
+    by_id = {d.get("id"): d for d in doc_index}
+    selection, items, seen = [], [], set()
+
+    def walk(n, rel):
+        ids = []
+        for ref in n.get("documents") or []:
+            d = by_id.get(ref.get("id"))
+            if not d or d["id"] in seen or d.get("sourceFeature") == "qc_review_report":
+                continue
+            seen.add(d["id"])
+            ids.append(d["id"])
+            name = d.get("name") or d["id"]
+            parts = name.rsplit(".", 1)[0].split("^") if "." in name else name.split("^")
+            qc = {}
+            if len(parts) >= 3:
+                qc = {"an": parts[0].strip(), "sn": parts[1].strip(), "pn": parts[2].strip()}
+            qc.update({k: v for k, v in (d.get("qcReview") or {}).items() if v not in (None, "")})
+            items.append({"folder": rel, "name": name, "qc": qc})
+        if ids:
+            selection.append({"nodeId": n["id"], "docIds": ids})
+        for c in n.get("children") or []:
+            walk(c, (rel + " / " if rel else "") + (c.get("name") or ""))
+    walk(node, "")
+    if not items:
+        return jsonify({"error": "This folder has no files to review"}), 400
+
+    try:
+        from databook import build_qc_review_pdf, build_databook
+        from pypdf import PdfReader, PdfWriter
+        import io as _io
+        cover = build_qc_review_pdf(
+            node.get("name") or "QC Review", _node_display_path(tree, node_id),
+            node.get("qcGeneralComment") or "", items, datetime.now().strftime("%Y-%m-%d %H:%M"))
+        writer = PdfWriter()
+        for pg in PdfReader(_io.BytesIO(cover)).pages:
+            writer.add_page(pg)
+        attach_sel = [
+            {"nodeId": sec["nodeId"], "docIds": [i for i in sec["docIds"] if attach_set is None or i in attach_set]}
+            for sec in selection
+        ]
+        attach_sel = [sec for sec in attach_sel if sec["docIds"]]
+        if attach_sel:
+            body = build_databook(attach_sel, docs_dir, doc_index, tree, include_cover=False)
+            for pg in PdfReader(_io.BytesIO(body)).pages:
+                writer.add_page(pg)
+        out = _io.BytesIO()
+        writer.write(out)
+        pdf_bytes = out.getvalue()
+        pages = len(writer.pages)
+    except ImportError as e:
+        return jsonify({"error": "Databook libraries not installed (pypdf, reportlab, Pillow): " + str(e)}), 500
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": f"QC Review Report failed: {e}"}), 500
+
+    display_name = f"{node.get('name') or 'QC Review'} - QC Review Report.pdf"
+    try:
+        result = _save_or_update_node_derived_doc(
+            idx, tree, node_id, pdf_bytes, "application/pdf", display_name,
+            "qc_review_report", True)
+    except _DocLimitReached as e:
+        return jsonify({"error": str(e), "code": "upload_limit_reached"}), 403
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"ok": True, "pages": pages, **result})
+
+
 @app.route("/api/docs/<doc_id>/extract-keys", methods=["POST"])
 def post_doc_extract_keys(doc_id):
     """Extract user-defined key strings from a stored document.
@@ -6892,6 +7239,62 @@ def post_doc_extract_keys(doc_id):
 
 
 # ---- Databook generation --------------------------------------------------
+DATABOOK_FOLDER_NAME = "databook"
+
+
+def _file_databook_in_tree(save_path) -> "str | None":
+    """Make a file saved under <root>/databook/ show up in the tree.
+
+    Ensures a top-level "databook" folder node exists and registers the file
+    as a document in it. The doc's own copy lives in that node's docs
+    subfolder (hard-linked to the databook/ file where possible, so no extra
+    disk space; falls back to a copy). Idempotent: a file whose name+size is
+    already filed there is skipped. Returns the new doc id (None if skipped).
+    """
+    save_path = Path(save_path)
+    docs_dir = get_docs_dir()
+    if not docs_dir or not save_path.is_file():
+        return None
+    idx = read_index()
+    tree = idx.get("tree")
+    if not tree:
+        return None
+    doc_index = idx.get("docIndex")
+    if doc_index is None:
+        doc_index = []
+        idx["docIndex"] = doc_index
+    folder = next((c for c in (tree.get("children") or [])
+                   if (c.get("name") or "") == DATABOOK_FOLDER_NAME), None)
+    if folder is None:
+        folder = {"id": "NODE-" + secrets.token_hex(4).upper(), "name": DATABOOK_FOLDER_NAME,
+                  "documents": [], "children": []}
+        tree.setdefault("children", []).append(folder)
+    size = save_path.stat().st_size
+    in_folder = {d.get("id") for d in (folder.get("documents") or [])}
+    if any(d.get("id") in in_folder and d.get("name") == save_path.name and d.get("size") == size
+           for d in doc_index):
+        return None
+    if not _reserve_doc_slots(idx, 1):
+        return None
+    mime = mimetypes.guess_type(save_path.name)[0] or "application/octet-stream"
+    new_id = "DOC-" + datetime.now().strftime("%Y%m%d") + "-" + secrets.token_hex(4).upper()
+    out_dir = _get_node_docs_dir(folder["id"], tree) or docs_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / _doc_filename(new_id, _safe_filename_part(save_path.name))
+    try:
+        os.link(save_path, out_path)
+    except OSError:
+        shutil.copy2(save_path, out_path)
+    doc_index.append({
+        "id": new_id, "name": save_path.name, "mime": mime, "size": size,
+        "uploadedAt": datetime.utcnow().isoformat() + "Z",
+        "originalNodeId": folder["id"], "metadata": {},
+    })
+    folder.setdefault("documents", []).append({"id": new_id})
+    write_index(idx)
+    return new_id
+
+
 @app.route("/api/databook", methods=["POST"])
 def post_databook():
     """
@@ -7022,6 +7425,8 @@ def post_databook():
             n += 1
         save_path.write_bytes(pdf_bytes)
         headers["X-Databook-Saved-Path"] = _pct_encode(str(save_path), safe="")
+        if _file_databook_in_tree(save_path):
+            headers["X-Databook-Tree-Updated"] = "1"
     except Exception:
         import traceback
         traceback.print_exc()
@@ -7069,7 +7474,15 @@ def post_databook_docx():
             guessed = mimetypes.guess_type(f.filename)[0]
             if guessed:
                 mime = guessed
-        cover_pages.append({"bytes": f.read(), "mime": mime, "filename": f.filename})
+        cover_bytes = f.read()
+        try:
+            from databook import is_office_file, office_to_pdf_bytes
+            if is_office_file(mime, f.filename):
+                cover_bytes = office_to_pdf_bytes(cover_bytes, f.filename)
+                mime = "application/pdf"
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        cover_pages.append({"bytes": cover_bytes, "mime": mime, "filename": f.filename})
 
     docs_dir = get_docs_dir()
     idx = read_index()
@@ -7135,6 +7548,8 @@ def post_databook_docx():
             n += 1
         save_path.write_bytes(docx_bytes)
         headers["X-Databook-Saved-Path"] = _pct_encode(str(save_path), safe="")
+        if _file_databook_in_tree(save_path):
+            headers["X-Databook-Tree-Updated"] = "1"
     except Exception:
         import traceback
         traceback.print_exc()
@@ -7240,6 +7655,8 @@ def post_folder_ai_pdf():
             n += 1
         save_path.write_bytes(pdf_bytes)
         headers["X-Databook-Saved-Path"] = _pct_encode(str(save_path), safe="")
+        if _file_databook_in_tree(save_path):
+            headers["X-Databook-Tree-Updated"] = "1"
     except Exception:
         import traceback
         traceback.print_exc()
@@ -8286,6 +8703,8 @@ def _merge_project_into(target_idx: dict, target_docs_dir: Path,
             target_node["description"] = source_node["description"]
         if not target_node.get("sn") and source_node.get("sn"):
             target_node["sn"] = source_node["sn"]
+        if not target_node.get("dueDate") and source_node.get("dueDate"):
+            target_node["dueDate"] = source_node["dueDate"]
         merge_logins(target_node, source_node)
         merge_documents(target_node, source_node, target_parts)
 
@@ -9043,15 +9462,31 @@ def write_faces(data: dict) -> None:
 # Deepface runs in a dedicated Python 3.12 venv because TensorFlow (which
 # deepface requires) does not yet support Python 3.14.  All DeepFace calls
 # go through deepface_worker.py executed in that venv via subprocess.
-_DEEPFACE_VENV = Path.home() / ".dms_deepface"
+_DEEPFACE_DEFAULT_VENV = Path.home() / ".dms_deepface"
+# When the home drive is too full, the venv goes on another drive; this file
+# (always in home) records where.
+_DEEPFACE_LOCATION_FILE = Path.home() / ".dms_deepface_location"
 _DEEPFACE_WORKER = Path(__file__).with_name("deepface_worker.py")
+# TensorFlow + deps unpack to ~1.5 GB, and pip needs scratch space on top of that.
+_DEEPFACE_MIN_FREE_BYTES = 4 * 1024 ** 3
+
+
+def _deepface_venv() -> Path:
+    try:
+        p = Path(_DEEPFACE_LOCATION_FILE.read_text(encoding="utf-8").strip())
+        if str(p):
+            return p
+    except OSError:
+        pass
+    return _DEEPFACE_DEFAULT_VENV
 
 
 def _deepface_python() -> str | None:
     """Return path to the deepface-venv Python executable, or None if not ready."""
+    venv = _deepface_venv()
     candidates = [
-        _DEEPFACE_VENV / "bin" / "python3",
-        _DEEPFACE_VENV / "Scripts" / "python.exe",  # Windows
+        venv / "bin" / "python3",
+        venv / "Scripts" / "python.exe",  # Windows
     ]
     for p in candidates:
         if p.exists():
@@ -9060,7 +9495,42 @@ def _deepface_python() -> str | None:
 
 
 def _check_deepface() -> bool:
-    return _deepface_python() is not None
+    # The venv python alone isn't enough — a failed pip install leaves the venv
+    # behind without the package.
+    if _deepface_python() is None:
+        return False
+    venv = _deepface_venv()
+    return any(venv.glob("Lib/site-packages/deepface")) or \
+        any(venv.glob("lib/python3*/site-packages/deepface"))
+
+
+def _free_bytes(path: Path) -> int:
+    try:
+        return shutil.disk_usage(path.anchor or path).free
+    except OSError:
+        return 0
+
+
+def _pick_deepface_venv_dir() -> Path | None:
+    """Home-drive venv if it has room, else a `dms_deepface` folder on the Windows
+    fixed drive with the most free space. None if no drive has enough room."""
+    if _free_bytes(Path.home()) >= _DEEPFACE_MIN_FREE_BYTES:
+        return _DEEPFACE_DEFAULT_VENV
+    if not sys.platform.startswith("win"):
+        return None
+    import ctypes
+    import string
+    best, best_free = None, 0
+    for letter in string.ascii_uppercase:
+        root = f"{letter}:\\"
+        if ctypes.windll.kernel32.GetDriveTypeW(root) != 3:  # DRIVE_FIXED only
+            continue
+        free = _free_bytes(Path(root))
+        if free > best_free:
+            best, best_free = Path(root), free
+    if best is None or best_free < _DEEPFACE_MIN_FREE_BYTES:
+        return None
+    return best / "dms_deepface"
 
 
 def _run_deepface_worker(cmd: dict, timeout: int = 300) -> dict:
@@ -9069,14 +9539,26 @@ def _run_deepface_worker(cmd: dict, timeout: int = 300) -> dict:
     if not python:
         raise RuntimeError("deepface not installed")
     worker = str(_DEEPFACE_WORKER)
+    # Keep deepface's model weights (downloaded on first use) with the venv rather
+    # than in ~/.deepface, so a venv moved off a full home drive stays off it.
+    env = dict(os.environ, DEEPFACE_HOME=str(_deepface_venv()))
+    # -I (isolated mode): don't put the worker's own folder on sys.path. In the
+    # packaged app that folder is PyInstaller's _MEI dir, full of Python 3.14
+    # extension modules (_ctypes.pyd, ...) that the 3.12 venv would otherwise
+    # import first -> "Module use of python314.dll conflicts with this version".
     result = subprocess.run(
-        [python, worker],
+        [python, "-I", worker],
         input=json.dumps(cmd),
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, timeout=timeout, env=env,
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "deepface worker failed")
-    return json.loads(result.stdout)
+    # The JSON result is the last line; anything before it is library noise
+    # (e.g. deepface's deprecation banner) that slipped onto stdout.
+    lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
+    if not lines:
+        raise RuntimeError(result.stderr.strip()[-1000:] or "deepface worker returned no output")
+    return json.loads(lines[-1])
 
 
 # deepface install runs in a background thread, polled via /api/install-deepface/status,
@@ -9106,16 +9588,33 @@ def _deepface_install_worker() -> None:
     ]
     if sys.platform.startswith("win"):
         import winreg  # type: ignore
-        try:
-            for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        # Check each hive separately — a per-user install only exists under HKCU, and
+        # a missing HKLM key must not abort the HKCU lookup.
+        for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            try:
                 key = winreg.OpenKey(root, r"SOFTWARE\Python\PythonCore\3.12\InstallPath")
-                base = winreg.QueryValueEx(key, "ExecutablePath")[0]
+                try:
+                    base = winreg.QueryValueEx(key, "ExecutablePath")[0]
+                except OSError:
+                    base = str(Path(winreg.QueryValueEx(key, "")[0]) / "python.exe")
                 if base and Path(base).exists():
                     python312_candidates.insert(0, base)
-        except Exception:
-            pass
+            except OSError:
+                pass
+        local_appdata = os.environ.get("LOCALAPPDATA", "")
+        if local_appdata:
+            python312_candidates.append(
+                str(Path(local_appdata) / "Programs" / "Python" / "Python312" / "python.exe"))
         python312_candidates += [r"C:\Python312\python.exe",
                                   r"C:\Program Files\Python312\python.exe"]
+        # Fall back to the py launcher, which knows about every registered install.
+        try:
+            r = subprocess.run(["py", "-3.12", "-c", "import sys; print(sys.executable)"],
+                               capture_output=True, text=True, timeout=15)
+            if r.returncode == 0 and r.stdout.strip():
+                python312_candidates.append(r.stdout.strip())
+        except Exception:
+            pass
 
     python312 = next((p for p in python312_candidates if Path(p).exists()), None)
 
@@ -9149,27 +9648,54 @@ def _deepface_install_worker() -> None:
             )
             return
 
-    venv_dir = str(_DEEPFACE_VENV)
+    venv = _pick_deepface_venv_dir()
+    if venv is None:
+        need_gb = _DEEPFACE_MIN_FREE_BYTES / 1024 ** 3
+        have_gb = _free_bytes(Path.home()) / 1024 ** 3
+        _deepface_install_set_state(
+            status="error",
+            error=(f"磁盘空间不足：安装人脸识别需要约 {need_gb:.0f} GB 可用空间，"
+                   f"当前系统盘仅剩 {have_gb:.1f} GB。请清理磁盘后重试。\n"
+                   f"Not enough disk space: face recognition needs about {need_gb:.0f} GB free, "
+                   f"but the system drive has only {have_gb:.1f} GB. Free up space and try again."),
+        )
+        return
+
+    # Moving off the home drive: drop any half-installed venv left there by an
+    # earlier attempt that ran out of space.
+    if venv != _DEEPFACE_DEFAULT_VENV and _DEEPFACE_DEFAULT_VENV.exists() and \
+            not any(_DEEPFACE_DEFAULT_VENV.glob("Lib/site-packages/deepface")) and \
+            not any(_DEEPFACE_DEFAULT_VENV.glob("lib/python3*/site-packages/deepface")):
+        shutil.rmtree(_DEEPFACE_DEFAULT_VENV, ignore_errors=True)
 
     # Create venv with Python 3.12
     try:
-        subprocess.run([python312, "-m", "venv", venv_dir],
+        subprocess.run([python312, "-m", "venv", str(venv)],
                        capture_output=True, timeout=60, check=True)
     except Exception as e:
         _deepface_install_set_state(status="error", error=f"创建虚拟环境失败: {e}")
         return
 
-    pip = _DEEPFACE_VENV / "bin" / "pip"
+    pip = venv / "bin" / "pip"
     if not pip.exists():
-        pip = _DEEPFACE_VENV / "Scripts" / "pip.exe"
+        pip = venv / "Scripts" / "pip.exe"
+
+    # pip unpacks wheels into TEMP (normally on C:) — point it at the venv's drive
+    # and skip the cache so a full home drive doesn't sink the install.
+    pip_tmp = venv / "pip-tmp"
+    pip_tmp.mkdir(parents=True, exist_ok=True)
+    pip_env = dict(os.environ, TMP=str(pip_tmp), TEMP=str(pip_tmp), TMPDIR=str(pip_tmp))
 
     # Install deepface (TF will install automatically on Python 3.12). This step is the
     # slow one (TensorFlow + deps can be several hundred MB) — its timeout is generous
     # since it's no longer tied to any single HTTP request's lifetime.
     try:
         result = subprocess.run(
-            [str(pip), "install", "--quiet", "deepface", "tf-keras", "pillow-heif"],
-            capture_output=True, text=True, timeout=1800,
+            [str(pip), "install", "--quiet", "--no-cache-dir",
+             "deepface", "tf-keras", "pillow-heif",
+             # OpenCV 5 dropped the bundled Haar cascades deepface's "opencv" detector needs.
+             "opencv-python<5"],
+            capture_output=True, text=True, timeout=1800, env=pip_env,
         )
         if result.returncode != 0:
             err = (result.stderr or result.stdout or "pip install 失败").strip()[-1000:]
@@ -9180,6 +9706,17 @@ def _deepface_install_worker() -> None:
         return
     except Exception as e:
         _deepface_install_set_state(status="error", error=str(e))
+        return
+    finally:
+        shutil.rmtree(pip_tmp, ignore_errors=True)
+
+    try:
+        if venv == _DEEPFACE_DEFAULT_VENV:
+            _DEEPFACE_LOCATION_FILE.unlink(missing_ok=True)
+        else:
+            _DEEPFACE_LOCATION_FILE.write_text(str(venv), encoding="utf-8")
+    except OSError as e:
+        _deepface_install_set_state(status="error", error=f"无法记录安装位置: {e}")
         return
 
     _deepface_install_set_state(status="done")
@@ -9206,13 +9743,46 @@ def install_deepface_status():
         return jsonify(dict(_DEEPFACE_INSTALL_STATE))
 
 
+# doc_id -> file path for every file under docs/, built by one directory walk
+# and reused. _find_doc_files does a full rglob of docs/ per call (~1.2 s on a
+# 70k-file library), and the face/photo routes resolve one path per photo --
+# so a 42-photo face scan spent about a minute just finding files before any
+# face work began, and a large folder took hours. One walk is ~0.6 s total.
+_DOC_PATH_CACHE = {"dir": None, "map": {}, "at": 0.0}
+_DOC_PATH_CACHE_LOCK = _Lock()
+_DOC_PATH_REBUILD_MIN_S = 2.0  # a miss rebuilds at most this often
+
+
+def _doc_path_map(docs_dir: Path, rebuild: bool = False) -> dict:
+    with _DOC_PATH_CACHE_LOCK:
+        c = _DOC_PATH_CACHE
+        same_dir = c["dir"] == str(docs_dir)
+        if same_dir and c["map"] and (
+            not rebuild or _time.time() - c["at"] < _DOC_PATH_REBUILD_MIN_S
+        ):
+            return c["map"]
+        m = {}
+        for root, _dirs, files in os.walk(docs_dir):
+            for name in files:
+                doc_id = _doc_id_from_filename(name)
+                if doc_id:
+                    m.setdefault(doc_id, os.path.join(root, name))
+        c.update(dir=str(docs_dir), map=m, at=_time.time())
+        return m
+
+
 def _resolve_photo_path(doc_id: str):
     """Return Path to the actual file for doc_id, or None if not found."""
     docs_dir = get_docs_dir()
-    if not docs_dir:
+    if not docs_dir or not doc_id:
         return None
-    matches = _find_doc_files(docs_dir, doc_id)
-    return matches[0] if matches else None
+    # A miss or a moved/deleted file means the map is stale (new upload,
+    # rename, move) -- rebuild it once and look again.
+    for rebuild in (False, True):
+        p = _doc_path_map(docs_dir, rebuild).get(doc_id)
+        if p and os.path.isfile(p):
+            return Path(p)
+    return None
 
 
 def _face_crop_b64(file_path, bbox: dict) -> str:
@@ -9258,6 +9828,211 @@ def _cosine_sim(a, b) -> float:
         return 0.0
 
 
+# ---- Face fingerprint cache -------------------------------------------------
+# Running DeepFace on a photo (decode, find faces, Facenet512 per face) is the
+# slow part of detect/recognize, and its output never changes for the same
+# file. So each photo's faces (bbox, confidence, embedding) are cached in
+# face_cache.sqlite next to faces.json, keyed by doc id plus the file's size
+# and mtime -- a replaced/edited file just misses and is analysed again.
+# Face order is stored as returned, so faceIdx-based labels stay valid.
+# Embeddings are kept as base64 float32 (~2.7 KB per face) rather than JSON
+# float lists, since a big photo library can mean 100k+ faces.
+
+def _face_file_sig(path) -> str | None:
+    try:
+        st = os.stat(path)
+        return f"{st.st_size}:{st.st_mtime_ns}"
+    except OSError:
+        return None
+
+
+def _face_cache_open():
+    import sqlite3
+    root = get_storage_root()
+    if not root:
+        return None
+    conn = sqlite3.connect(str(root / "face_cache.sqlite"), timeout=30)
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS face_cache ("
+        " doc_id TEXT PRIMARY KEY, fsig TEXT NOT NULL, faces TEXT NOT NULL)"
+    )
+    return conn
+
+
+def _face_emb_encode(emb) -> str:
+    from array import array
+    return base64.b64encode(array("f", emb).tobytes()).decode()
+
+
+def _face_emb_decode(b64: str) -> list:
+    from array import array
+    a = array("f")
+    a.frombytes(base64.b64decode(b64))
+    return a.tolist()
+
+
+def _face_cache_get(conn, sigs: dict) -> dict:
+    """sigs: doc_id -> file signature. Returns doc_id -> faces list for every
+    doc whose cached entry still matches its file."""
+    out = {}
+    ids = [d for d, sig in sigs.items() if sig]
+    for i in range(0, len(ids), 500):
+        chunk = ids[i:i + 500]
+        placeholders = ",".join("?" * len(chunk))
+        rows = conn.execute(
+            f"SELECT doc_id, fsig, faces FROM face_cache WHERE doc_id IN ({placeholders})",
+            chunk,
+        ).fetchall()
+        for doc_id, fsig, faces_json in rows:
+            if fsig != sigs.get(doc_id):
+                continue
+            try:
+                out[doc_id] = [
+                    {"bbox": f["bbox"], "confidence": f.get("confidence", 0),
+                     "embedding": _face_emb_decode(f["emb"])}
+                    for f in json.loads(faces_json)
+                ]
+            except Exception:
+                pass  # corrupt row -- just re-analyse that photo
+    return out
+
+
+def _face_cache_put(conn, doc_id: str, sig: str, faces: list) -> None:
+    stored = [
+        {"bbox": f.get("bbox", {}), "confidence": f.get("confidence", 0),
+         "emb": _face_emb_encode(f.get("embedding") or [])}
+        for f in faces
+    ]
+    conn.execute(
+        "INSERT OR REPLACE INTO face_cache (doc_id, fsig, faces) VALUES (?, ?, ?)",
+        (doc_id, sig, json.dumps(stored)),
+    )
+    conn.commit()
+
+
+# Workers started by _run_deepface_worker_stream that are still running,
+# mapped to their stop-reason list -- /api/faces/recognize/cancel kills them.
+_FACE_ACTIVE_WORKERS: dict = {}
+_FACE_ACTIVE_WORKERS_LOCK = _Lock()
+
+
+def _run_deepface_worker_stream(cmd: dict, on_result, timeout: int) -> str:
+    """Like _run_deepface_worker, but the worker reports one photo per line
+    and on_result(r) is called for each as it arrives. Returns "complete" if
+    every item was processed, or "timeout" / "cancelled" if the time limit or
+    a Stop click killed the worker first (results so far were already
+    delivered)."""
+    python = _deepface_python()
+    if not python:
+        raise RuntimeError("deepface not installed")
+    env = dict(os.environ, DEEPFACE_HOME=str(_deepface_venv()))
+    stopped = []  # "timeout" or "cancelled", set by whoever kills the worker
+
+    # stderr goes to a temp file, not a pipe: TensorFlow can log a lot, and
+    # an undrained stderr pipe would block the worker mid-run.
+    with tempfile.TemporaryFile() as err:
+        proc = subprocess.Popen(
+            [python, "-I", str(_DEEPFACE_WORKER)],  # -I: see _run_deepface_worker
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err,
+            text=True, env=env,
+        )
+
+        def _kill():
+            stopped.append("timeout")
+            _kill_proc_tree(proc)
+
+        with _FACE_ACTIVE_WORKERS_LOCK:
+            _FACE_ACTIVE_WORKERS[proc] = stopped
+        killer = Timer(timeout, _kill)
+        killer.start()
+        try:
+            proc.stdin.write(json.dumps(dict(cmd, stream=True)))
+            proc.stdin.close()
+            for line in proc.stdout:
+                line = line.strip()
+                if not line.startswith("{"):
+                    continue  # stray library output
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if "doc_id" in r:
+                    on_result(r)
+        finally:
+            killer.cancel()
+            with _FACE_ACTIVE_WORKERS_LOCK:
+                _FACE_ACTIVE_WORKERS.pop(proc, None)
+            if proc.poll() is None and not stopped:
+                proc.kill()  # on_result raised -- don't leave the worker running
+            rc = proc.wait()
+        if stopped:
+            return stopped[0]
+        if rc != 0:
+            err.seek(0)
+            msg = err.read().decode("utf-8", "replace").strip()[-1000:]
+            raise RuntimeError(msg or "deepface worker failed")
+    return "complete"
+
+
+def _kill_proc_tree(proc) -> None:
+    """Kill a worker and its children. On Windows the venv's python.exe is a
+    launcher that runs the real interpreter as a child process, so killing
+    only the launcher would leave the actual face analysis running."""
+    try:
+        if sys.platform.startswith("win"):
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=15,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        else:
+            proc.kill()
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _face_represent_cached(items: list, *, crops: bool, timeout: int):
+    """Faces for each {doc_id, path} item, from the cache where possible and
+    DeepFace for the rest (each new result is cached as soon as it arrives).
+    Returns (results, status): results maps doc_id -> {"faces": [...]} or
+    {"faces": [], "error": msg}; status is "complete", or "timeout" /
+    "cancelled" if the DeepFace run was cut short, in which case unfinished
+    docs are simply missing."""
+    conn = _face_cache_open()
+    if conn is None:
+        raise RuntimeError("Storage path is not configured")
+    try:
+        sigs = {it["doc_id"]: _face_file_sig(it["path"]) for it in items}
+        results = {d: {"faces": faces} for d, faces in _face_cache_get(conn, sigs).items()}
+        todo = [it for it in items if it["doc_id"] not in results]
+        if crops:
+            # Cached entries don't keep thumbnails -- cut them from the file.
+            paths = {it["doc_id"]: it["path"] for it in items}
+            for d, r in results.items():
+                for f in r["faces"]:
+                    f["crop_b64"] = _face_crop_b64(paths[d], f["bbox"])
+        if not todo:
+            return results, "complete"
+
+        def on_result(r):
+            doc_id = r["doc_id"]
+            if r.get("error"):
+                results[doc_id] = {"faces": [], "error": r["error"]}
+                return
+            faces = r.get("faces", [])
+            if sigs.get(doc_id):
+                _face_cache_put(conn, doc_id, sigs[doc_id], faces)
+            results[doc_id] = {"faces": faces}
+
+        status = _run_deepface_worker_stream(
+            {"action": "represent", "items": todo, "crops": crops}, on_result, timeout)
+        return results, status
+    finally:
+        conn.close()
+
+
 @app.route("/api/faces/detect", methods=["POST"])
 def faces_detect():
     if not _check_deepface():
@@ -9293,12 +10068,16 @@ def faces_detect():
 
     if items:
         try:
-            worker_out = _run_deepface_worker({"action": "represent", "items": items})
+            by_doc, _status = _face_represent_cached(items, crops=True, timeout=300)
         except Exception as e:
             return jsonify({"error": f"人脸检测失败: {e}"}), 500
 
-        for r in worker_out.get("results", []):
-            doc_id = r["doc_id"]
+        for it in items:
+            doc_id = it["doc_id"]
+            r = by_doc.get(doc_id) or {
+                "faces": [],
+                "error": "检测超时（已完成的照片已缓存，请重试）",
+            }
             if r.get("error"):
                 results.append({"docId": doc_id, "faces": [], "error": r["error"]})
                 continue
@@ -9499,13 +10278,11 @@ def faces_recognize():
         return jsonify({"ok": True, "found": 0, "scanned": 0})
 
     try:
-        worker_out = _run_deepface_worker({"action": "represent", "items": items},
-                                          timeout=600)
+        by_doc, status = _face_represent_cached(items, crops=False, timeout=600)
     except Exception as e:
         return jsonify({"error": f"人脸识别失败: {e}"}), 500
 
-    for r in worker_out.get("results", []):
-        doc_id = r["doc_id"]
+    for doc_id, r in by_doc.items():
         if r.get("error"):
             continue
         scanned += 1
@@ -9530,11 +10307,52 @@ def faces_recognize():
                     break
 
     write_faces(faces_data)
+
+    # Keep each scanned person's 人脸匹配/<name> folder up to date, so new
+    # matches show up in the tree without a manual "create folder" click.
+    # Only people with at least one match get a folder; a failure here
+    # doesn't undo the scan -- it's reported alongside the result.
+    folder_added = 0
+    folder_error = None
+    names = {p["id"]: p["name"] for p in people}
+    for pid in person_embeddings:
+        if not any(r["personId"] == pid for r in faces_data["recognitions"]):
+            continue
+        try:
+            n, _node_id = _link_into_face_folder(names.get(pid, ""), _person_photo_ids(faces_data, pid))
+            folder_added += n
+        except Exception as e:
+            folder_error = str(e)
+
     # Count unique photos (a group photo may have multiple matched faces)
     matched_docs = len({r["docId"] for r in faces_data.get("recognitions", [])
                         if r["personId"] == target_person_id} if target_person_id
                        else {r["docId"] for r in faces_data.get("recognitions", [])})
-    return jsonify({"ok": True, "found": found, "photos": matched_docs, "scanned": scanned})
+    # incomplete: the time limit (or a Stop click -- cancelled) ended
+    # DeepFace before every photo was analysed. Everything it finished is
+    # cached, so running the same scan again picks up where this one stopped.
+    return jsonify({"ok": True, "found": found, "photos": matched_docs, "scanned": scanned,
+                    "total": len(items), "incomplete": status != "complete",
+                    "cancelled": status == "cancelled",
+                    "folderAdded": folder_added, "folderError": folder_error,
+                    # All of the person's photos (tagged by hand + scan
+                    # matches) -- what their card and gallery show.
+                    "personTotal": len(_person_photo_ids(faces_data, target_person_id))
+                    if target_person_id else None})
+
+
+@app.route("/api/faces/recognize/cancel", methods=["POST"])
+def faces_recognize_cancel():
+    """Stop button: kill the running DeepFace worker(s). The recognize
+    request then returns right away with what it finished (cancelled: true);
+    those photos are already cached."""
+    with _FACE_ACTIVE_WORKERS_LOCK:
+        running = list(_FACE_ACTIVE_WORKERS.items())
+    for proc, stopped in running:
+        if not stopped:
+            stopped.append("cancelled")
+        _kill_proc_tree(proc)
+    return jsonify({"ok": True, "stopped": len(running)})
 
 
 @app.route("/api/faces/photos/<person_id>", methods=["GET"])
@@ -9548,6 +10366,40 @@ def faces_photos(person_id):
     return jsonify({"docIds": all_doc_ids})
 
 
+def _person_photo_ids(faces_data: dict, person_id: str) -> list:
+    """Every photo of a person: faces tagged by hand plus scan matches."""
+    ids = {lbl["docId"] for lbl in faces_data.get("labels", []) if lbl["personId"] == person_id}
+    ids |= {r["docId"] for r in faces_data.get("recognitions", []) if r["personId"] == person_id}
+    return list(ids)
+
+
+def _link_into_face_folder(person_name: str, doc_ids: list) -> tuple:
+    """Link doc_ids into the tree folder 人脸匹配/<person_name>, creating it if
+    needed. Only adds -- photos already there (or put there by hand) are
+    left alone. Reads index.json fresh right before writing, since a
+    recognize scan can run for minutes while the user keeps editing the
+    tree, and writes only when something was actually added.
+    Returns (added, node_id); node_id is None if there was nothing to do."""
+    if not person_name or not doc_ids:
+        return 0, None
+    idx = read_index()
+    tree = idx.get("tree")
+    if not tree:
+        raise RuntimeError("No project tree found")
+    face_parent = _get_or_create_child_node(tree, "人脸匹配")
+    person_node = _get_or_create_child_node(face_parent, person_name)
+    existing_ids = {d["id"] if isinstance(d, dict) else d for d in (person_node.get("documents") or [])}
+    added = 0
+    for doc_id in doc_ids:
+        if doc_id not in existing_ids:
+            person_node.setdefault("documents", []).append({"id": doc_id})
+            existing_ids.add(doc_id)
+            added += 1
+    if added:
+        write_index(idx)
+    return added, person_node["id"]
+
+
 @app.route("/api/faces/create-folder", methods=["POST"])
 def faces_create_folder():
     """Create a tree folder named after a person and link all their matched photos to it."""
@@ -9556,28 +10408,11 @@ def faces_create_folder():
     doc_ids = data.get("docIds") or []
     if not person_name or not doc_ids:
         return jsonify({"error": "personName and docIds are required"}), 400
-
-    idx = read_index()
-    tree = idx.get("tree")
-    if not tree:
-        return jsonify({"error": "No project tree found"}), 400
-
-    # Create/find "人脸匹配" parent folder at root level
-    face_parent = _get_or_create_child_node(tree, "人脸匹配")
-    # Create/find the person's subfolder
-    person_node = _get_or_create_child_node(face_parent, person_name)
-
-    # Link docs that aren't already in this node
-    existing_ids = {d["id"] for d in (person_node.get("documents") or []) if isinstance(d, dict)}
-    added = 0
-    for doc_id in doc_ids:
-        if doc_id not in existing_ids:
-            person_node.setdefault("documents", []).append({"id": doc_id})
-            existing_ids.add(doc_id)
-            added += 1
-
-    write_index(idx)
-    return jsonify({"ok": True, "added": added, "nodeId": person_node["id"]})
+    try:
+        added, node_id = _link_into_face_folder(person_name, doc_ids)
+    except Exception as e:
+        return jsonify({"error": f"创建文件夹失败: {e}"}), 500
+    return jsonify({"ok": True, "added": added, "nodeId": node_id})
 
 
 @app.route("/api/faces/person/<person_id>", methods=["DELETE"])

@@ -102,8 +102,19 @@ def junk_targets():
             candidates.append(("Firefox Cache", os.path.join(
                 appdata, "..", "Local", "Mozilla", "Firefox", "Profiles")))
 
-    # keep only ones that actually exist
-    return [(label, path) for label, path in candidates if path and os.path.isdir(path)]
+    # keep only ones that actually exist, and each folder once — %TEMP%, %TMP% and
+    # LocalAppData\Temp are usually the same folder
+    seen = set()
+    targets = []
+    for label, path in candidates:
+        if not path or not os.path.isdir(path):
+            continue
+        key = os.path.normcase(os.path.realpath(path))
+        if key in seen:
+            continue
+        seen.add(key)
+        targets.append((label, path))
+    return targets
 
 
 def folder_size(path):
@@ -123,7 +134,12 @@ def clean_folder(path, dry_run=True):
     freed = 0
     removed = 0
     skipped = 0
-    for entry in os.scandir(path):
+    try:
+        entries = list(os.scandir(path))
+    except OSError:
+        # e.g. C:\Windows\Temp and Prefetch need administrator rights
+        return 0, 0, 1
+    for entry in entries:
         try:
             if entry.is_file(follow_symlinks=False):
                 size = entry.stat().st_size
@@ -147,10 +163,21 @@ def clean_folder(path, dry_run=True):
     return freed, removed, skipped
 
 
+def _can_list(path):
+    try:
+        with os.scandir(path):
+            return True
+    except OSError:
+        return False
+
+
 def scan_junk():
     print("\nScanning for junk files...")
     results = []
     for label, path in junk_targets():
+        if not os.access(path, os.R_OK) or not _can_list(path):
+            print(f"  {label:<22} {path:<70} (needs 'Run as administrator' — skipped)")
+            continue
         size = folder_size(path)
         results.append((label, path, size))
         print(f"  {label:<22} {path:<70} {human_size(size)}")

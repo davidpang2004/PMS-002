@@ -5,7 +5,7 @@ from PyInstaller.utils.hooks import copy_metadata
 
 datas = [('/Users/david/PMS/dms.html', '.'), ('/Users/david/PMS/vendor', 'vendor'), ('/Users/david/PMS/deepface_worker.py', '.'), ('/Users/david/PMS/PMS用户手册_更新版.docx', '.'), ('/Users/david/PMS/Gemini_API_Key_设置指南.docx', '.')]
 binaries = []
-hiddenimports = ['pillow_heif', 'fitz', 'qrcode', 'pyzbar', 'pyngrok', 'pyngrok.ngrok', 'pyngrok.conf', 'google.genai', 'numpy', 'tkinter', 'tkinter.ttk', 'tkinter.scrolledtext', 'tkinter.font', 'tkinter.messagebox', 'flask', 'dms_server', 'databook', 'pdf_extraction', 'ai_extraction', '_dms_trial']
+hiddenimports = ['pillow_heif', 'fitz', 'qrcode', 'pyzbar', 'pyngrok', 'pyngrok.ngrok', 'pyngrok.conf', 'google.genai', 'numpy', 'tkinter', 'tkinter.ttk', 'tkinter.scrolledtext', 'tkinter.font', 'tkinter.messagebox', 'flask', 'dms_server', 'databook', 'heic_to_jpg', 'pdf_extraction', 'ai_extraction', '_dms_trial']
 datas += copy_metadata('Pillow')
 hiddenimports += collect_submodules('tkinter')
 hiddenimports += collect_submodules('tkinter.ttk')

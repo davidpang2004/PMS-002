@@ -446,7 +446,7 @@ def build_pyinstaller_command() -> list[str]:
     # Belt-and-suspenders hidden imports
     for mod in ("tkinter", "tkinter.ttk", "tkinter.scrolledtext",
                 "tkinter.font", "tkinter.messagebox",
-                "flask", "dms_server", "databook", "pdf_extraction",
+                "flask", "dms_server", "databook", "heic_to_jpg", "pdf_extraction",
                 "ai_extraction", "_dms_trial"):
         cmd.extend(["--hidden-import", mod])
 
