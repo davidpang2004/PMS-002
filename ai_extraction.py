@@ -35,6 +35,43 @@ class AIExtractionError(Exception):
     """Raised for any AI-extraction failure with a message safe to show the user."""
 
 
+def _retry_wait_text(msg: str):
+    """'5小时1分钟 / 5h 1m' from a Gemini 429 message, or None if it has no delay."""
+    m = re.search(r"retryDelay'?\"?:\s*'?\"?(\d+(?:\.\d+)?)s", msg) or re.search(r"retry in (\d+(?:\.\d+)?)s", msg)
+    if m:
+        secs = int(float(m.group(1)))
+    else:
+        m = re.search(r"retry in (?:(\d+)h)?(?:(\d+)m)?(?:(\d+(?:\.\d+)?)s)?", msg)
+        if not m or not any(m.groups()):
+            return None
+        secs = int(m.group(1) or 0) * 3600 + int(m.group(2) or 0) * 60 + int(float(m.group(3) or 0))
+    h, mi = secs // 3600, (secs % 3600) // 60
+    if h:
+        return f"{h}小时{mi}分钟 / {h}h {mi}m"
+    if mi:
+        return f"{mi}分钟 / {mi}m"
+    return f"{max(secs, 1)}秒 / {max(secs, 1)}s"
+
+
+def _gemini_error_message(err) -> str:
+    """User-facing text for a failed Gemini call. A 429 quota error gets a plain
+    explanation (and when it resets); anything else keeps the raw error."""
+    msg = str(err)
+    if "RESOURCE_EXHAUSTED" in msg or msg.startswith("429"):
+        free = "FreeTier" in msg or "free_tier" in msg
+        daily = "PerDay" in msg
+        wait = _retry_wait_text(msg)
+        zh = "Gemini API 额度已用完" + ("（免费版" + ("每日" if daily else "") + "额度）" if free else "") + "。"
+        en = "Gemini API quota exceeded" + (" (free tier" + (", daily limit" if daily else "") + ")" if free else "") + ". "
+        if wait:
+            zh += f"约 {wait.split(' / ')[0]} 后恢复。"
+            en += f"It resets in about {wait.split(' / ')[1]}. "
+        zh += "可稍后重试、为该 Google 项目开通计费，或换用其他 AI 服务商/API 密钥。"
+        en += "Retry later, enable billing on the Google project, or switch AI provider / API key."
+        return f"{zh}\n{en}"
+    return f"调用 Gemini API 失败：{err}"
+
+
 def gemini_available() -> bool:
     try:
         import google.genai  # noqa: F401
@@ -130,7 +167,7 @@ def extract_keys_with_gemini(image_bytes_list: list[bytes], keys: list[str],
             break
 
     if last_error is not None:
-        raise AIExtractionError(f"调用 Gemini API 失败：{last_error}")
+        raise AIExtractionError(_gemini_error_message(last_error))
 
     raw = getattr(response, "text", None) or ""
     parsed = _extract_json_object(raw)
@@ -215,7 +252,7 @@ def detect_service_date_with_gemini(image_bytes_list: list[bytes], api_key: str,
             break
 
     if last_error is not None:
-        raise AIExtractionError(f"调用 Gemini API 失败：{last_error}")
+        raise AIExtractionError(_gemini_error_message(last_error))
 
     raw = (getattr(response, "text", None) or "").strip()
     return raw or "NF"
@@ -314,7 +351,7 @@ def answer_question_with_gemini(question: str, snippets: list[dict],
             break
 
     if last_error is not None:
-        raise AIExtractionError(f"调用 Gemini API 失败：{last_error}")
+        raise AIExtractionError(_gemini_error_message(last_error))
 
     raw = getattr(response, "text", None) or ""
     return _parse_cross_doc_answer(raw)
@@ -395,7 +432,7 @@ def answer_question_with_gemini_multimodal(question: str, doc_items: list[dict],
             break
 
     if last_error is not None:
-        raise AIExtractionError(f"调用 Gemini API 失败：{last_error}")
+        raise AIExtractionError(_gemini_error_message(last_error))
 
     raw = getattr(response, "text", None) or ""
     return _parse_cross_doc_answer(raw)
@@ -477,7 +514,7 @@ def comment_on_trend_with_gemini(param_name: str, unit: str, points: list[dict],
             break
 
     if last_error is not None:
-        raise AIExtractionError(f"调用 Gemini API 失败：{last_error}")
+        raise AIExtractionError(_gemini_error_message(last_error))
 
     raw = getattr(response, "text", None) or ""
     parsed = _extract_json_object(raw)
@@ -582,7 +619,7 @@ def answer_question_about_document(question: str, doc_name: str, doc_text: str,
             break
 
     if last_error is not None:
-        raise AIExtractionError(f"调用 Gemini API 失败：{last_error}")
+        raise AIExtractionError(_gemini_error_message(last_error))
 
     answer = (getattr(response, "text", None) or "").strip()
     if not answer:
@@ -645,7 +682,7 @@ def translate_to_chinese(text: str, api_key: str, provider: str = "gemini",
                 continue
             break
     if last_error is not None:
-        raise AIExtractionError(f"调用 Gemini API 失败：{last_error}")
+        raise AIExtractionError(_gemini_error_message(last_error))
 
     out = (getattr(response, "text", None) or "").strip()
     if out.startswith("```"):
@@ -654,6 +691,68 @@ def translate_to_chinese(text: str, api_key: str, provider: str = "gemini",
     if not out:
         raise AIExtractionError("AI 未返回有效的翻译。")
     return {"text": out, "model": model_used}
+
+
+_FREE_LANG_CODES = {
+    "Simplified Chinese": "zh-CN", "Traditional Chinese": "zh-TW", "Cantonese": "zh-TW",
+    "Afrikaans": "af", "Arabic": "ar", "Bengali": "bn", "Bulgarian": "bg", "Catalan": "ca",
+    "Croatian": "hr", "Czech": "cs", "Danish": "da", "Dutch": "nl", "English": "en",
+    "Estonian": "et", "Filipino": "tl", "Finnish": "fi", "French": "fr", "German": "de",
+    "Greek": "el", "Gujarati": "gu", "Hebrew": "iw", "Hindi": "hi", "Hungarian": "hu",
+    "Indonesian": "id", "Italian": "it", "Japanese": "ja", "Kannada": "kn", "Korean": "ko",
+    "Latvian": "lv", "Lithuanian": "lt", "Malay": "ms", "Malayalam": "ml", "Marathi": "mr",
+    "Norwegian": "no", "Persian": "fa", "Polish": "pl", "Portuguese": "pt", "Punjabi": "pa",
+    "Romanian": "ro", "Russian": "ru", "Serbian": "sr", "Slovak": "sk", "Slovenian": "sl",
+    "Spanish": "es", "Swahili": "sw", "Swedish": "sv", "Tamil": "ta", "Telugu": "te",
+    "Thai": "th", "Turkish": "tr", "Ukrainian": "uk", "Urdu": "ur", "Vietnamese": "vi",
+}
+
+
+def translate_free(text: str, language: str = "Simplified Chinese (简体中文)") -> dict:
+    """Translate with Google Translate's free web endpoint -- no API key, no
+    extra package, and much faster than an LLM, but needs internet access and
+    is literal (no document-aware phrasing). Text is sent in line-aligned
+    chunks (~4000 chars) so very long pages still fit one request each."""
+    import json as _json
+    import urllib.parse
+    import urllib.request
+
+    text = (text or "").strip()
+    if not text:
+        raise AIExtractionError("此页没有可翻译的文字。")
+    name = re.sub(r"\s*\(.*\)", "", language or "").strip()
+    code = _FREE_LANG_CODES.get(name, "zh-CN")
+
+    chunks, cur = [], ""
+    for line in text.split("\n"):
+        while len(line) > 4000:          # pathological single line
+            if cur:
+                chunks.append(cur); cur = ""
+            chunks.append(line[:4000]); line = line[4000:]
+        if cur and len(cur) + len(line) + 1 > 4000:
+            chunks.append(cur); cur = line
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    if cur:
+        chunks.append(cur)
+
+    out = []
+    for ch in chunks:
+        body = urllib.parse.urlencode(
+            {"client": "gtx", "sl": "auto", "tl": code, "dt": "t", "q": ch}).encode()
+        req = urllib.request.Request(
+            "https://translate.googleapis.com/translate_a/single", body,
+            {"User-Agent": "Mozilla/5.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = _json.load(r)
+            out.append("".join(seg[0] for seg in data[0] if seg and seg[0]))
+        except Exception as e:
+            raise AIExtractionError(f"免费翻译服务不可用（需要联网）：{e}")
+    result = "\n".join(out).strip()
+    if not result:
+        raise AIExtractionError("翻译服务未返回结果。")
+    return {"text": result, "model": "Google Translate (free)"}
 
 
 # Style presets for polish_description_text(). Keep the wording tight -- these
@@ -756,7 +855,7 @@ def polish_description_text(text: str, api_key: str, provider: str = "gemini",
             break
 
     if last_error is not None:
-        raise AIExtractionError(f"调用 Gemini API 失败：{last_error}")
+        raise AIExtractionError(_gemini_error_message(last_error))
 
     out = (getattr(response, "text", None) or "").strip()
     # Models sometimes wrap the answer in a ``` fence despite being told not to.
@@ -824,7 +923,7 @@ def transcribe_audio_with_gemini(audio_bytes: bytes, mime_type: str, api_key: st
             break
 
     if last_error is not None:
-        raise AIExtractionError(f"调用 Gemini API 失败：{last_error}")
+        raise AIExtractionError(_gemini_error_message(last_error))
 
     out = (getattr(response, "text", None) or "").strip()
     if out.startswith("```"):
@@ -925,7 +1024,7 @@ def check_typos_cn(text: str, api_key: str, provider: str = "gemini") -> dict:
             break
 
     if last_error is not None:
-        raise AIExtractionError(f"调用 Gemini API 失败：{last_error}")
+        raise AIExtractionError(_gemini_error_message(last_error))
 
     out = (getattr(response, "text", None) or "").strip()
     result = _extract_json_object(out)

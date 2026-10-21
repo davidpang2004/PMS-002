@@ -372,6 +372,10 @@ def build_pyinstaller_command() -> list[str]:
         import fitz  # noqa: F401  (PyMuPDF)
         cmd.extend(["--collect-submodules", "fitz"])
         cmd.extend(["--hidden-import", "fitz"])
+        # PyMuPDF 2.x loads its layout model (onnx/yaml data files) on import
+        # when pymupdf_layout is installed; without the data, import fails in
+        # the frozen app and every PDF feature reports "PyMuPDF missing".
+        cmd.extend(["--collect-all", "pymupdf"])
         print("  PyMuPDF found — scanned-PDF OCR will be available in the build.")
     except ImportError:
         print("  PyMuPDF not installed — scanned-PDF OCR omitted "
@@ -447,7 +451,7 @@ def build_pyinstaller_command() -> list[str]:
     for mod in ("tkinter", "tkinter.ttk", "tkinter.scrolledtext",
                 "tkinter.font", "tkinter.messagebox",
                 "flask", "dms_server", "databook", "heic_to_jpg", "pdf_extraction",
-                "ai_extraction", "_dms_trial"):
+                "ai_extraction", "photo_location", "layout_translate", "_dms_trial"):
         cmd.extend(["--hidden-import", mod])
 
     # The entry point is the launcher

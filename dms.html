@@ -21,6 +21,11 @@ Babel.registerPreset('react-classic', {
     50%  { margin-left: 60%; width: 40%; }
     100% { margin-left: 100%; width: 40%; }
   }
+  /* Search-text matches inside the pdf.js viewer: red (all hits dim, current hit solid). */
+  .pdfjs-viewer-root .textLayer .highlight {
+    --highlight-bg-color: rgb(239 68 68 / 0.40) !important;
+    --highlight-selected-bg-color: rgb(220 38 38 / 0.70) !important;
+  }
 </style>
 </head>
 <body class="bg-stone-50">
@@ -1028,6 +1033,27 @@ const StorageAdapter = {
     });
   },
 
+  async getPhotoLocationSettings() {
+    return this._json("/api/photo-location-settings");
+  },
+
+  async savePhotoLocationSettings(settings) {
+    return this._json("/api/photo-location-settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(settings),
+    });
+  },
+
+  // Place names for freshly-made location folders: points = [{id, lat, lon}].
+  async nameLocationPoints(points) {
+    return this._json("/api/photo-location-names", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ points }),
+    });
+  },
+
   async saveTree(tree) {
     await this._json("/api/tree", {
       method: "PUT",
@@ -1139,6 +1165,7 @@ const StorageAdapter = {
     if (doc.photoLat != null) form.append("photo_lat", String(doc.photoLat));
     if (doc.photoLon != null) form.append("photo_lon", String(doc.photoLon));
     if (doc.photoBaseNodeId) form.append("photo_base_node_id", doc.photoBaseNodeId);
+    if (doc.photoLocation) form.append("photo_location", doc.photoLocation);
     const res = await fetchWithTimeout(API_BASE + "/api/docs", { method: "POST", body: form }, uploadTimeoutMs);
     let resData = {};
     try { resData = await res.json(); } catch {}
@@ -1687,6 +1714,190 @@ const genNodeId = () => {
   const rand = Math.random().toString(36).slice(2, 8).toUpperCase();
   return `NODE-${rand}`;
 };
+
+// <loc-helpers>
+// Photo location folders: under each Year/Month folder, GPS photos are filed
+// into child "location folders" (node.geoCluster, centered on node.geoCenter).
+// A photo joins the nearest location folder whose center is within the
+// radius, otherwise it starts a new one centered on itself. Photos without
+// GPS stay directly in the month folder. photo_location.py carries the same
+// rules for phone uploads -- keep the two in step.
+const LOC_KM_PER_MILE = 1.609344;
+const LOC_EARTH_MILES = 3958.7613;
+const LOC_DEFAULTS = { enabled: true, radius: 10, unit: "mi" };
+
+const geoDistanceMiles = (lat1, lon1, lat2, lon2) => {
+  const rad = (d) => (d * Math.PI) / 180;
+  const dphi = rad(lat2 - lat1), dlmb = rad(lon2 - lon1);
+  const a = Math.sin(dphi / 2) ** 2 + Math.cos(rad(lat1)) * Math.cos(rad(lat2)) * Math.sin(dlmb / 2) ** 2;
+  return 2 * LOC_EARTH_MILES * Math.asin(Math.min(1, Math.sqrt(a)));
+};
+const locRadiusToMiles = (value, unit) => (unit === "km" ? value / LOC_KM_PER_MILE : value);
+
+// Coerce anything (server reply, dialog draft) into a valid {enabled, radius, unit}.
+const normalizeLocSettings = (raw) => {
+  const r = raw || {};
+  let unit = String(r.unit || "").toLowerCase() === "km" ? "km" : "mi";
+  let radius = Number(r.radius);
+  const miles = locRadiusToMiles(radius, unit);
+  if (!Number.isFinite(radius) || miles < 0.05 || miles > 12000) {
+    radius = LOC_DEFAULTS.radius;
+    unit = LOC_DEFAULTS.unit;
+  }
+  const enabled = r.enabled === undefined ? LOC_DEFAULTS.enabled : !!r.enabled;
+  return { enabled, radius, unit };
+};
+
+const sortTreeChildren = (children) =>
+  [...children].sort((a, b) => {
+    const na = parseInt(a.name, 10), nb = parseInt(b.name, 10);
+    if (!isNaN(na) && !isNaN(nb)) return na - nb;
+    return a.name.localeCompare(b.name);
+  });
+
+const locUniqueName = (base, taken) => {
+  const lower = new Set(taken.map((n) => String(n).toLowerCase()));
+  if (!lower.has(base.toLowerCase())) return base;
+  let i = 2;
+  while (lower.has(`${base} (${i})`.toLowerCase())) i++;
+  return `${base} (${i})`;
+};
+const locProvisionalName = (taken) => {
+  const lower = new Set(taken.map((n) => String(n).toLowerCase()));
+  let i = 1;
+  while (lower.has(`location ${i}`)) i++;
+  return `Location ${i}`;
+};
+
+const locClusterCenters = (monthNode) =>
+  (monthNode?.children || []).filter(
+    (c) => c.geoCluster && c.geoCenter && c.geoCenter.lat != null && c.geoCenter.lon != null
+  );
+
+// Nearest location folder under monthNode within radiusMi of (lat, lon), or null.
+const findLocCluster = (monthNode, lat, lon, radiusMi) => {
+  let best = null, bestD = Infinity;
+  for (const c of locClusterCenters(monthNode)) {
+    const d = geoDistanceMiles(lat, lon, c.geoCenter.lat, c.geoCenter.lon);
+    if (d <= radiusMi && d < bestD) { best = c; bestD = d; }
+  }
+  return best;
+};
+
+const makeLocNode = (monthNode, lat, lon) => ({
+  id: genNodeId(),
+  name: locProvisionalName((monthNode.children || []).map((c) => c.name)),
+  children: [],
+  documents: [],
+  geoCluster: true,
+  geoCenter: { lat, lon },
+  geoNamePending: true,   // renamed to the place name once looked up
+});
+
+// Dialog drafts keep the radius as text so it can be typed freely.
+const locSettingsToDraft = (st) => ({ enabled: st.enabled, radius: String(st.radius), unit: st.unit });
+const locDraftRadius = (d) => {
+  const r = parseFloat(d.radius);
+  const miles = locRadiusToMiles(r, d.unit);
+  return Number.isFinite(r) && miles >= 0.05 && miles <= 12000 ? r : null;
+};
+const locDraftValid = (d) => !d.enabled || locDraftRadius(d) !== null;
+const locDraftToSettings = (d) => normalizeLocSettings({ enabled: d.enabled, radius: locDraftRadius(d), unit: d.unit });
+const LOC_PHOTO_EXTS = new Set(["jpg", "jpeg", "png", "heic", "heif", "tif", "tiff", "webp", "gif", "bmp"]);
+const looksLikePhotoFile = (f) =>
+  (f.type || "").startsWith("image/") || LOC_PHOTO_EXTS.has((f.name.split(".").pop() || "").toLowerCase());
+
+const isYearName = (name) => /^\d{4}$/.test(name || "");
+const isMonthName = (name) => /^\d{1,2}$/.test(name || "");
+
+// Every Year/Month node at or under nodeId.
+const collectMonthNodes = (root, nodeId) => {
+  const node = findNode(root, nodeId);
+  if (!node) return [];
+  const parent = findParentNode(root, nodeId);
+  if (isMonthName(node.name) && parent && isYearName(parent.name)) return [node];
+  const out = [];
+  const walk = (n) => {
+    for (const c of n.children || []) {
+      if (isYearName(n.name) && isMonthName(c.name)) out.push(c);
+      else walk(c);
+    }
+  };
+  walk(node);
+  return out;
+};
+
+// Rebuild one month folder's location folders from scratch for a new radius.
+// Pure: returns { node, moves, newClusters, photos } and touches nothing.
+//  - every photo with GPS (directly in the month folder or in an old
+//    location folder) is re-clustered, oldest first, so a cluster is centered
+//    on its earliest photo
+//  - docs without GPS that were in an old location folder move up to the month
+//  - an old location folder holding subfolders is kept as a plain folder
+//  - folders that aren't location folders are left alone
+// moves: Map<docId, nodeId> for every doc whose folder changes.
+const regroupMonthByLocation = (monthNode, docsById, radiusMi) => {
+  const kids = monthNode.children || [];
+  const oldClusters = kids.filter((c) => c.geoCluster);
+  const others = kids.filter((c) => !c.geoCluster);
+  const keptOld = [];
+  const pool = [];
+  const loose = [];
+  const moves = new Map();
+  const consider = (ref, fromCluster) => {
+    const e = docsById.get(ref.id);
+    const lat = e ? Number(e.lat) : NaN, lon = e ? Number(e.lon) : NaN;
+    if (e && e.lat != null && e.lon != null && Number.isFinite(lat) && Number.isFinite(lon)) {
+      pool.push({ ref, lat, lon, key: `${e.docDate || ""}\u0000${e.name || ""}\u0000${ref.id}` });
+    } else {
+      loose.push(ref);
+      if (fromCluster) moves.set(ref.id, monthNode.id);
+    }
+  };
+  (monthNode.documents || []).forEach((r) => consider(r, false));
+  for (const c of oldClusters) {
+    (c.documents || []).forEach((r) => consider(r, true));
+    if ((c.children || []).length) {
+      const { geoCluster, geoCenter, geoNamePending, ...plain } = c;
+      keptOld.push({ ...plain, documents: [] });
+    }
+  }
+  pool.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+
+  const taken = [...others, ...keptOld].map((c) => c.name);
+  const fresh = [];
+  for (const p of pool) {
+    let hit = null, hitD = Infinity;
+    for (const c of fresh) {
+      const d = geoDistanceMiles(p.lat, p.lon, c.geoCenter.lat, c.geoCenter.lon);
+      if (d <= radiusMi && d < hitD) { hit = c; hitD = d; }
+    }
+    if (!hit) {
+      hit = {
+        id: genNodeId(), name: locProvisionalName([...taken, ...fresh.map((c) => c.name)]),
+        children: [], documents: [], geoCluster: true,
+        geoCenter: { lat: p.lat, lon: p.lon }, geoNamePending: true,
+      };
+      fresh.push(hit);
+    }
+    hit.documents.push(p.ref);
+    moves.set(p.ref.id, hit.id);
+  }
+  // A doc that stays in the month folder never needs a move.
+  for (const r of monthNode.documents || []) {
+    if (moves.get(r.id) === monthNode.id) moves.delete(r.id);
+  }
+  const node = {
+    ...monthNode,
+    documents: loose,
+    children: sortTreeChildren([...others, ...keptOld, ...fresh]),
+  };
+  return {
+    node, moves, photos: pool.length,
+    newClusters: fresh.map((c) => ({ id: c.id, lat: c.geoCenter.lat, lon: c.geoCenter.lon })),
+  };
+};
+// </loc-helpers>
 
 const genLoginId = () => {
   const rand = Math.random().toString(36).slice(2, 8).toUpperCase();
@@ -2556,10 +2767,59 @@ const TreeNode = ({
  * UI: CONTEXT MENU
  * =============================================================================
  */
+// Radius picker shared by the upload dialogs (and, without the on/off
+// checkbox, the regroup dialog). `draft` = { enabled, radius (text), unit }.
+const LocationGroupingControls = ({ draft, setDraft, showToggle = true, hint = true }) => {
+  const { t } = useLang();
+  const active = draft.enabled || !showToggle;
+  const invalid = active && !locDraftValid(draft);
+  return (
+    <div className="flex flex-col gap-1.5 text-sm text-stone-700 border border-stone-200 rounded px-3 py-2 bg-stone-50">
+      {showToggle && (
+        <label className="flex items-center gap-2 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={draft.enabled}
+            onChange={(e) => setDraft({ ...draft, enabled: e.target.checked })}
+            className="accent-amber-600"
+          />
+          {t("照片按拍摄地点分子文件夹（在月文件夹内）", "Group photos into location folders (inside each month)")}
+        </label>
+      )}
+      <div className={`flex items-center gap-2 ${active ? "" : "opacity-40"}`}>
+        {t("半径", "Radius")}
+        <input
+          type="number" min="0.1" step="any"
+          value={draft.radius}
+          disabled={!active}
+          onChange={(e) => setDraft({ ...draft, radius: e.target.value })}
+          className={`w-24 text-sm px-2 py-1 border rounded focus:outline-none ${invalid ? "border-red-400" : "border-stone-300 focus:border-amber-500"}`}
+        />
+        <select
+          value={draft.unit}
+          disabled={!active}
+          onChange={(e) => setDraft({ ...draft, unit: e.target.value })}
+          className="text-sm px-2 py-1 border border-stone-300 rounded bg-white"
+        >
+          <option value="mi">{t("英里", "miles")}</option>
+          <option value="km">{t("公里", "km")}</option>
+        </select>
+        {invalid && <span className="text-[12px] text-red-600">{t("请输入有效的半径", "Enter a valid radius")}</span>}
+      </div>
+      {hint && (
+        <span className="text-[12px] text-stone-600">
+          {t("同一半径内的照片放进同一个地点文件夹，以该文件夹第一张照片的位置为中心；没有位置信息的照片留在月文件夹中。此数值会被记住，作为下次上传的默认值。",
+             "Photos within this distance of a location folder's first photo go into that folder; photos without GPS stay in the month folder. The value is remembered as the default for the next upload.")}
+        </span>
+      )}
+    </div>
+  );
+};
+
 const ContextMenu = ({
   x, y, isRoot, nodeName, isPhotoRoot, isDateFolder,
   onClose, onRename, onAddChild, onUpload, onDelete,
-  onSetPhotoRoot, onClearPhotoRoot, onAskAI,
+  onSetPhotoRoot, onClearPhotoRoot, onAskAI, onRegroupLocations,
 }) => {
   const { t } = useLang();
   useEffect(() => {
@@ -2608,6 +2868,14 @@ const ContextMenu = ({
       >
         <Edit2 size={13} /> {t("重命名", "Rename")}
       </button>
+      {onRegroupLocations && (
+        <button
+          onClick={() => { onRegroupLocations(); onClose(); }}
+          className="w-full text-left px-3 py-1.5 hover:bg-amber-50 flex items-center gap-2 text-stone-700"
+        >
+          <MapPin size={13} /> {t("按地点重新分组照片…", "Regroup photos by location…")}
+        </button>
+      )}
       {!isDateFolder && (
         <>
           <div className="border-t border-stone-200 my-1" />
@@ -2815,6 +3083,7 @@ const VoiceMicButton = ({ onFinalTranscript, title, className = "" }) => {
   );
 
   return (
+    <span className="inline-flex items-center gap-1.5 shrink-0">
     <span className={"inline-flex items-center shrink-0 rounded border border-stone-300 overflow-hidden " + className}>
       <button
         type="button"
@@ -2843,6 +3112,9 @@ const VoiceMicButton = ({ onFinalTranscript, title, className = "" }) => {
         {voice.listening ? <MicOff size={12} /> : <Mic size={12} />}
       </button>
     </span>
+    {voice.voiceError && <span className="text-[11px] text-red-600 max-w-[320px] leading-tight">{voice.voiceError}</span>}
+    {voice.listening && voice.voiceInterim && <span className="text-[11px] text-stone-500 italic max-w-[240px] truncate">{voice.voiceInterim}</span>}
+    </span>
   );
 };
 
@@ -2850,7 +3122,7 @@ const VoiceMicButton = ({ onFinalTranscript, title, className = "" }) => {
  * UI: DOCUMENT VIEWER
  * =============================================================================
  */
-const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyParameter, onSaveLocalParams, onSaveParams, onSaveDescription, onSaveTextAsDoc, onPasteDescriptionImage, onUpdateMeta, derivedDocs = [], onOpenAISettings, nodeId, onPrevDoc, onNextDoc, qcNode, onSaveQcReview, onQcReport }) => {
+const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyParameter, onSaveLocalParams, onSaveParams, onSaveDescription, onSaveTextAsDoc, onPasteDescriptionImage, onSaveTranslationPdf, pairedDoc, onUpdateMeta, derivedDocs = [], onOpenAISettings, nodeId, onPrevDoc, onNextDoc, qcNode, onSaveQcReview, onQcReport }) => {
   const { t } = useLang();
   const isImage = doc?.mime?.startsWith("image/");
   const isPdf = doc?.mime === "application/pdf";
@@ -2881,6 +3153,7 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
   // Side panel: null (closed) | "text" (OCR text) | "keys" (key-param extract) | "desc" (description) | "ask" (AI Q&A) | "meta" (metadata) | "qc" (QC Review form, side by side with the file) | "search" (find text, PDF only)
   const [panelMode, setPanelMode] = useState(null);
   const [translateOn, setTranslateOn] = useState(false);
+  const [pairOn, setPairOn] = useState(false);
   const [copied, setCopied] = useState(false);
   const [saved, setSaved] = useState(false);
 
@@ -3863,9 +4136,23 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
                   : (<><ScanText size={13} /> {doc.ocrText ? t("重新 OCR", "Re-run OCR") : t("提取文字 (OCR)", "Extract text (OCR)")}</>)}
               </button>
             )}
+            {isPdf && pairedDoc && (
+              <button
+                onClick={() => { setPairOn((v) => !v); setTranslateOn(false); }}
+                title={pairedDoc.role === "translation"
+                  ? t("左右并排显示原文和已保存的译文，同步滚动", "Show the original and its saved translation side by side, scrolling in sync")
+                  : t("左右并排显示原文和已保存的译文，同步滚动", "Show the original and its saved translation side by side, scrolling in sync")}
+                className={"text-sm px-3 py-1.5 rounded flex items-center gap-1.5 border " +
+                  (pairOn
+                    ? "border-emerald-400 text-emerald-800 bg-emerald-100"
+                    : "border-emerald-300 text-emerald-800 bg-emerald-50 hover:bg-emerald-100")}
+              >
+                {t("原文 | 译文", "Original | Translation")}
+              </button>
+            )}
             {isPdf && (
               <button
-                onClick={() => setTranslateOn((v) => !v)}
+                onClick={() => { setTranslateOn((v) => !v); setPairOn(false); }}
                 title={t("在右侧显示中文翻译，左右同步滚动", "Show a Chinese translation on the right, scrolling in sync with the PDF")}
                 className={"text-sm px-3 py-1.5 rounded flex items-center gap-1.5 border " +
                   (translateOn
@@ -4037,8 +4324,29 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
                 <img src={viewUrl} alt={doc.name} className="max-w-full max-h-full object-contain"
                   onError={() => setImgLoadError(true)} />
               </div>
+            ) : isPdf && pairOn && pairedDoc ? (
+              <PdfPairSplit key={doc.id + pairedDoc.id}
+                leftUrl={pairedDoc.role === "translation" ? doc.dataUrl : pairedDoc.dataUrl}
+                rightUrl={pairedDoc.role === "translation" ? pairedDoc.dataUrl : doc.dataUrl}
+                rightLabel={pairedDoc.role === "translation" ? pairedDoc.name : doc.name}
+                rightDocId={pairedDoc.role === "translation" ? pairedDoc.id : doc.id}
+                onClose={() => setPairOn(false)} />
             ) : isPdf && translateOn ? (
-              <PdfTranslateSplit key={doc.id} docId={doc.id} url={doc.dataUrl} onClose={() => setTranslateOn(false)} />
+              <PdfTranslateSplit key={doc.id} docId={doc.id} url={doc.dataUrl} onClose={() => setTranslateOn(false)}
+                onSaveTranslation={onSaveTranslationPdf ? (pages, lang, sizes) => onSaveTranslationPdf(doc, nodeId, pages, lang, sizes) : undefined}
+                onSaveTranslationLayout={onSaveTranslationPdf ? async (lang, provider) => {
+                  const name = await onSaveTranslationPdf(doc, nodeId, null, lang, null, { provider });
+                  // show the new layout translation next to the original right away
+                  setPairOn(true); setTranslateOn(false);
+                  return name;
+                } : undefined} />
+            ) : isPdf && currentSearchMatch ? (
+              // Chrome's native PDF iframe can't highlight text, so while a
+              // search match is active show the pdf.js viewer, which marks it in red.
+              <PdfViewerPanel key={`search-${doc.id}`} url={doc.dataUrl}
+                jumpToPage={currentSearchMatchPage}
+                highlightText={currentSearchMatch.text || null}
+                jumpNonce={searchMatchIdx * 1000 + pdfJumpNonce} />
             ) : isPdf ? (
               <iframe
                 key={pdfJumpPage ? `pdf-jump-${pdfJumpNonce}` : "pdf-default"}
@@ -4489,7 +4797,7 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
                       return (
                         <div className="bg-stone-50 border border-stone-200 rounded px-2 py-1.5 text-[13px] text-stone-700 leading-snug mb-2">
                           {s.before && <span className="text-stone-600">…{s.before} </span>}
-                          <mark className="bg-amber-200 text-stone-900 rounded px-0.5">{s.match}</mark>
+                          <mark className="bg-red-100 text-red-600 font-semibold rounded px-0.5">{s.match}</mark>
                           {s.after && <span className="text-stone-600"> {s.after}…</span>}
                         </div>
                       );
@@ -4497,7 +4805,7 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
                     {currentSearchMatchPage != null && (
                       <button
                         onClick={() => { setPdfJumpPage(currentSearchMatchPage); setPdfJumpNonce((n) => n + 1); }}
-                        title={t("Chrome 内置的 PDF 阅读器无法被脚本控制高亮显示，只能跳转到该页", "Chrome's built-in PDF viewer can't be scripted to highlight the match, only jump to its page")}
+                        title={t("跳转到该匹配所在页并以红色高亮", "Jump to the page of this match (highlighted in red)")}
                         className="text-sm px-2.5 py-1 border border-cyan-300 text-cyan-800 bg-cyan-50 hover:bg-cyan-100 rounded flex items-center gap-1.5"
                       >
                         <FileText size={12} /> {t(`跳转到第 ${currentSearchMatchPage} 页`, `Jump to page ${currentSearchMatchPage}`)}
@@ -11964,10 +12272,11 @@ const TRANSLATE_LANGUAGES = [
 // (translated lazily, only the pages near what's on screen). Scrolling either
 // pane scrolls the other to the same page and the same fraction through it,
 // so the Chinese always lines up with the English being read.
-const PdfTranslateSplit = ({ docId, url, onClose }) => {
+const PdfTranslateSplit = ({ docId, url, onClose, onSaveTranslation, onSaveTranslationLayout }) => {
   const { t } = useLang();
+  const [saveState, setSaveState] = useState(null); // null | {busy, msg, error}
   const [viewer, setViewer] = useState(null);
-  const [provider, setProvider] = useState("gemini");
+  const [provider, setProvider] = useState("google");
   const [language, setLanguage] = useState(TRANSLATE_LANGUAGES[0].name);
   const [fontPct, setFontPct] = useState(100);
   const [trans, setTrans] = useState({});      // page -> {status, text, error}
@@ -11978,20 +12287,9 @@ const PdfTranslateSplit = ({ docId, url, onClose }) => {
   const lockRef = useRef({ owner: null, until: 0 });
   const curPageRef = useRef(1);
   const chainRef = useRef(Promise.resolve());
-  const providerRef = useRef("gemini");
+  const providerRef = useRef("google");
   const languageRef = useRef(TRANSLATE_LANGUAGES[0].name);
   const pageCount = viewer?.doc?.numPages || 0;
-
-  useEffect(() => {
-    let alive = true;
-    (async () => {
-      const g = await StorageAdapter.getAISettings("gemini").catch(() => ({}));
-      if (!alive || g.configured) return;
-      const d = await StorageAdapter.getAISettings("deepseek").catch(() => ({}));
-      if (alive && d.configured) setProvider("deepseek");
-    })();
-    return () => { alive = false; };
-  }, []);
 
   const setPageState = (p, v) => {
     transRef.current = { ...transRef.current, [p]: v };
@@ -12126,6 +12424,66 @@ const PdfTranslateSplit = ({ docId, url, onClose }) => {
     container.scrollTop = d.offsetTop + frac * d.offsetHeight;
   };
 
+  // Translate every page not yet done (in order, one at a time), then hand the
+  // whole translation to the app to be saved as "<name> Chinese.pdf" beside
+  // the original. Reuses the server's per-page cache, so pages already
+  // translated while reading cost nothing.
+  const saveAsPdf = async () => {
+    if (!viewer || !onSaveTranslation || saveState?.busy) return;
+    const prov = providerRef.current, lang = languageRef.current;
+    const out = {};
+    try {
+      for (let p = 1; p <= pageCount; p++) {
+        setSaveState({ busy: true, msg: t(`翻译第 ${p} / ${pageCount} 页…`, `Translating page ${p} / ${pageCount}…`) });
+        const have = transRef.current[p];
+        if (have?.status === "done") { out[p] = have.text; continue; }
+        if (have?.status === "empty") continue;
+        let text = "";
+        try {
+          const page = await viewer.doc.getPage(p);
+          const tc = await page.getTextContent();
+          text = tc.items.map((it) => (it.str || "") + (it.hasEOL ? "\n" : "")).join("");
+        } catch {}
+        const res = await fetch(`${API_BASE}/api/docs/${docId}/translate-page`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ page: p, text, provider: prov, language: lang }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.status === 422) continue;
+        if (!res.ok) throw new Error(`${t("第", "Page")} ${p}: ${data.error || "HTTP " + res.status}`);
+        out[p] = data.text;
+        setPageState(p, { status: "done", text: data.text });
+      }
+      if (!Object.keys(out).length) throw new Error(t("没有可保存的译文。", "Nothing to save."));
+      setSaveState({ busy: true, msg: t("保存中…", "Saving…") });
+      const sizes = [];
+      for (let p = 1; p <= pageCount; p++) {
+        try {
+          const vp = (await viewer.doc.getPage(p)).getViewport({ scale: 1 });
+          sizes.push([vp.width, vp.height]);
+        } catch { sizes.push(null); }
+      }
+      const name = await onSaveTranslation(out, lang, sizes);
+      setSaveState({ msg: t(`已保存：${name}`, `Saved: ${name}`) });
+    } catch (e) {
+      setSaveState({ error: e.message || String(e) });
+    }
+  };
+
+  // Translate every text block of the ORIGINAL pages and paint it back in the
+  // same place, so tables keep their rows/columns. Done server-side.
+  const saveWithLayout = async () => {
+    if (!onSaveTranslationLayout || saveState?.busy) return;
+    setSaveState({ busy: true, msg: t("正在按原版式翻译（可能需要一两分钟）…", "Translating with the original layout (may take a minute or two)…") });
+    try {
+      const name = await onSaveTranslationLayout(languageRef.current, providerRef.current);
+      setSaveState({ msg: t(`已保存：${name}`, `Saved: ${name}`) });
+    } catch (e) {
+      setSaveState({ error: e.message || String(e) });
+    }
+  };
+
   const pages = [];
   for (let p = 1; p <= pageCount; p++) pages.push(p);
 
@@ -12149,12 +12507,33 @@ const PdfTranslateSplit = ({ docId, url, onClose }) => {
           <button onClick={() => setFontPct((f) => Math.max(50, f - 10))} className="w-6 h-6 leading-none border border-stone-300 rounded hover:bg-white" title={t("缩小文字", "Smaller text")}>−</button>
           <span className="text-stone-700 w-10 text-center">{fontPct}%</span>
           <button onClick={() => setFontPct((f) => Math.min(300, f + 10))} className="w-6 h-6 leading-none border border-stone-300 rounded hover:bg-white" title={t("放大文字", "Larger text")}>+</button>
+          {onSaveTranslation && (
+            <button
+              onClick={saveAsPdf}
+              disabled={!viewer || !!saveState?.busy}
+              className="ml-auto px-2 py-0.5 border border-emerald-700 rounded bg-white text-emerald-800 font-bold hover:bg-emerald-100 disabled:opacity-50 whitespace-nowrap"
+              title={t("把整份译文保存为同一文件夹里的新 PDF（原文件名 + Chinese）", "Save the full translation as a new PDF in the same folder (original name + Chinese)")}
+            >
+              {t("保存为 PDF", "Save as PDF")}
+            </button>
+          )}
+          {onSaveTranslationLayout && (
+            <button
+              onClick={saveWithLayout}
+              disabled={!!saveState?.busy}
+              className="px-2 py-0.5 border border-emerald-700 rounded bg-emerald-700 text-white font-bold hover:bg-emerald-800 disabled:opacity-50 whitespace-nowrap"
+              title={t("保持原文的表格/版式：把译文放回原来的位置，保存为新 PDF（适用于有文字层的 PDF）", "Keep the original layout (tables, columns): put each translated text back where it was and save as a new PDF (needs a PDF with selectable text)")}
+            >
+              {t("保存为 PDF（保持版式）", "Save with layout")}
+            </button>
+          )}
           <select
             value={provider}
             onChange={(e) => setProvider(e.target.value)}
-            className="ml-auto px-1 py-0.5 border border-stone-300 rounded bg-white"
+            className={(onSaveTranslation ? "" : "ml-auto ") + "px-1 py-0.5 border border-stone-300 rounded bg-white"}
             title={t("翻译所用的 AI", "AI used for translating")}
           >
+            <option value="google">{t("快速翻译（免费）", "Fast (free)")}</option>
             <option value="gemini">Gemini</option>
             <option value="deepseek">DeepSeek</option>
           </select>
@@ -12162,6 +12541,11 @@ const PdfTranslateSplit = ({ docId, url, onClose }) => {
             <X size={13} />
           </button>
         </div>
+        {saveState && (saveState.msg || saveState.error) && (
+          <div className={"px-2 py-1 text-xs shrink-0 border-b " + (saveState.error ? "bg-red-50 text-red-700 border-red-200" : "bg-emerald-50 text-emerald-800 border-emerald-200")}>
+            {saveState.error || saveState.msg}
+          </div>
+        )}
         <div ref={rightRef} onScroll={onRightScroll} className="relative flex-1 min-h-0 overflow-auto bg-stone-100">
           {!viewer && (
             <div className="p-4 text-sm text-stone-600">{t("加载文档中…", "Loading document…")}</div>
@@ -12193,6 +12577,291 @@ const PdfTranslateSplit = ({ docId, url, onClose }) => {
             );
           })}
         </div>
+      </div>
+    </div>
+  );
+};
+
+// Two saved PDFs side by side -- the original on the left, its saved
+// translation on the right (page N of the translation is page N of the
+// original, see _build_translation_pdf). Scrolling either one scrolls the
+// other to the same page and the same fraction through it.
+// Colour markup used by the translation editor, mirrored by the server
+// (_translation_markup_to_html): [[y:text]] = yellow highlight, etc.
+const TR_MARKS = [
+  { k: "y", name: "Yellow", c: "#fff176" }, { k: "g", name: "Green", c: "#a5d6a7" },
+  { k: "p", name: "Pink", c: "#f8bbd0" }, { k: "b", name: "Blue", c: "#90caf9" },
+  { k: "r", name: "Red", c: "#d32f2f", text: true }, { k: "u", name: "Blue", c: "#1565c0", text: true },
+];
+const TR_MARK_RE = (flags = "") => new RegExp("\\[\\[([ygpbru]):([\\s\\S]*?)\\]\\]", flags);
+const trEsc = (t) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+// markup -> editor HTML (coloured spans, "\n" kept literally; the editor is white-space:pre-wrap)
+const trMarkupToHtml = (text) => {
+  let out = "", pos = 0;
+  for (const m of text.matchAll(TR_MARK_RE("g"))) {
+    out += trEsc(text.slice(pos, m.index));
+    const def = TR_MARKS.find((x) => x.k === m[1]);
+    out += `<span data-m="${m[1]}" style="${def.text ? "color:" : "background-color:"}${def.c}">${trEsc(m[2])}</span>`;
+    pos = m.index + m[0].length;
+  }
+  return out + trEsc(text.slice(pos));
+};
+// editor DOM -> markup string, also reporting the selection as markup offsets.
+const trDomToMarkup = (root) => {
+  const sel = window.getSelection();
+  const r = sel && sel.rangeCount && root.contains(sel.anchorNode) ? sel.getRangeAt(0) : null;
+  let out = "", selA = null, selB = null;
+  const mark = (node, off) => {
+    if (!r) return;
+    if (r.startContainer === node && r.startOffset === off) selA = out.length;
+    if (r.endContainer === node && r.endOffset === off) selB = out.length;
+  };
+  const walk = (node, inSpan) => {
+    if (node.nodeType === 3) {
+      const v = node.nodeValue;
+      if (r && (r.startContainer === node || r.endContainer === node)) {
+        for (let o = 0; o <= v.length; o++) { mark(node, o); if (o < v.length) out += v[o]; }
+      } else out += v;
+      return;
+    }
+    if (node.nodeName === "BR") { out += "\n"; return; }
+    const k = node !== root && node.nodeName === "SPAN" && node.dataset && node.dataset.m;
+    // browsers wrap a new line in a <div>/<p>: that's a line break
+    if (node !== root && /^(DIV|P)$/.test(node.nodeName) && out && !out.endsWith("\n")) out += "\n";
+    if (k) out += `[[${k}:`;
+    const kids = node.childNodes;
+    for (let i = 0; i <= kids.length; i++) {
+      mark(node, i);
+      if (i < kids.length) walk(kids[i], inSpan || !!k);
+    }
+    if (k) out += "]]";
+  };
+  walk(root, false);
+  // a lone trailing <br> the browser adds is not a real line break
+  return { text: out, a: selA, b: selB };
+};
+
+const TrEditor = ({ id, value, onChange, minRows = 5 }) => {
+  const ref = useRef(null);
+  const lastRef = useRef(null);
+  useEffect(() => {
+    if (ref.current && value !== lastRef.current) {
+      ref.current.innerHTML = trMarkupToHtml(value || "");
+      lastRef.current = value;
+    }
+  }, [value]);
+  const emit = () => {
+    const { text } = trDomToMarkup(ref.current);
+    lastRef.current = text;
+    onChange(text);
+  };
+  return (
+    <div
+      id={id} ref={ref} contentEditable suppressContentEditableWarning spellCheck={false}
+      onInput={emit}
+      onKeyDown={(e) => {
+        if (e.key !== "Enter") return;
+        e.preventDefault();
+        // insert a literal "\n" (execCommand would start a new <div> instead)
+        const sel = window.getSelection();
+        if (!sel.rangeCount) return;
+        const r = sel.getRangeAt(0);
+        r.deleteContents();
+        const n = document.createTextNode("\n");
+        r.insertNode(n);
+        r.setStartAfter(n); r.collapse(true);
+        sel.removeAllRanges(); sel.addRange(r);
+        ref.current.dispatchEvent(new Event("input", { bubbles: true }));
+      }}
+      onPaste={(e) => { e.preventDefault(); document.execCommand("insertText", false, e.clipboardData.getData("text/plain")); }}
+      className="w-full border border-stone-300 rounded p-2 text-sm leading-relaxed focus:outline-none focus:border-emerald-500 overflow-auto"
+      style={{ whiteSpace: "pre-wrap", wordBreak: "break-word", minHeight: `${minRows * 1.6}em`, maxHeight: "28em" }}
+    />
+  );
+};
+
+const PdfPairSplit = ({ leftUrl, rightUrl, rightLabel, rightDocId, onClose, onTranslationSaved }) => {
+  const { t } = useLang();
+  const [vl, setVl] = useState(null);
+  const [vr, setVr] = useState(null);
+  // Editing the saved translation: per-page textareas (each with a mic), then
+  // Save re-renders the PDF in place and the right viewer reloads.
+  const [editing, setEditing] = useState(false);
+  const [editPages, setEditPages] = useState(null);   // {pageNo: text}
+  const [editBusy, setEditBusy] = useState(false);
+  const [editError, setEditError] = useState("");
+  const [editLayout, setEditLayout] = useState(null); // {page: [{src, text}]} for layout translations
+  const [reloadNonce, setReloadNonce] = useState(0);
+  const apiUrl = (typeof API_BASE === "string" ? API_BASE : "") + "/api/docs/" + encodeURIComponent(rightDocId || "") + "/translation-text";
+  const startEdit = async () => {
+    setEditError(""); setEditBusy(true); setEditing(true); setEditPages(null);
+    try {
+      const r = await fetch(apiUrl);
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || !d.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      if (d.layout) {
+        // layout translation: edit each cell/paragraph separately
+        const un = {};
+        Object.keys(d.units).forEach((k) => { un[k] = d.units[k].map((u) => ({ ...u, keep: !u.text })); });
+        setEditLayout(un);
+        setEditPages({});
+      } else {
+        setEditLayout(null);
+        const pg = {};
+        for (let i = 1; i <= d.count; i++) pg[i] = d.pages[String(i)] || "";
+        setEditPages(pg);
+      }
+    } catch (e) { setEditError(String(e.message || e)); }
+    setEditBusy(false);
+  };
+  // Wrap the textarea's selection in [[x:...]] colour markup (first stripping
+  // any markup already inside the selection so colours never nest).
+  const applyMark = (k, mark) => {
+    const el = document.getElementById("tr-edit-" + k);
+    if (!el) return;
+    const cur = trDomToMarkup(el);
+    if (cur.a == null || cur.b == null || cur.a === cur.b) { setEditError(t("请先在文本框中选中要标色的文字。", "Select some text in the box first.")); return; }
+    setEditError("");
+    const v = cur.text;
+    let s0 = Math.min(cur.a, cur.b), s1 = Math.max(cur.a, cur.b);
+    // a boundary sitting at the edge of an existing span can map to either
+    // side of its marker; snap to just outside it
+    while (v.startsWith("]]", s0)) s0 += 2;
+    while (/\[\[[ygpbru]:$/.test(v.slice(0, s1))) s1 -= 4;
+    if (s1 <= s0) { setEditError(t("请先在文本框中选中要标色的文字。", "Select some text in the box first.")); return; }
+    // grow the selection to swallow any marker it only partly covers
+    for (const m of v.matchAll(TR_MARK_RE("g"))) {
+      const ms = m.index, me = m.index + m[0].length;
+      if (ms < s1 && me > s0) { s0 = Math.min(s0, ms); s1 = Math.max(s1, me); }
+    }
+    const inner = v.slice(s0, s1).replace(TR_MARK_RE("g"), "$2");
+    const next = v.slice(0, s0) + (mark ? `[[${mark}:${inner}]]` : inner) + v.slice(s1);
+    setEditPages((prev) => ({ ...prev, [k]: next }));
+  };
+  const saveEdit = async () => {
+    setEditError(""); setEditBusy(true);
+    try {
+      const r = await fetch(apiUrl, { method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(editLayout
+          ? { units: Object.fromEntries(Object.entries(editLayout).map(([k, us]) => [k, us.map((u) => u.text)])) }
+          : { pages: editPages }) });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || !d.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      setEditing(false); setEditPages(null); setEditLayout(null); setVr(null);
+      setReloadNonce((n) => n + 1);
+      if (onTranslationSaved) onTranslationSaved(d.size);
+    } catch (e) { setEditError(String(e.message || e)); }
+    setEditBusy(false);
+  };
+  const lockRef = useRef({ owner: null, until: 0 });
+
+  useEffect(() => {
+    if (!vl || !vr) return;
+    const pos = (v) => {
+      const s = v.container.scrollTop, n = v.pdfViewer.pagesCount;
+      let i = 0;
+      for (let k = 0; k < n; k++) {
+        const d = v.pdfViewer.getPageView(k)?.div;
+        if (d && d.offsetTop <= s + 1) i = k; else break;
+      }
+      const d = v.pdfViewer.getPageView(i)?.div;
+      return d ? { i, frac: Math.max(0, Math.min(1, (s - d.offsetTop) / Math.max(1, d.offsetHeight))) } : null;
+    };
+    const mirror = (from, to, who, other) => () => {
+      const lk = lockRef.current, now = Date.now();
+      if (lk.owner === other && now < lk.until) return;
+      const p = pos(from);
+      const d = p && to.pdfViewer.getPageView(Math.min(p.i, to.pdfViewer.pagesCount - 1))?.div;
+      if (!d) return;
+      lockRef.current = { owner: who, until: now + 120 };
+      to.container.scrollTop = d.offsetTop + p.frac * d.offsetHeight;
+    };
+    const a = mirror(vl, vr, "l", "r"), b = mirror(vr, vl, "r", "l");
+    vl.container.addEventListener("scroll", a, { passive: true });
+    vr.container.addEventListener("scroll", b, { passive: true });
+    return () => {
+      vl.container.removeEventListener("scroll", a);
+      vr.container.removeEventListener("scroll", b);
+    };
+  }, [vl, vr]);
+
+  return (
+    <div className="w-full h-full flex bg-white">
+      <div className="w-1/2 min-w-0 h-full border-r border-stone-300 flex flex-col">
+        <div className="px-2 py-1 text-sm font-bold bg-stone-100 border-b border-stone-200 shrink-0">{t("原文", "Original")}</div>
+        <div className="flex-1 min-h-0"><PdfViewerPanel url={leftUrl} onViewerReady={setVl} /></div>
+      </div>
+      <div className="w-1/2 min-w-0 h-full flex flex-col">
+        <div className="flex items-center gap-2 px-2 py-1 text-sm font-bold bg-emerald-50 text-emerald-800 border-b border-stone-200 shrink-0">
+          <span className="truncate">{t("译文", "Translation")} · {rightLabel}</span>
+          <span className="ml-auto flex items-center gap-1.5 shrink-0 font-normal">
+            {!editing && rightDocId && (
+              <button onClick={startEdit} className="px-2 py-0.5 text-xs rounded border border-emerald-400 bg-white text-emerald-800 hover:bg-emerald-100 flex items-center gap-1" title={t("编辑译文（可语音输入）", "Edit the translation (voice input available)")}>
+                <Edit2 size={12} /> {t("编辑", "Edit")}
+              </button>
+            )}
+            {editing && (
+              <>
+                <button onClick={saveEdit} disabled={editBusy || !editPages} className="px-2 py-0.5 text-xs rounded bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50">
+                  {editBusy && editPages ? t("保存中…", "Saving…") : t("保存", "Save")}
+                </button>
+                <button onClick={() => { setEditing(false); setEditPages(null); setEditError(""); }} disabled={editBusy && !!editPages} className="px-2 py-0.5 text-xs rounded border border-stone-300 bg-white text-stone-700 hover:bg-stone-100">
+                  {t("取消", "Cancel")}
+                </button>
+              </>
+            )}
+            <button onClick={onClose} className="p-1 text-stone-600 hover:text-stone-800" title={t("关闭", "Close")}><X size={13} /></button>
+          </span>
+        </div>
+        {editError && <div className="px-2 py-1 text-xs bg-red-50 text-red-700 border-b border-red-200 shrink-0">{editError}</div>}
+        {editing ? (
+          <div className="flex-1 min-h-0 overflow-auto bg-stone-100">
+            {!editPages && !editError && <div className="p-4 text-sm text-stone-600">{t("加载中…", "Loading…")}</div>}
+            {editPages && editLayout && Object.keys(editLayout).map((k) => (
+              <div key={k} className="border-b border-stone-300 bg-white px-3 py-2">
+                <div className="text-xs font-bold text-stone-500 mb-1">{t(`第 ${k} 页`, `Page ${k}`)}</div>
+                {editLayout[k].map((u, i) => (
+                  <div key={i} className={"mb-2 " + (u.keep ? "hidden" : "")}>
+                    <div className="text-[11px] text-stone-400 truncate" title={u.src}>{u.src}</div>
+                    <div className="flex items-start gap-1.5">
+                      <div className="flex-1 min-w-0">
+                        <TrEditor id={"tr-edit-" + k + "-" + i} value={u.text || ""} minRows={1}
+                          onChange={(v) => setEditLayout((prev) => ({ ...prev, [k]: prev[k].map((x, j) => j === i ? { ...x, text: v } : x) }))} />
+                      </div>
+                      <VoiceMicButton onFinalTranscript={(chunk) => setEditLayout((prev) => ({ ...prev, [k]: prev[k].map((x, j) => j === i ? { ...x, text: appendWithSpace(x.text || "", chunk) } : x) }))} />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ))}
+            {editPages && !editLayout && Object.keys(editPages).map((k) => (
+              <div key={k} className="border-b border-stone-300 bg-white px-3 py-2">
+                <div className="flex items-center gap-2 mb-1">
+                  <span className="text-xs font-bold text-stone-500">{t(`第 ${k} 页`, `Page ${k}`)}</span>
+                  <VoiceMicButton onFinalTranscript={(chunk) => setEditPages((prev) => ({ ...prev, [k]: appendWithSpace(prev[k] || "", chunk) }))} />
+                  <span className="flex items-center gap-1 ml-2" title={t("先在文本框里选中文字，再点颜色", "Select text in the box, then click a colour")}>
+                    {TR_MARKS.map((m) => (
+                      <button key={m.k} type="button" onMouseDown={(e) => e.preventDefault()}
+                        onClick={() => applyMark(k, m.k)}
+                        className="w-5 h-5 rounded border border-stone-400 text-[10px] font-bold leading-none"
+                        style={m.text ? { color: m.c, background: "#fff" } : { background: m.c }}
+                        title={m.text ? t("文字颜色：", "Text colour: ") + m.name : t("高亮：", "Highlight: ") + m.name}>
+                        {m.text ? "A" : ""}
+                      </button>
+                    ))}
+                    <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => applyMark(k, null)}
+                      className="px-1.5 h-5 rounded border border-stone-400 text-[10px] text-stone-700 hover:bg-stone-100"
+                      title={t("清除所选文字的颜色", "Remove colour from the selected text")}>{t("清除", "Clear")}</button>
+                  </span>
+                </div>
+                <TrEditor id={"tr-edit-" + k} value={editPages[k] || ""}
+                  onChange={(v) => setEditPages((prev) => ({ ...prev, [k]: v }))} />
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="flex-1 min-h-0"><PdfViewerPanel key={reloadNonce} url={reloadNonce ? rightUrl + (rightUrl.includes("?") ? "&" : "?") + "v=" + reloadNonce : rightUrl} onViewerReady={setVr} /></div>
+        )}
       </div>
     </div>
   );
@@ -12479,7 +13148,7 @@ const FloatingDocPreview = ({ doc, onClose }) => {
                     return (
                       <div className="bg-white border border-stone-200 rounded px-2 py-1 text-stone-700 leading-snug">
                         {s.before && <span className="text-stone-600">…{s.before} </span>}
-                        <mark className="bg-amber-200 text-stone-900 rounded px-0.5">{s.match}</mark>
+                        <mark className="bg-red-100 text-red-600 font-semibold rounded px-0.5">{s.match}</mark>
                         {s.after && <span className="text-stone-600"> {s.after}…</span>}
                       </div>
                     );
@@ -16634,7 +17303,7 @@ const SEARCH_RAIL_MIN_W = 160;
 const SEARCH_RAIL_MAX_W = 480;
 const SEARCH_RAIL_DEFAULT_W = 224; // matches the original w-56
 const LinkPicker = ({
-  open, onClose, onLink, onLinkMany,
+  open, onClose, onLink, onLinkMany, onDeleteMany,
   docIndex, tree, refMap, currentNodeId, currentNodeName,
   formatBytes, getPathFor,
 }) => {
@@ -16662,8 +17331,33 @@ const LinkPicker = ({
       h: typeof window !== "undefined" ? Math.round(window.innerHeight * 0.8) : 600,
     };
   });
-  const [interacting, setInteracting] = useState(null); // null | "x" | "y" | "xy"
+  const [interacting, setInteracting] = useState(null); // null | "x" | "y" | "xy" | "move" | "rail"
   const resizeRef = useRef(null);
+  // Window position (null = centered). Set once the user drags the title bar.
+  const [pos, setPos] = useState(null);
+  const modalRef = useRef(null);
+  const onMoveStart = (e) => {
+    if (e.button !== 0 || e.target.closest("button")) return;
+    e.preventDefault();
+    const r = modalRef.current.getBoundingClientRect();
+    const startX = e.clientX, startY = e.clientY, origX = r.left, origY = r.top;
+    setInteracting("move");
+    const onMove = (ev) => {
+      const w = modalRef.current ? modalRef.current.offsetWidth : 0;
+      const h = modalRef.current ? modalRef.current.offsetHeight : 0;
+      setPos({
+        x: Math.min(window.innerWidth - 80, Math.max(80 - w, origX + ev.clientX - startX)),
+        y: Math.min(window.innerHeight - 40, Math.max(0, origY + ev.clientY - startY)),
+      });
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      setInteracting(null);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
 
   // axis: "x" (right edge, width only), "y" (bottom edge, height only), or
   // "xy" (corner, both at once) -- same three-handle pattern as the folder
@@ -16672,6 +17366,10 @@ const LinkPicker = ({
     e.preventDefault();
     e.stopPropagation();
     resizeRef.current = { startX: e.clientX, startY: e.clientY, origW: size.w, origH: size.h };
+    if (!pos && modalRef.current) {
+      const r = modalRef.current.getBoundingClientRect();
+      setPos({ x: r.left, y: r.top });
+    }
     setInteracting(axis);
     const onMove = (ev) => {
       const d = resizeRef.current;
@@ -16702,6 +17400,7 @@ const LinkPicker = ({
     : interacting === "y" ? "ns-resize"
     : interacting === "xy" ? "nwse-resize"
     : interacting === "rail" ? "col-resize"
+    : interacting === "move" ? "move"
     : "default";
 
   // Search tab's two columns (doc list / drop-target folder rail) --
@@ -16805,6 +17504,15 @@ const LinkPicker = ({
       setLinkFeedback("");
     }
   }, [open, tree]);
+  useEffect(() => { if (open) setPos(null); }, [open]);
+
+  // Browse tab: which folders are expanded in the full tree
+  const [expandedIds, setExpandedIds] = useState(() => new Set());
+  const toggleExpand = (id) => setExpandedIds((prev) => {
+    const next = new Set(prev);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    return next;
+  });
 
   if (!open) return null;
 
@@ -16877,6 +17585,15 @@ const LinkPicker = ({
     const nodeIds = selectedNodeIds.size > 0 ? Array.from(selectedNodeIds) : [currentNodeId];
     await onLinkMany(Array.from(selectedIds), nodeIds);
     onClose();
+  };
+
+  // Permanently delete the selected search-result docs (the caller confirms
+  // and purges); clear the selection afterwards since those ids are gone.
+  const deleteSelected = async () => {
+    const ids = Array.from(selectedIds);
+    if (ids.length === 0) return;
+    const done = await onDeleteMany(ids);
+    if (done) setSelectedIds(new Set());
   };
 
   const renderRow = (doc) => {
@@ -17153,18 +17870,93 @@ const LinkPicker = ({
     );
   };
 
+  // Browse tab: full expandable tree. Folders expand/collapse; the documents
+  // attached to an expanded folder are listed under it with checkboxes (the
+  // same selectedIds the Search tab uses). Folder rows are also drop targets.
+  const renderTreeNode = (node, depth) => {
+    const kids = node.children || [];
+    const docs = (node.documents || [])
+      .map((ref) => docIndex.find((e) => e.id === ref.id))
+      .filter(Boolean);
+    const expandable = kids.length > 0 || docs.length > 0;
+    const expanded = expandedIds.has(node.id) || depth === 0;
+    const pad = { paddingLeft: 6 + depth * 16 };
+    return (
+      <div key={node.id}>
+        <div
+          style={pad}
+          onClick={() => expandable && depth > 0 && toggleExpand(node.id)}
+          onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "link"; }}
+          onDragEnter={(e) => { e.preventDefault(); setDragOverNodeId(node.id); }}
+          onDragLeave={() => setDragOverNodeId((cur) => (cur === node.id ? null : cur))}
+          onDrop={(e) => handleDropOnNode(e, node)}
+          className={`flex items-center gap-1.5 py-1 pr-2 rounded text-sm ${expandable && depth > 0 ? "cursor-pointer" : ""} ${
+            dragOverNodeId === node.id ? "bg-amber-100 ring-1 ring-inset ring-amber-500" : "hover:bg-stone-100"
+          }`}
+        >
+          {expandable
+            ? (expanded ? <ChevronDown size={12} className="text-stone-500 shrink-0" /> : <ChevronRight size={12} className="text-stone-500 shrink-0" />)
+            : <span className="w-3 shrink-0" />}
+          <Folder size={13} className="text-amber-700 shrink-0" />
+          <span className="truncate flex-1">{node.name}</span>
+          {docs.length > 0 && <span className="text-[11px] tabular-nums px-1 bg-stone-200 rounded">{docs.length}</span>}
+        </div>
+        {expanded && (
+          <>
+            {docs.map((doc) => {
+              const linkedHere = alreadyLinkedHere.has(doc.id);
+              const selected = selectedIds.has(doc.id);
+              return (
+                <div
+                  key={node.id + ":" + doc.id}
+                  style={{ paddingLeft: 6 + (depth + 1) * 16 + 16 }}
+                  onClick={() => toggleSelect(doc.id)}
+                  draggable={!linkedHere}
+                  onDragStart={(e) => {
+                    e.dataTransfer.effectAllowed = "link";
+                    e.dataTransfer.setData("text/plain", doc.id);
+                    dragDocIdRef.current = doc.id;
+                    setDragDocId(doc.id);
+                  }}
+                  onDragEnd={() => { dragDocIdRef.current = null; setDragDocId(null); }}
+                  className={`flex items-center gap-1.5 py-0.5 pr-2 rounded text-[13px] ${
+                    linkedHere ? "opacity-50 cursor-not-allowed" : "cursor-pointer"
+                  } ${selected ? "bg-amber-50" : "hover:bg-stone-50"} ${dragDocId === doc.id ? "opacity-40" : ""}`}
+                  title={linkedHere ? t("已在此处链接", "Already linked here") : doc.name}
+                >
+                  <input type="checkbox" readOnly disabled={linkedHere} checked={selected || linkedHere} className="shrink-0" />
+                  <FileText size={12} className="text-stone-500 shrink-0" />
+                  <span className="truncate">{doc.name}</span>
+                </div>
+              );
+            })}
+            {kids.map((c) => renderTreeNode(c, depth + 1))}
+          </>
+        )}
+      </div>
+    );
+  };
+
   return (
     <div
-      className="fixed inset-0 bg-stone-900/70 z-50 flex items-center justify-center p-4"
+      className={"fixed inset-0 bg-stone-900/70 z-50 " + (pos ? "" : "flex items-center justify-center p-4")}
       onClick={onClose}
     >
       <div
-        className="relative bg-white rounded shadow-2xl flex flex-col"
-        style={{ width: size.w, height: size.h, maxWidth: "calc(100vw - 32px)", maxHeight: "calc(100vh - 32px)" }}
+        ref={modalRef}
+        className="bg-white rounded shadow-2xl flex flex-col"
+        style={{
+          width: size.w, height: size.h, maxWidth: "calc(100vw - 32px)", maxHeight: "calc(100vh - 32px)",
+          ...(pos ? { position: "absolute", left: pos.x, top: pos.y } : { position: "relative" }),
+        }}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="px-4 py-3 border-b border-stone-200">
-          <div className="flex items-center justify-between">
+          <div
+            className="flex items-center justify-between cursor-move select-none"
+            onMouseDown={onMoveStart}
+            title={t("拖动标题栏可移动窗口", "Drag the title bar to move this window")}
+          >
             <div>
               <div className="text-base font-semibold text-stone-900">{t("链接现有文档", "Link an existing document")}</div>
               <div className="text-[13px] text-stone-700">
@@ -17297,38 +18089,43 @@ const LinkPicker = ({
 
           {tab === "browse" && (
             <>
-              <div className="w-1/3 border-r border-stone-200 overflow-hidden flex flex-col p-2">
+              <div className="flex-1 flex flex-col p-3 gap-2 overflow-hidden">
+                <div className="flex items-center gap-2 text-[13px] text-stone-700 shrink-0 flex-wrap">
+                  <span>{t("展开文件夹，勾选要链接的文档", "Expand folders and check the documents to link")}</span>
+                  <div className="ml-auto flex items-center gap-1.5">
+                    <button
+                      onClick={() => {
+                        const all = new Set();
+                        const walk = (n) => { if ((n.children || []).length || (n.documents || []).length) all.add(n.id); (n.children || []).forEach(walk); };
+                        if (tree) walk(tree);
+                        setExpandedIds(all);
+                      }}
+                      className="px-1.5 py-1 text-[11px] border border-stone-300 rounded hover:bg-stone-100"
+                    >{t("全部展开", "Expand all")}</button>
+                    <button
+                      onClick={() => setExpandedIds(new Set(tree ? [tree.id] : []))}
+                      className="px-1.5 py-1 text-[11px] border border-stone-300 rounded hover:bg-stone-100"
+                    >{t("全部折叠", "Collapse all")}</button>
+                  </div>
+                </div>
+                <div className="flex-1 overflow-auto border border-stone-200 rounded p-1">
+                  {tree ? renderTreeNode(tree, 0) : null}
+                </div>
+              </div>
+              <div
+                onMouseDown={onRailResizeStart}
+                title={t("拖动可调整两栏宽度", "Drag to resize the two columns")}
+                className={`relative w-1 shrink-0 cursor-col-resize ${
+                  interacting === "rail" ? "bg-amber-500" : "bg-stone-200 hover:bg-amber-400"
+                }`}
+              >
+                <div className="absolute inset-y-0 -left-1 -right-1" />
+              </div>
+              <div className="shrink-0 overflow-hidden p-2 flex flex-col" style={{ width: searchRailWidth }}>
                 <div className="text-[11px] text-stone-600 uppercase tracking-wider mb-1.5 px-1 shrink-0">
-                  {t("点击文件夹进入；勾选多个文件夹以批量链接", "Click a folder to open it; check several to batch-link")}
+                  {t("目标文件夹：勾选，或将文档拖到此处", "Target folders: check, or drag a doc here")}
                 </div>
                 <div className="flex-1 min-h-0">{renderFolderBrowser()}</div>
-              </div>
-              <div className="flex-1 p-3 overflow-auto">
-                {browseNode && (
-                  <>
-                    <div className="text-[13px] font-mono text-stone-700 mb-2">
-                      {getPathFor(browseNode.id)}
-                    </div>
-                    <div className="flex items-center justify-between mb-2 flex-wrap gap-2">
-                      <div className="text-sm uppercase tracking-wider text-stone-700">
-                        {t("已附加文档", "Attached documents")}
-                      </div>
-                      {renderViewToggle()}
-                    </div>
-                    {browseDocs.length === 0 && (
-                      <div className="text-sm text-stone-700 italic">
-                        {t("此节点暂无附加文档。", "No documents attached to this node yet.")}
-                      </div>
-                    )}
-                    {docViewMode === "grid" ? (
-                      <div className="grid gap-2" style={{ gridTemplateColumns: `repeat(auto-fill, minmax(${gridCols}px, 1fr))` }}>
-                        {browseDocs.map(renderGridTile)}
-                      </div>
-                    ) : (
-                      <div className="space-y-1.5">{browseDocs.map(renderRow)}</div>
-                    )}
-                  </>
-                )}
               </div>
             </>
           )}
@@ -17351,6 +18148,16 @@ const LinkPicker = ({
             >
               {t("取消", "Cancel")}
             </button>
+            {tab === "search" && onDeleteMany && (
+              <button
+                onClick={deleteSelected}
+                disabled={selectedIds.size === 0}
+                title={t("从磁盘永久删除选中的文档，此操作无法撤销", "Permanently delete the selected documents from disk — this cannot be undone")}
+                className="px-4 py-1.5 text-sm border border-red-400 bg-red-50 hover:bg-red-100 text-red-700 rounded disabled:opacity-40 flex items-center gap-1.5"
+              >
+                <Trash2 size={12} /> {t("删除", "Delete")}{selectedIds.size > 0 ? ` (${selectedIds.size})` : ""}
+              </button>
+            )}
             <button
               onClick={commit}
               disabled={selectedIds.size === 0}
@@ -18402,8 +19209,14 @@ function DMS({ storagePath, onChangeFolder }) {
 
   const openAiFillDialog = () => {
     StorageAdapter.getAISettings().then(setAiFillSettings).catch(() => {});
+    let savedKey = "", savedCustom = "";
+    try {
+      savedKey = localStorage.getItem("dms:ai-fill-key") || "";
+      savedCustom = localStorage.getItem("dms:ai-fill-custom-key") || "";
+    } catch {}
     setAiFillDialog({
-      key: keyParameters[0] || "", customKey: "",
+      key: keyParameters.includes(savedKey) ? savedKey : (keyParameters[0] || ""),
+      customKey: savedCustom,
       running: false, done: 0, total: 0, rows: null,
       applying: false, appliedCount: 0, error: "",
     });
@@ -18413,6 +19226,10 @@ function DMS({ storagePath, onChangeFolder }) {
     const docIds = Array.from(aiFillSelectedIds);
     const key = (aiFillDialog?.customKey || "").trim() || (aiFillDialog?.key || "").trim();
     if (!key || !docIds.length) return;
+    try {
+      localStorage.setItem("dms:ai-fill-key", (aiFillDialog?.key || "").trim());
+      localStorage.setItem("dms:ai-fill-custom-key", (aiFillDialog?.customKey || "").trim());
+    } catch {}
     setAiFillDialog((d) => (d ? { ...d, running: true, error: "", rows: [], done: 0, total: docIds.length } : d));
     const rows = [];
     for (const docId of docIds) {
@@ -18847,6 +19664,14 @@ function DMS({ storagePath, onChangeFolder }) {
   // Empty by default -- names are left exactly as today's behavior produces
   // them unless the user opts in.
   const [folderUploadExtraText, setFolderUploadExtraText] = useState("");
+  // Photo location folders (see the loc-helpers block): the remembered
+  // radius/unit/on-off, the draft being edited in the upload dialogs, the
+  // pre-upload prompt for the plain "Upload file" button, and the regroup dialog.
+  const [locSettings, setLocSettings] = useState(LOC_DEFAULTS);
+  const locSettingsRef = useRef(LOC_DEFAULTS);
+  const [locDraft, setLocDraft] = useState(locSettingsToDraft(LOC_DEFAULTS));
+  const [locPrompt, setLocPrompt] = useState(null);       // { files }
+  const [regroupDialog, setRegroupDialog] = useState(null); // { nodeId, name, draft, busy, ... }
   const multiFolderInputRef = useRef(null);
   const [draggingId, setDraggingId] = useState(null);
   const [dropInfo, setDropInfo] = useState(null);
@@ -18956,6 +19781,14 @@ function DMS({ storagePath, onChangeFolder }) {
         await StorageAdapter.saveTree(t);
       }
       setPhotoRootNodeId(treeResp.photoRootNodeId || "");
+      try {
+        const ls = normalizeLocSettings(await StorageAdapter.getPhotoLocationSettings());
+        locSettingsRef.current = ls;
+        setLocSettings(ls);
+        setLocDraft(locSettingsToDraft(ls));
+      } catch (e) {
+        console.warn("[DMS] Could not load photo location settings; using defaults.", e);
+      }
 
       const rawIdx = await StorageAdapter.listDocumentIndex();
       const savedKeyParameters = await StorageAdapter.getKeyParameters();
@@ -19092,6 +19925,22 @@ function DMS({ storagePath, onChangeFolder }) {
   };
 
   // Node operations
+  // Build an .xlsx of every folder's saved website logins (folder, website,
+  // user name, password, folder description) and open it in the
+  // OS default spreadsheet app -- no browser download.
+  const exportLoginsXlsx = async () => {
+    try {
+      const res = await fetch("/api/export-logins-xlsx", { method: "POST" });
+      if (!res.ok) {
+        let msg = `HTTP ${res.status}`;
+        try { msg = (await res.json()).error || msg; } catch {}
+        throw new Error(msg);
+      }
+    } catch (e) {
+      alert(t("导出失败：", "Export failed: ") + e.message);
+    }
+  };
+
   const startAddChildFromToolbar = () => {
     if (!selectedNode) return;
     setAddingChildToId(selectedId);
@@ -19487,6 +20336,114 @@ function DMS({ storagePath, onChangeFolder }) {
     return [newTree, newId];
   };
 
+  // Remember the radius/unit/on-off just used as the default for next time.
+  const rememberLocSettings = async (cfg) => {
+    locSettingsRef.current = cfg;
+    setLocSettings(cfg);
+    try {
+      await StorageAdapter.savePhotoLocationSettings(cfg);
+    } catch (e) {
+      console.warn("[DMS] Could not save photo location settings:", e);
+    }
+  };
+
+  // Folders made by the location grouping start out as "Location N" (an
+  // upload never waits on a place-name lookup). This looks the names up a
+  // few at a time and renames the folders in the latest saved tree -- only
+  // ones still marked pending, so a name the user typed in the meantime wins.
+  const nameLocationFolders = async (points, onProgress) => {
+    if (!points.length) return;
+    const names = {};
+    const BATCH = 5;
+    for (let i = 0; i < points.length; i += BATCH) {
+      try {
+        const r = await StorageAdapter.nameLocationPoints(points.slice(i, i + BATCH));
+        Object.assign(names, r.names || {});
+      } catch (e) {
+        console.warn("[DMS] Location name lookup failed for a batch:", e);
+      }
+      if (onProgress) onProgress(Math.min(i + BATCH, points.length), points.length);
+    }
+    if (!Object.keys(names).length) return;
+    const resp = await StorageAdapter.getTree();
+    let latest = resp.tree;
+    if (!latest) return;
+    let changed = false;
+    for (const [id, name] of Object.entries(names)) {
+      const node = findNode(latest, id);
+      if (!node || !node.geoNamePending) continue;
+      const parent = findParentNode(latest, id);
+      const siblings = (parent?.children || []).filter((c) => c.id !== id).map((c) => c.name);
+      const finalName = locUniqueName(name, siblings);
+      latest = updateNodeInTree(latest, id, (n) => {
+        const { geoNamePending, ...rest } = n;
+        return { ...rest, name: finalName };
+      });
+      changed = true;
+    }
+    if (changed) await persistTree(latest);
+  };
+
+  // What a radius would produce for everything under nodeId, without
+  // changing anything -- drives the live preview in the regroup dialog.
+  const previewRegroup = (nodeId, cfg) => {
+    const docsById = new Map(docIndex.map((d) => [d.id, d]));
+    const radiusMi = locRadiusToMiles(cfg.radius, cfg.unit);
+    const months = collectMonthNodes(tree, nodeId);
+    let photos = 0, folders = 0;
+    for (const m of months) {
+      const r = regroupMonthByLocation(m, docsById, radiusMi);
+      photos += r.photos;
+      folders += r.newClusters.length;
+    }
+    return { months: months.length, photos, folders };
+  };
+
+  // Rebuild the location folders under every month at/below the chosen
+  // folder for a new radius. Works from the latest saved tree + index; docs
+  // are re-pointed at their new folders (index first, then the tree, whose
+  // save makes the server move the files on disk to match), then the new
+  // folders are named after their places.
+  const applyRegroup = async () => {
+    const d = regroupDialog;
+    if (!d || d.busy || !locDraftValid({ ...d.draft, enabled: true })) return;
+    const cfg = locDraftToSettings({ ...d.draft, enabled: true });
+    const busy = (msg) => setRegroupDialog((cur) => cur && ({ ...cur, busy: msg }));
+    busy(t("正在重新分组…", "Regrouping…"));
+    try {
+      const [treeResp, freshIndex] = await Promise.all([StorageAdapter.getTree(), StorageAdapter.listDocumentIndex()]);
+      let newTree = treeResp.tree;
+      if (!newTree) throw new Error("tree unavailable");
+      const docsById = new Map(freshIndex.map((x) => [x.id, x]));
+      const radiusMi = locRadiusToMiles(cfg.radius, cfg.unit);
+      const allMoves = new Map();
+      const points = [];
+      for (const m of collectMonthNodes(newTree, d.nodeId)) {
+        const r = regroupMonthByLocation(findNode(newTree, m.id), docsById, radiusMi);
+        newTree = updateNodeInTree(newTree, m.id, () => r.node);
+        r.moves.forEach((nodeId, docId) => allMoves.set(docId, nodeId));
+        points.push(...r.newClusters);
+      }
+      const newIndex = freshIndex.map((x) => (allMoves.has(x.id) ? { ...x, originalNodeId: allMoves.get(x.id) } : x));
+      await persistIndex(newIndex);
+      await persistTree(newTree);
+      // The folder being viewed may have been one of the rebuilt location folders.
+      if (selectedId && !findNode(newTree, selectedId)) setSelectedId(d.nodeId);
+      if (d.remember) await rememberLocSettings(cfg);
+      try {
+        await nameLocationFolders(points, (done, total) =>
+          busy(t(`正在命名地点文件夹… ${done} / ${total}`, `Naming location folders… ${done} / ${total}`)));
+      } catch (e) {
+        console.warn("[DMS] Naming location folders failed (non-fatal):", e);
+      }
+      setRegroupDialog(null);
+    } catch (e) {
+      console.error("[DMS] ✗ Regroup by location failed:", e);
+      busy(null);
+      alert(t("重新分组失败：", "Regroup failed: ") + (e.message || e));
+    }
+  };
+
   const uploadFilesToNode = async (
     targetNodeId,
     files,
@@ -19498,10 +20455,18 @@ function DMS({ storagePath, onChangeFolder }) {
     // snapshot from before those folders existed, so its diff-and-merge
     // step at the end would never find them and any doc references
     // pointed at them would silently vanish instead of attaching.
-    { skipDuplicates = false, routeMode = "year-month", baseTreeOverride = null, extraText = "", exactName = false, qcReview = null } = {}
+    { skipDuplicates = false, routeMode = "year-month", baseTreeOverride = null, extraText = "", exactName = false, qcReview = null, locationGrouping = null } = {}
   ) => {
     console.log(`[DMS] uploadFilesToNode called, target=${targetNodeId}, files=${files.length}, mode=${routeMode}`);
     if (!files.length) return;
+
+    // Location folders under each month (see the loc-helpers block): only
+    // for date-routed uploads. Callers that don't pass locationGrouping get
+    // the remembered setting (10 miles until the user changes it).
+    const locCfg = normalizeLocSettings(locationGrouping || locSettingsRef.current);
+    const locRadiusMi = locCfg.enabled && routeMode === "year-month"
+      ? locRadiusToMiles(locCfg.radius, locCfg.unit) : 0;
+    const newLocPoints = [];   // location folders created by this upload, to be named after it
 
     // Duplicate detection — skipped when caller already handled it (dialog response).
     // Uses name+size only (no hash) to avoid reading all files into memory upfront,
@@ -19722,11 +20687,29 @@ function DMS({ storagePath, onChangeFolder }) {
       // uploading to current folder.
       let finalNodeId = effectiveNodeId;
       let photoBaseNodeId = null;
+      let photoLocationName = null;
       if (photoDate && routeMode !== "current-folder") {
         const baseId = photoRootNodeId || effectiveNodeId || workingTree.id;
         photoBaseNodeId = baseId;
         [workingTree, finalNodeId] = getOrCreateChild(workingTree, baseId, photoDate.year);
         [workingTree, finalNodeId] = getOrCreateChild(workingTree, finalNodeId, photoDate.month);
+        // Photos with GPS go one level deeper, into the location folder
+        // within the radius (or a new one). The distance check is a few
+        // math operations per photo -- no network, no extra file reads.
+        if (locRadiusMi > 0 && _isPhoto && photoDate.lat != null && photoDate.lon != null) {
+          const monthNode = findNode(workingTree, finalNodeId);
+          let locNode = findLocCluster(monthNode, photoDate.lat, photoDate.lon, locRadiusMi);
+          if (!locNode) {
+            locNode = makeLocNode(monthNode, photoDate.lat, photoDate.lon);
+            const newLoc = locNode;
+            workingTree = updateNodeInTree(workingTree, finalNodeId, (n) => ({
+              ...n, children: sortTreeChildren([...(n.children || []), newLoc]),
+            }));
+            newLocPoints.push({ id: newLoc.id, lat: photoDate.lat, lon: photoDate.lon });
+          }
+          finalNodeId = locNode.id;
+          photoLocationName = locNode.name;
+        }
       }
 
       // Copy the target folder's own SN onto the document itself, so keyword
@@ -19744,6 +20727,7 @@ function DMS({ storagePath, onChangeFolder }) {
           ...(photoDate.lat != null ? { photoLat: photoDate.lat, photoLon: photoDate.lon } : {}),
         } : {}),
         ...(photoBaseNodeId ? { photoBaseNodeId } : {}),
+        ...(photoLocationName ? { photoLocation: photoLocationName } : {}),
       };
       let uploadResult = {};
       try {
@@ -19831,6 +20815,15 @@ function DMS({ storagePath, onChangeFolder }) {
         return false;
       }
       console.log("[DMS] ✓ Upload complete");
+      if (newLocPoints.length > 0) {
+        try {
+          await nameLocationFolders(newLocPoints, (done, total) =>
+            setUploadStatus({ done, total, phase: "命名地点" }));
+        } catch (e) {
+          // Folders just keep their "Location N" names; a regroup renames them.
+          console.warn("[DMS] Naming location folders failed (non-fatal):", e);
+        }
+      }
       if (pendingDateVerification.length > 0) {
         setVerifyDatesQueue(pendingDateVerification);
       }
@@ -19944,6 +20937,25 @@ function DMS({ storagePath, onChangeFolder }) {
     await runMirroredUpload(mirroredTree, fileNodeId, files, extraText);
   };
 
+  const confirmLocPrompt = async () => {
+    if (!locPrompt || !locDraftValid(locDraft)) return;
+    const { files, nodeId } = locPrompt;
+    const cfg = locDraftToSettings(locDraft);
+    setLocPrompt(null);
+    await rememberLocSettings(cfg);
+    try {
+      await uploadFilesToNode(nodeId, files, { locationGrouping: cfg });
+    } catch (err) {
+      console.error("[DMS] ✗ Top-level upload error:", err);
+      alert(t("上传过程中发生意外错误：", "An unexpected error occurred during upload: ") + err.message);
+    }
+  };
+
+  // Each time the multi-folder dialog opens, start from the remembered radius.
+  useEffect(() => {
+    if (folderPickerOpen) setLocDraft(locSettingsToDraft(locSettingsRef.current));
+  }, [folderPickerOpen]);
+
   // "Upload file" — the OS file picker (no `accept` filter, so every
   // visible file type can be selected, not just photos).
   const handleUpload = async (e) => {
@@ -19956,6 +20968,14 @@ function DMS({ storagePath, onChangeFolder }) {
     if (!selectedNode) {
       console.warn("[DMS] No node selected, cannot upload");
       alert(t("请先在装配树中点击选择一个文件夹。", "Please click to select a folder in the assembly tree first."));
+      return;
+    }
+    if (files.some(looksLikePhotoFile)) {
+      // Photos: confirm the location-grouping radius first (pre-filled with
+      // the one used last time), then upload from confirmLocPrompt.
+      e.target.value = "";
+      setLocDraft(locSettingsToDraft(locSettingsRef.current));
+      setLocPrompt({ files, nodeId: selectedId });
       return;
     }
     console.log(`[DMS] Uploading ${files.length} file(s) to selected node ${selectedId}`);
@@ -20017,7 +21037,9 @@ function DMS({ storagePath, onChangeFolder }) {
         // "year-month" (default): every file from every picked folder and
         // subfolder is routed by date into year/month folders, creating
         // them under the current node if they don't exist yet.
-        await uploadFilesToNode(selectedId, allFiles, { extraText });
+        const locCfg = locDraftToSettings(locDraft);
+        await rememberLocSettings(locCfg);
+        await uploadFilesToNode(selectedId, allFiles, { extraText, locationGrouping: locCfg });
       }
     } catch (err) {
       console.error("[DMS] ✗ Multi-folder upload error:", err);
@@ -20201,6 +21223,33 @@ function DMS({ storagePath, onChangeFolder }) {
 
   const [pasteStatus, setPasteStatus] = useState(null); // null | "saving" | "done" | "error"
 
+  // Clipboard holds text rather than an image: file it as a PDF in the folder.
+  const handlePasteText = async (text) => {
+    if (!selectedId || !selectedNode) {
+      alert(t("请先选择一个文件夹。", "Please select a folder first."));
+      return;
+    }
+    setPasteStatus("saving");
+    try {
+      const res = await fetch("/api/nodes/" + encodeURIComponent(selectedId) + "/paste-text", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      const { tree: freshTree } = await StorageAdapter.getTree();
+      if (freshTree) setTree(freshTree);
+      setDocIndex(await StorageAdapter.listDocumentIndex());
+      setPasteStatus("done");
+      setTimeout(() => setPasteStatus(null), 2000);
+    } catch (e) {
+      setPasteStatus("error");
+      setTimeout(() => setPasteStatus(null), 3000);
+      alert(t("保存粘贴的文字失败：", "Failed to save the pasted text: ") + (e.message || e));
+    }
+  };
+
   const handlePasteScreenshot = async (imageBlob) => {
     if (!selectedId || !selectedNode) {
       alert(t("请先选择一个文件夹。", "Please select a folder first."));
@@ -20310,6 +21359,50 @@ function DMS({ storagePath, onChangeFolder }) {
     await persistTree(newTree);
     await persistIndex(newIndex);
     return docId;
+  };
+
+  // Save a PDF's translation (from the side-by-side pane) as a new PDF named
+  // "<original> Chinese.pdf" in the same folder as the original, then register
+  // it in the tree/index like any other new document. Returns its name.
+  const handleSaveTranslationPdf = async (srcDoc, paneNodeId, pages, language, sizes, layoutOpts) => {
+    const srcEntry = docIndex.find((d) => d.id === srcDoc.id);
+    // The original's own folder: the one being browsed if it holds the doc,
+    // else the doc's recorded home folder.
+    const holder = paneNodeId && findNode(tree, paneNodeId);
+    const nodeId = (holder && (holder.documents || []).some((d) => d.id === srcDoc.id))
+      ? paneNodeId : (srcEntry?.originalNodeId || paneNodeId);
+    // layoutOpts = { provider }: translate server-side and keep the page layout
+    // (tables etc.) instead of saving the already-translated flowing text.
+    const res = await fetch("/api/docs/" + encodeURIComponent(srcDoc.id) + (layoutOpts ? "/save-translation-layout" : "/save-translation"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(layoutOpts
+        ? { provider: layoutOpts.provider, language, node_id: nodeId, name: (srcEntry && srcEntry.name) || srcDoc.name }
+        : { pages, language, sizes, node_id: nodeId, name: (srcEntry && srcEntry.name) || srcDoc.name }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    const newTree = updateNodeInTree(tree, nodeId, (n) => ({
+      ...n,
+      documents: [...(n.documents || []), { id: data.doc_id }],
+    }));
+    const newIndex = [
+      ...docIndex,
+      {
+        id: data.doc_id,
+        name: data.name,
+        mime: "application/pdf",
+        size: data.size,
+        uploadedAt: new Date().toISOString(),
+        originalNodeId: nodeId,
+        metadata: {},
+        translationOf: srcDoc.id,
+        translationLanguage: language,
+      },
+    ];
+    await persistTree(newTree);
+    await persistIndex(newIndex);
+    return data.name;
   };
 
   // Listen for Ctrl+V / Cmd+V paste events when a folder is selected
@@ -20622,6 +21715,19 @@ function DMS({ storagePath, onChangeFolder }) {
     }
     if (!confirm(confirmMsg)) return;
     await purgeDocumentIds([docId]);
+  };
+
+  // Hard delete from the link picker's Search results; returns true if done.
+  const purgeFromPicker = async (docIds) => {
+    const ids = Array.from(new Set(docIds));
+    if (ids.length === 0) return false;
+    const confirmMsg = t(
+      `确定永久删除选中的 ${ids.length} 份文档？\n\n所有链接将被移除，文件将从磁盘上删除。此操作无法撤销。`,
+      `Permanently delete the selected ${ids.length} document(s)?\n\nAll links will be removed and the files will be deleted from disk. This cannot be undone.`
+    );
+    if (!confirm(confirmMsg)) return false;
+    await purgeDocumentIds(ids);
+    return true;
   };
 
   // Bulk hard delete for the recycle bin's multi-select toolbar.
@@ -21185,7 +22291,7 @@ function DMS({ storagePath, onChangeFolder }) {
             <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"/>
           </svg>
           <span>
-            {t(`${uploadStatus.phase}中…`, uploadStatus.phase === "检查重复" ? "Checking for duplicates…" : "Uploading…")} {uploadStatus.done} / {uploadStatus.total} {t("个文件", "files")}
+            {t(`${uploadStatus.phase}中…`, uploadStatus.phase === "检查重复" ? "Checking for duplicates…" : uploadStatus.phase === "命名地点" ? "Naming location folders…" : "Uploading…")} {uploadStatus.done} / {uploadStatus.total} {uploadStatus.phase === "命名地点" ? t("个地点", "places") : t("个文件", "files")}
           </span>
           <div className="flex-1 bg-amber-800 rounded-full h-1.5 overflow-hidden">
             <div
@@ -21415,6 +22521,14 @@ function DMS({ storagePath, onChangeFolder }) {
                     title={t("上传质检审核记录：文件名 检验项目^SN^设备描述^WO/PO，直接保存到对应文件夹", "Upload QC Review records: file names Inspection^SN^Equipment Description^WO/PO, filed directly in the matching folder")}
                   >
                     <ListChecks size={11} /> {t("上传质检审核", "Upload QC Review")}
+                  </button>
+                  <button
+                    onClick={exportLoginsXlsx}
+                    disabled={!tree}
+                    className="text-[13px] px-2 py-1 border border-stone-300 hover:bg-amber-50 hover:border-amber-400 rounded flex items-center gap-1 disabled:opacity-40"
+                    title={t("在表格程序中打开所有文件夹的网站、用户名、密码和文件夹描述（含明文密码，请妥善保管）", "Open a spreadsheet of every folder's websites, user names, passwords and folder description (contains plain-text passwords — keep it safe)")}
+                  >
+                    <Download size={11} /> {t("导出登录信息", "Export logins")}
                   </button>
                   <button
                     onClick={() => setShowHeicDialog(true)}
@@ -21965,10 +23079,14 @@ function DMS({ storagePath, onChangeFolder }) {
                               handlePasteScreenshot(blob);
                               return;
                             }
+                            if (item.types.includes("text/plain")) {
+                              const txt = await (await item.getType("text/plain")).text();
+                              if (txt.trim()) { handlePasteText(txt); return; }
+                            }
                           }
                           alert(isMacDMS
-                            ? t("剪贴板中未找到图片。\n请先截图（Cmd+Ctrl+Shift+4 复制到剪贴板），再点击此按钮。", "No image found on the clipboard.\nTake a screenshot first (Cmd+Ctrl+Shift+4 copies to clipboard), then click this button.")
-                            : t("剪贴板中未找到图片。\n请先截图（Win+Shift+S），再点击此按钮。", "No image found on the clipboard.\nTake a screenshot first (Win+Shift+S), then click this button."));
+                            ? t("剪贴板中没有图片或文字。\n请先截图（Cmd+Ctrl+Shift+4 复制到剪贴板）或复制一段文字，再点击此按钮。", "Nothing to paste: no image or text on the clipboard.\nTake a screenshot (Cmd+Ctrl+Shift+4 copies to clipboard) or copy some text first, then click this button.")
+                            : t("剪贴板中没有图片或文字。\n请先截图（Win+Shift+S）或复制一段文字，再点击此按钮。", "Nothing to paste: no image or text on the clipboard.\nTake a screenshot (Win+Shift+S) or copy some text first, then click this button."));
                         } catch {
                           alert(t("无法读取剪贴板。\n请改用键盘快捷键：选中此文件夹后按 Ctrl+V / Cmd+V 粘贴截图。", "Could not read the clipboard.\nUse the keyboard shortcut instead: select this folder, then press Ctrl+V / Cmd+V to paste the screenshot."));
                         }
@@ -21979,7 +23097,7 @@ function DMS({ storagePath, onChangeFolder }) {
                         : pasteStatus === "error" ? "border-red-400 bg-red-50 text-red-700"
                         : "border-stone-300 hover:bg-amber-50 hover:border-amber-400 text-stone-700"
                       }`}
-                      title={t("将剪贴板截图保存为 PDF（也可在选中文件夹后直接按 Ctrl+V / Cmd+V）", "Save a clipboard screenshot as a PDF (or just press Ctrl+V / Cmd+V after selecting a folder)")}
+                      title={t("将剪贴板中的截图或文字保存为 PDF（也可在选中文件夹后直接按 Ctrl+V / Cmd+V）", "Save the clipboard screenshot or copied text as a PDF (or just press Ctrl+V / Cmd+V after selecting a folder)")}
                       disabled={pasteStatus === "saving"}
                     >
                       <Clipboard size={12} />
@@ -22518,6 +23636,18 @@ function DMS({ storagePath, onChangeFolder }) {
         onSaveDescription={handleSaveDescription}
         onSaveTextAsDoc={handleSaveTextAsDoc}
         onPasteDescriptionImage={handlePasteDescriptionImage}
+        onSaveTranslationPdf={handleSaveTranslationPdf}
+        pairedDoc={(() => {
+          if (!viewerDoc) return null;
+          const me = docIndex.find((d) => d.id === viewerDoc.id);
+          const mk = (e, role) => ({ id: e.id, name: e.name, role, dataUrl: API_BASE + "/api/docs/" + e.id });
+          if (me && me.translationOf) {
+            const orig = docIndex.find((d) => d.id === me.translationOf);
+            return orig ? mk(orig, "original") : null;
+          }
+          const tr = docIndex.filter((d) => d.translationOf === viewerDoc.id).pop();
+          return tr ? mk(tr, "translation") : null;
+        })()}
         onUpdateMeta={viewerDoc ? (m) => handleUpdateDocMeta(viewerDoc.id, m, selectedId) : undefined}
         derivedDocs={viewerDoc ? docIndex.filter((e) => e.derivedFrom === viewerDoc.id) : []}
         onOpenAISettings={() => setShowAISettings(true)}
@@ -22834,6 +23964,7 @@ function DMS({ storagePath, onChangeFolder }) {
         onClose={() => setShowLinkPicker(false)}
         onLink={(docId, nodeId) => linkDocToNode(docId, nodeId || selectedId)}
         onLinkMany={(docIds, nodeIds) => linkDocsToNodes(docIds, nodeIds || [selectedId])}
+        onDeleteMany={purgeFromPicker}
         docIndex={docIndex}
         tree={tree}
         refMap={refMap}
@@ -22938,6 +24069,10 @@ function DMS({ storagePath, onChangeFolder }) {
               setSelectedId(contextMenu.nodeId);
               setShowAskAIDialog(true);
             }}
+            onRegroupLocations={collectMonthNodes(tree, contextMenu.nodeId).length > 0 ? () => {
+              setLocDraft(locSettingsToDraft(locSettingsRef.current));
+              setRegroupDialog({ nodeId: contextMenu.nodeId, name: ctxName, draft: { ...locSettingsToDraft(locSettingsRef.current), enabled: true }, remember: true, busy: null });
+            } : null}
           />
         );
       })()}
@@ -23019,6 +24154,9 @@ function DMS({ storagePath, onChangeFolder }) {
                 </span>
               </span>
             </label>
+            {folderUploadMode === "year-month" && (
+              <LocationGroupingControls draft={locDraft} setDraft={setLocDraft} />
+            )}
             <label className="flex flex-col gap-1 text-sm text-stone-700 border border-stone-200 rounded px-3 py-2 bg-stone-50">
               {t("在文件名中添加文字（可选）", "Add text to filenames (optional)")}
               <div className="flex gap-1.5">
@@ -23039,7 +24177,7 @@ function DMS({ storagePath, onChangeFolder }) {
               <button onClick={() => { setFolderPickerOpen(false); setPendingFolderFiles([]); setFolderUploadMode("year-month"); setFolderUploadExtraText(""); }} className="text-sm px-3 py-1.5 rounded border border-stone-300 hover:bg-stone-50 text-stone-700">{t("取消", "Cancel")}</button>
               <button
                 onClick={handleMultiFolderUpload}
-                disabled={pendingFolderFiles.length === 0}
+                disabled={pendingFolderFiles.length === 0 || (folderUploadMode === "year-month" && !locDraftValid(locDraft))}
                 className="text-sm px-3 py-1.5 rounded bg-amber-600 hover:bg-amber-700 text-white disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 {`${t("上传", "Upload")} ${pendingFolderFiles.length > 0 ? t(`(${pendingFolderFiles.flatMap((f) => f.files).length} 个文件)`, `(${pendingFolderFiles.flatMap((f) => f.files).length} files)`) : ""}`}
@@ -23048,6 +24186,79 @@ function DMS({ storagePath, onChangeFolder }) {
           </div>
         </div>
       )}
+
+      {locPrompt && (
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center"
+             onClick={(e) => { if (e.target === e.currentTarget) setLocPrompt(null); }}>
+          <div className="bg-white rounded-lg shadow-xl p-6 w-96 flex flex-col gap-4"
+               onKeyDown={(e) => { if (e.key === "Enter") confirmLocPrompt(); else if (e.key === "Escape") setLocPrompt(null); }}>
+            <h3 className="font-semibold text-base text-stone-800">
+              {t(`上传 ${locPrompt.files.length} 个文件`, `Upload ${locPrompt.files.length} file(s)`)}
+            </h3>
+            <div className="text-sm text-stone-700">
+              {t("照片会按拍摄日期放入 年/月 文件夹。", "Photos are filed into year/month folders by the date taken.")}
+            </div>
+            <LocationGroupingControls draft={locDraft} setDraft={setLocDraft} />
+            <div className="flex justify-end gap-2">
+              <button onClick={() => setLocPrompt(null)} className="text-sm px-3 py-1.5 rounded border border-stone-300 hover:bg-stone-50 text-stone-700">{t("取消", "Cancel")}</button>
+              <button
+                onClick={confirmLocPrompt}
+                disabled={!locDraftValid(locDraft)}
+                className="text-sm px-3 py-1.5 rounded bg-amber-600 hover:bg-amber-700 text-white disabled:opacity-40 disabled:cursor-not-allowed"
+              >{t("上传", "Upload")}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {regroupDialog && (() => {
+        const rd = regroupDialog;
+        const ok = locDraftValid({ ...rd.draft, enabled: true });
+        const preview = ok && !rd.busy ? previewRegroup(rd.nodeId, locDraftToSettings({ ...rd.draft, enabled: true })) : null;
+        return (
+          <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center"
+               onClick={(e) => { if (e.target === e.currentTarget && !rd.busy) setRegroupDialog(null); }}>
+            <div className="bg-white rounded-lg shadow-xl p-6 w-[28rem] flex flex-col gap-4">
+              <h3 className="font-semibold text-base text-stone-800">
+                {t(`按地点重新分组照片 — ${rd.name}`, `Regroup photos by location — ${rd.name}`)}
+              </h3>
+              <div className="text-sm text-stone-700">
+                {t("用新的半径重新生成月文件夹下的地点文件夹。半径太大会把不同地点合在一起，太小则会拆得太碎——可随时用新半径再次分组。没有位置信息的照片留在月文件夹中。地点文件夹被手动改过的名称会被重新命名；其他文件夹和文档不受影响。",
+                   "Rebuilds the location folders inside each month using a new radius. Too large and different places merge together; too small and one place splits apart — you can regroup again with another value at any time. Photos without GPS stay in the month folder. Location folders you renamed by hand are renamed again; other folders and documents are untouched.")}
+              </div>
+              <LocationGroupingControls
+                draft={rd.draft} showToggle={false} hint={false}
+                setDraft={(d) => setRegroupDialog((cur) => cur && ({ ...cur, draft: d }))}
+              />
+              <div className="text-sm text-stone-800 min-h-[1.5rem]">
+                {rd.busy ? rd.busy : preview ? (
+                  preview.photos === 0
+                    ? t("此范围内没有带位置信息的照片。", "No photos with GPS were found here.")
+                    : t(`预览：${preview.months} 个月、${preview.photos} 张带位置的照片 → ${preview.folders} 个地点文件夹`,
+                        `Preview: ${preview.months} month(s), ${preview.photos} photo(s) with GPS → ${preview.folders} location folder(s)`)
+                ) : ""}
+              </div>
+              <label className="flex items-center gap-2 text-sm text-stone-700 cursor-pointer">
+                <input
+                  type="checkbox" checked={rd.remember} disabled={!!rd.busy}
+                  onChange={(e) => setRegroupDialog((cur) => cur && ({ ...cur, remember: e.target.checked }))}
+                  className="accent-amber-600"
+                />
+                {t("同时将此半径设为今后上传的默认值", "Also use this radius as the default for future uploads")}
+              </label>
+              <div className="flex justify-end gap-2">
+                <button onClick={() => setRegroupDialog(null)} disabled={!!rd.busy}
+                        className="text-sm px-3 py-1.5 rounded border border-stone-300 hover:bg-stone-50 text-stone-700 disabled:opacity-40">{t("取消", "Cancel")}</button>
+                <button
+                  onClick={applyRegroup}
+                  disabled={!ok || !!rd.busy || !preview || preview.photos === 0}
+                  className="text-sm px-3 py-1.5 rounded bg-amber-600 hover:bg-amber-700 text-white disabled:opacity-40 disabled:cursor-not-allowed"
+                >{t("重新分组", "Regroup")}</button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {downloadDialog && (
         <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center" onClick={(e) => { if (e.target === e.currentTarget && !downloadDialog.busy) setDownloadDialog(null); }}>

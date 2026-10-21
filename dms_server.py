@@ -50,6 +50,8 @@ import time as _time
 from collections import deque, defaultdict
 from urllib.parse import quote as _url_quote
 
+import photo_location as _ploc
+
 try:
     from flask import (
         Flask, request, jsonify, send_file, send_from_directory,
@@ -88,6 +90,11 @@ DEFAULT_CONFIG = {
     "email_smtp_pass": "",
     "email_from": "",
     "email_ssl": False,   # True → SMTP_SSL (port 465); False → STARTTLS (port 587)
+    # Photo location folders (Year/Month/<place>): see photo_location.py.
+    # The radius last used in an upload becomes the next upload's default.
+    "photo_location_enabled": True,
+    "photo_location_radius": 10.0,
+    "photo_location_unit": "mi",   # "mi" or "km"
 }
 
 DEFAULT_KEY_PARAMETERS = [
@@ -2723,6 +2730,12 @@ def mobile_upload():
         write_index(fresh_idx)
         pending_doc_entries = []
 
+    # Location folders under each month (see photo_location.py): the
+    # remembered radius applies to phone uploads too.
+    loc_settings = _photo_location_settings()
+    loc_radius_mi = _ploc.settings_radius_miles(loc_settings)
+    new_location_node_ids: list[str] = []
+
     limit_reached = False
     for i, f in enumerate(all_files):
         if not _reserve_doc_slots(idx, 1):
@@ -2777,6 +2790,26 @@ def mobile_upload():
                         base_node_id=base_node_id,
                     )
                 ) or docs_dir
+            if loc_settings["enabled"] and gps_lat is not None and attach_node_id and tree:
+                month_node = _find_node_by_id(tree, attach_node_id)
+                if month_node is not None and not month_node.get("geoCluster"):
+                    hit = _ploc.find_cluster(_ploc.node_centers(month_node), gps_lat, gps_lon, loc_radius_mi)
+                    if hit is not None:
+                        loc_node = hit["node"]
+                    else:
+                        loc_node = {
+                            "id": f"NODE-{secrets.token_hex(3).upper()}",
+                            "name": _ploc.provisional_name(
+                                [c.get("name") for c in (month_node.get("children") or [])]),
+                            "children": [], "documents": [],
+                            "geoCluster": True,
+                            "geoCenter": {"lat": gps_lat, "lon": gps_lon},
+                            "geoNamePending": True,
+                        }
+                        month_node.setdefault("children", []).append(loc_node)
+                        new_location_node_ids.append(loc_node["id"])
+                    attach_node_id = loc_node["id"]
+                    out_dir = _get_node_docs_dir(attach_node_id, tree) or out_dir
         elif node_id and tree is not None:
             attach_node_id = node_id
             out_dir = _get_node_docs_dir(attach_node_id, tree) or docs_dir
@@ -2827,6 +2860,13 @@ def mobile_upload():
         return _redirect_err(
             f"Save failed after {len(names)} file(s) — those are already "
             f"saved, please retry the rest: {_e}")
+    if new_location_node_ids:
+        # Name the new location folders after their places in the
+        # background -- the phone's upload page never waits on the lookups.
+        _threading.Thread(
+            target=_rename_pending_location_nodes, args=(list(new_location_node_ids),),
+            daemon=True, name="location-folder-naming",
+        ).start()
     if limit_reached:
         if names:
             return _redirect_ok(
@@ -3170,6 +3210,136 @@ def set_settings():
 
     set_storage_path(str(p))
     return jsonify({"ok": True, "resolved_path": str(p), "had_existing_data": had_existing_data, "renamed": renamed})
+
+
+# ---- Photo location folders -------------------------------------------------
+# Under each Year/Month photo folder, GPS photos are filed into "location
+# folders" -- see photo_location.py for the grouping rules. These endpoints
+# hold the remembered radius and look up folder names; the grouping itself
+# happens in the client (desktop uploads, regroup) or in mobile_upload.
+_LOCATION_NAME_LOCK = _Lock()
+_NOMINATIM_MIN_INTERVAL_SECONDS = 1.1   # Nominatim's usage policy: one request per second
+
+
+def _photo_location_settings() -> dict:
+    cfg = load_config()
+    return _ploc.normalize_settings({
+        "enabled": cfg.get("photo_location_enabled"),
+        "radius": cfg.get("photo_location_radius"),
+        "unit": cfg.get("photo_location_unit"),
+    })
+
+
+@app.route("/api/photo-location-settings", methods=["GET"])
+def get_photo_location_settings():
+    return jsonify(_photo_location_settings())
+
+
+@app.route("/api/photo-location-settings", methods=["POST"])
+def set_photo_location_settings():
+    """Remember the radius/unit/on-off last used, as the next upload's default."""
+    data = request.get_json(force=True, silent=True) or {}
+    clean = _ploc.normalize_settings(data)
+    cfg = load_config()
+    cfg["photo_location_enabled"] = clean["enabled"]
+    cfg["photo_location_radius"] = clean["radius"]
+    cfg["photo_location_unit"] = clean["unit"]
+    save_config(cfg)
+    return jsonify(clean)
+
+
+def _short_place_name(full: str) -> str:
+    """'Cambridge, Middlesex County, Massachusetts' -> 'Cambridge, Massachusetts'."""
+    parts = [p.strip() for p in (full or "").split(",") if p.strip()]
+    if len(parts) >= 3:
+        parts = [parts[0], parts[-1]]
+    return ", ".join(parts)
+
+
+def _place_name_for(lat: float, lon: float, throttle: bool = False) -> str:
+    """Folder-friendly place name for a coordinate, via the shared geocode
+    cache. throttle=True waits ~1s before a real network lookup (Nominatim's
+    usage policy allows one request per second)."""
+    key = _geocode_cache_key(lat, lon)
+    with _GEOCODE_LOCK:
+        cached = _GEOCODE_CACHE.get(key)
+    if not cached:
+        if throttle:
+            _time.sleep(_NOMINATIM_MIN_INTERVAL_SECONDS)
+        cached = _reverse_geocode_network(lat, lon)
+        with _GEOCODE_LOCK:
+            _GEOCODE_CACHE[key] = cached
+    return _safe_folder_name(_short_place_name(cached or f"{lat:.3f}, {lon:.3f}"))
+
+
+@app.route("/api/photo-location-names", methods=["POST"])
+def post_photo_location_names():
+    """Body {points: [{id, lat, lon}, ...]} -> {names: {id: place name}}.
+
+    The client calls this after an upload (or regroup) created location
+    folders with provisional names, a few at a time so it can show progress,
+    then renames the folders itself -- uploads never wait on a lookup."""
+    data = request.get_json(force=True, silent=True) or {}
+    names = {}
+    for pt in (data.get("points") or [])[:20]:
+        try:
+            names[str(pt["id"])] = _place_name_for(float(pt["lat"]), float(pt["lon"]), throttle=True)
+        except (KeyError, TypeError, ValueError):
+            continue
+    return jsonify({"names": names})
+
+
+def _rename_pending_location_nodes(node_ids) -> None:
+    """Server-side counterpart of the client's rename step, for uploads that
+    build their own folders (mobile). Resolves each pending location folder's
+    place name, renames it in the index tree and syncs the disk."""
+    with _LOCATION_NAME_LOCK:
+        idx = read_index()
+        tree = idx.get("tree")
+        pending = []
+        for nid in node_ids:
+            node = _find_node_by_id(tree, nid)
+            gc = (node or {}).get("geoCenter")
+            if node and node.get("geoNamePending") and gc:
+                pending.append((nid, float(gc["lat"]), float(gc["lon"])))
+    if not pending:
+        return
+    names = {}
+    for nid, lat, lon in pending:
+        try:
+            names[nid] = _place_name_for(lat, lon, throttle=True)
+        except Exception as e:
+            print(f"[DMS] location folder naming failed for {nid}: {e}")
+    with _LOCATION_NAME_LOCK:
+        idx = read_index()
+        old_tree = json.loads(json.dumps(idx.get("tree")))
+        tree = idx.get("tree")
+        changed = False
+        for nid, name in names.items():
+            node = _find_node_by_id(tree, nid)
+            if not node or not node.get("geoNamePending"):
+                continue
+            parent = _find_parent_node(tree, nid)
+            siblings = [c.get("name") for c in (parent or {}).get("children", []) if c.get("id") != nid]
+            node["name"] = _ploc.unique_name(name, siblings)
+            node.pop("geoNamePending", None)
+            changed = True
+        if not changed:
+            return
+        write_index(idx)
+    _sync_folder_moves(old_tree, tree)
+    _sync_doc_files_to_tree_paths(tree)
+
+
+def _find_parent_node(tree: dict | None, node_id: str):
+    stack = [tree] if tree else []
+    while stack:
+        n = stack.pop()
+        for c in (n.get("children") or []):
+            if c.get("id") == node_id:
+                return n
+            stack.append(c)
+    return None
 
 
 # ---- Tree ------------------------------------------------------------------
@@ -3781,7 +3951,7 @@ def rename_doc_file(doc_id):
 
 
 def _route_upload_out_dir(docs_dir, tree, node_id, is_dated_media, valid_date, route_mode,
-                           photo_year, photo_month, photo_base_node_id):
+                           photo_year, photo_month, photo_base_node_id, photo_location=None):
     """Shared by post_doc and post_doc_stream: where a newly-uploaded file's
     bytes should land, given its (already-resolved) photo/video routing info.
     is_dated_media covers both photos and videos -- the routing itself (into a
@@ -3797,6 +3967,13 @@ def _route_upload_out_dir(docs_dir, tree, node_id, is_dated_media, valid_date, r
                 docs_dir, tree, photo_year, photo_month,
                 base_node_id=photo_base_node_id or node_id,
             )
+        if photo_location:
+            # A location folder under the month folder. The tree is the
+            # source of truth for folder names (the client names it
+            # provisionally, then renames it once the place is looked up),
+            # and the post-save disk sync moves files to match.
+            out_dir = out_dir / _safe_folder_name(photo_location)
+            out_dir.mkdir(parents=True, exist_ok=True)
     elif node_id:
         out_dir = _get_node_docs_dir(node_id, tree) or docs_dir
     else:
@@ -3886,6 +4063,7 @@ def post_doc():
     photo_month = request.form.get("photo_month", "").strip() or None
     route_mode = request.form.get("route_mode", "year-month").strip() or "year-month"
     photo_base_node_id = request.form.get("photo_base_node_id", "").strip() or None
+    photo_location = request.form.get("photo_location", "").strip() or None
 
     is_photo = _is_photo_file(ext, mime)
     is_video = _is_video_file(ext, mime)
@@ -3924,7 +4102,7 @@ def post_doc():
         # user doesn't have write access to.
         out_dir = _route_upload_out_dir(
             docs_dir, tree, node_id, is_photo or is_video, _valid_date, route_mode,
-            photo_year, photo_month, photo_base_node_id,
+            photo_year, photo_month, photo_base_node_id, photo_location,
         )
     except OSError as e:
         return jsonify({"error": f"Could not create destination folder: {e}"}), 500
@@ -6202,7 +6380,7 @@ def translate_pdf_page(doc_id):
     if page < 1:
         return jsonify({"error": "Provide a 'page' number"}), 400
     provider = (data.get("provider") or "gemini").strip().lower()
-    if provider not in ("gemini", "deepseek"):
+    if provider not in ("gemini", "deepseek", "google"):
         return jsonify({"error": "Unknown provider"}), 400
 
     language = (data.get("language") or "").strip()[:80] or "Simplified Chinese (简体中文)"
@@ -6211,15 +6389,17 @@ def translate_pdf_page(doc_id):
     if hit:
         return jsonify({"ok": True, "page": page, "provider": provider, "cached": True, **hit})
 
-    cfg = load_config()
-    enc = cfg.get(_ai_key_field(provider), "")
-    label = "DeepSeek" if provider == "deepseek" else "Gemini"
-    if not enc:
-        return jsonify({"error": f"未配置 {label} API Key，请先在设置中添加。"}), 400
-    try:
-        api_key = decrypt_secret(enc)
-    except Exception:
-        return jsonify({"error": "无法读取已保存的 API Key，请重新设置。"}), 400
+    api_key = ""
+    if provider != "google":      # the free translator needs no key
+        cfg = load_config()
+        enc = cfg.get(_ai_key_field(provider), "")
+        label = "DeepSeek" if provider == "deepseek" else "Gemini"
+        if not enc:
+            return jsonify({"error": f"未配置 {label} API Key，请先在设置中添加。"}), 400
+        try:
+            api_key = decrypt_secret(enc)
+        except Exception:
+            return jsonify({"error": "无法读取已保存的 API Key，请重新设置。"}), 400
 
     text = (data.get("text") or "").strip()
     if not text:
@@ -6237,8 +6417,11 @@ def translate_pdf_page(doc_id):
 
     try:
         import ai_extraction
-        result = ai_extraction.translate_to_chinese(
-            text, api_key, provider=provider, language=language)
+        if provider == "google":
+            result = ai_extraction.translate_free(text, language)
+        else:
+            result = ai_extraction.translate_to_chinese(
+                text, api_key, provider=provider, language=language)
     except ai_extraction.AIExtractionError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:
@@ -6249,6 +6432,374 @@ def translate_pdf_page(doc_id):
     _translate_cache[key] = {"text": result["text"], "model": result.get("model")}
     return jsonify({"ok": True, "page": page, "provider": provider, "cached": False,
                     "text": result["text"], "model": result.get("model")})
+
+
+# Colour markup typed/inserted by the editor: [[y:text]] etc. (not nested).
+# y/g/p/b = highlighter backgrounds, r/u = red/blue text.
+_TRANSLATION_MARKS = {
+    "y": "background-color:#fff176", "g": "background-color:#a5d6a7",
+    "p": "background-color:#f8bbd0", "b": "background-color:#90caf9",
+    "r": "color:#d32f2f", "u": "color:#1565c0",
+}
+_TRANSLATION_MARK_RE = re.compile(r"\[\[([ygpbru]):(.*?)\]\]", re.S)
+
+
+def _translation_markup_to_html(text: str) -> str:
+    import html as _html
+    def esc(t):
+        return "<br>".join(_html.escape(ln) for ln in t.split("\n"))
+    out, pos = [], 0
+    for m in _TRANSLATION_MARK_RE.finditer(text):
+        out.append(esc(text[pos:m.start()]))
+        out.append(f'<span style="{_TRANSLATION_MARKS[m.group(1)]}">{esc(m.group(2))}</span>')
+        pos = m.end()
+    out.append(esc(text[pos:]))
+    return "".join(out)
+
+
+def _build_translation_pdf(pages: list, sizes: list | None = None) -> bytes:
+    """Render [(page_no, text), ...] into a PDF with exactly ONE page per
+    source page (blank where a page had no text), each the source page's size
+    when `sizes` ([[w, h], ...] in points) is given, else A4. The text shrinks
+    until it fits its page, so page N of the translation always lines up with
+    page N of the original -- which is what lets the viewer show the two side
+    by side with synced scrolling. Uses PyMuPDF's Story, which falls back to
+    bundled fonts so CJK/Cyrillic/etc. all render."""
+    import html as _html
+    import pymupdf
+    texts = dict(pages)
+    total = max(len(sizes or []), max(texts) if texts else 0)
+    buf = io.BytesIO()
+    writer = pymupdf.DocumentWriter(buf)
+    for n in range(1, total + 1):
+        try:
+            W, H = (float(sizes[n - 1][0]), float(sizes[n - 1][1]))
+            if not (50 <= W <= 5000 and 50 <= H <= 5000):
+                raise ValueError
+        except Exception:
+            W, H = 595.0, 842.0
+        M = max(18.0, min(W, H) * 0.06)
+        box = pymupdf.Rect(M, M, W - M, H - M)
+        text = (texts.get(n) or "").strip()
+        dev = writer.begin_page(pymupdf.Rect(0, 0, W, H))
+        if text:
+            body = _translation_markup_to_html(text)
+            def mk(pt):
+                return pymupdf.Story(
+                    html=f"<p>{body}</p>",
+                    user_css=f"p{{font-size:{pt}pt;line-height:1.4}}")
+            pt = 11.0
+            while pt > 4.0 and mk(pt).place(box)[0]:
+                pt -= 0.5
+            st = mk(pt)
+            st.place(box)
+            st.draw(dev)
+        writer.end_page()
+    writer.close()
+    # Keep the exact text (with its real line breaks) inside the PDF so the
+    # translation can be edited later without guessing at wrapped lines.
+    try:
+        doc = pymupdf.open("pdf", buf.getvalue())
+        doc.embfile_add(_TRANSLATION_EMBED_NAME, json.dumps(
+            {str(k): v for k, v in texts.items()}, ensure_ascii=False).encode("utf-8"))
+        out = doc.tobytes(garbage=3, deflate=True)
+        doc.close()
+        return out
+    except Exception:
+        return buf.getvalue()
+
+
+_TRANSLATION_EMBED_NAME = "dms-translation.json"
+
+
+def _read_translation_pdf(path: Path):
+    """-> ({page_no: text}, [[w, h], ...]) from a saved translation PDF. Uses the
+    embedded source text when present, else extracts the visible text."""
+    import pymupdf
+    doc = pymupdf.open(str(path))
+    try:
+        sizes = [[p.rect.width, p.rect.height] for p in doc]
+        texts = None
+        try:
+            if _TRANSLATION_EMBED_NAME in doc.embfile_names():
+                texts = {int(k): v for k, v in json.loads(
+                    doc.embfile_get(_TRANSLATION_EMBED_NAME).decode("utf-8")).items()}
+        except Exception:
+            texts = None
+        if texts is None:
+            texts = {i + 1: p.get_text("text").strip() for i, p in enumerate(doc)}
+        return texts, sizes
+    finally:
+        doc.close()
+
+
+def _layout_translation_text(path, lay):
+    """GET/PUT for a layout-preserving translation: edit the translation of
+    each unit (cell/paragraph); Save re-renders from the original PDF."""
+    import layout_translate
+    pages = lay.get("pages") or {}
+    if request.method == "GET":
+        return jsonify({"ok": True, "layout": True, "count": len(pages),
+                        "units": {pg: [{"src": u.get("src", ""), "text": u.get("text", "")}
+                                       for u in us] for pg, us in pages.items()}})
+    data = request.get_json(force=True, silent=True) or {}
+    edited = data.get("units") or {}
+    for pg, us in pages.items():
+        new = edited.get(pg)
+        if isinstance(new, list) and len(new) == len(us):
+            for u, t in zip(us, new):
+                u["text"] = str(t if t is not None else "").strip()
+    docs_dir = get_docs_dir()
+    src = _find_doc_files(docs_dir, lay.get("source_id") or "")
+    if not src:
+        return jsonify({"error": "The original PDF is no longer available, so this translation can't be re-rendered."}), 409
+    try:
+        units = {int(pg): us for pg, us in pages.items()}
+        pdf = layout_translate.render(src[0], units, _translation_markup_to_html)
+        pdf = layout_translate.embed_layout(pdf, lay.get("source_id"), units)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_bytes(pdf)
+        os.replace(tmp, path)
+    except Exception as e:
+        return jsonify({"error": f"Could not save the edited translation: {e}"}), 500
+    return jsonify({"ok": True, "size": len(pdf)})
+
+
+def _translate_texts(texts: list, provider: str, api_key: str, language: str) -> list:
+    """Translate many short strings (table cells etc.), returning a list of
+    the same length. Strings are sent in batches (one per line / numbered) and
+    any the service garbles or drops are redone one at a time."""
+    import ai_extraction
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(t):
+        try:
+            if provider == "google":
+                return ai_extraction.translate_free(t, language)["text"]
+            return ai_extraction.translate_to_chinese(t, api_key, provider=provider, language=language)["text"]
+        except Exception:
+            return ""
+
+    out = [""] * len(texts)
+    todo = []
+    batch, size = [], 0
+    limit_chars = 3000 if provider == "google" else 6000
+    limit_items = 400 if provider == "google" else 60
+    for i, t in enumerate(texts):
+        if batch and (size + len(t) > limit_chars or len(batch) >= limit_items):
+            todo.append(batch); batch, size = [], 0
+        batch.append(i); size += len(t) + 8
+    if batch:
+        todo.append(batch)
+
+    missing = []
+    for b in todo:
+        try:
+            if provider == "google":
+                res = ai_extraction.translate_free("\n".join(texts[i] for i in b), language)["text"].split("\n")
+                if len(res) == len(b):
+                    for i, r in zip(b, res):
+                        out[i] = r.strip()
+                    continue
+            else:
+                body = "\n".join(f"{n + 1}|{texts[i]}" for n, i in enumerate(b))
+                res = ai_extraction.translate_to_chinese(body, api_key, provider=provider, language=language)["text"]
+                got = {}
+                for ln in res.split("\n"):
+                    m = re.match(r"^\s*(\d+)\s*[|｜]\s*(.*)$", ln)
+                    if m:
+                        got[int(m.group(1))] = m.group(2).strip()
+                for n, i in enumerate(b):
+                    if got.get(n + 1):
+                        out[i] = got[n + 1]
+                    else:
+                        missing.append(i)
+                continue
+        except Exception:
+            pass
+        missing.extend(b)
+    if missing:
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            for i, r in zip(missing, ex.map(lambda i: one(texts[i]), missing)):
+                out[i] = r.strip()
+    return out
+
+
+@app.route("/api/docs/<doc_id>/save-translation-layout", methods=["POST"])
+def save_pdf_translation_layout(doc_id):
+    """Translate a text-layer PDF while keeping its layout (tables, columns):
+    every text unit is translated and painted back where the original was.
+    Saved as a new PDF named like save-translation's, in the original's folder.
+
+    Body: { "provider": "google"|"gemini"|"deepseek", "language": str,
+    "node_id": str|null, "name": str }.  Returns the same shape as
+    save-translation plus { units, blank_pages }.
+    """
+    import layout_translate
+    docs_dir = get_docs_dir()
+    if not docs_dir:
+        return jsonify({"error": "Storage path not configured"}), 503
+    data = request.get_json(force=True, silent=True) or {}
+    provider = (data.get("provider") or "google").strip().lower()
+    if provider not in ("gemini", "deepseek", "google"):
+        return jsonify({"error": "Unknown provider"}), 400
+    language = (data.get("language") or "").strip()[:80] or "Simplified Chinese (简体中文)"
+    api_key = ""
+    if provider != "google":
+        enc = load_config().get(_ai_key_field(provider), "")
+        if not enc:
+            return jsonify({"error": f"未配置 {'DeepSeek' if provider == 'deepseek' else 'Gemini'} API Key，请先在设置中添加。"}), 400
+        try:
+            api_key = decrypt_secret(enc)
+        except Exception:
+            return jsonify({"error": "无法读取已保存的 API Key，请重新设置。"}), 400
+    matches = _find_doc_files(docs_dir, doc_id)
+    if not matches:
+        return jsonify({"error": "Document not found"}), 404
+
+    target_cjk = bool(re.search(r"Chinese|Japanese|Korean|Cantonese", language))
+    try:
+        units, blank = layout_translate.build_translated_units(
+            matches[0], lambda texts: _translate_texts(texts, provider, api_key, language), target_cjk)
+        n_units = sum(1 for us in units.values() for u in us if u.get("text"))
+        if not n_units:
+            return jsonify({"error": "此 PDF 没有可定位的文字（可能是扫描件）。请改用「保存为 PDF」。 / "
+                                     "No selectable text found (scanned PDF?). Use \"Save as PDF\" instead."}), 422
+        pdf = layout_translate.render(matches[0], units, _translation_markup_to_html)
+        pdf = layout_translate.embed_layout(pdf, doc_id, units)
+    except ImportError:
+        return jsonify({"error": "缺少 PDF 渲染库（PyMuPDF）。 / PyMuPDF is required."}), 400
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify({"error": f"Could not build the translated PDF: {e}"}), 500
+
+    if "Chinese" in language or "Cantonese" in language or not language:
+        lang_word = "Chinese"
+    else:
+        lang_word = re.sub(r"\s*\(.*\)", "", language).strip() or "Translated"
+    stem = Path((data.get("name") or "").strip() or "document.pdf").stem or "document"
+    node_id = (data.get("node_id") or "").strip() or None
+    new_id = secrets.token_hex(8)
+    tree = read_index().get("tree")
+    out_dir = (_get_node_docs_dir(node_id, tree) if node_id else None) or docs_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    base = _safe_filename_part(f"{stem} {lang_word}")
+    safe_name = f"{base}.pdf"
+    n = 1
+    while (out_dir / _doc_filename(new_id, safe_name)).exists() or _doc_display_name_in_use(docs_dir, safe_name):
+        n += 1
+        safe_name = f"{base} ({n}).pdf"
+    out_path = out_dir / _doc_filename(new_id, safe_name)
+    try:
+        out_path.write_bytes(pdf)
+    except OSError as e:
+        return jsonify({"error": f"Could not save file to disk: {e}"}), 500
+    print(f"[DMS] save-translation-layout → {out_path.name} ({len(pdf)} bytes, {n_units} units)")
+    return jsonify({"ok": True, "doc_id": new_id, "name": safe_name, "size": len(pdf),
+                    "mime": "application/pdf", "units": n_units, "blank_pages": blank})
+
+
+@app.route("/api/docs/<doc_id>/translation-text", methods=["GET", "PUT"])
+def translation_text(doc_id):
+    """GET the editable per-page text of a saved translation PDF; PUT edited
+    text back, which re-renders the PDF in place (same doc id, same pages)."""
+    docs_dir = get_docs_dir()
+    if not docs_dir:
+        return jsonify({"error": "Storage path not configured"}), 503
+    matches = _find_doc_files(docs_dir, doc_id)
+    if not matches or matches[0].suffix.lower() != ".pdf":
+        return jsonify({"error": "Document not found"}), 404
+    path = matches[0]
+    import layout_translate
+    try:
+        lay = layout_translate.read_layout(path)
+    except Exception:
+        lay = None
+    if lay is not None:
+        return _layout_translation_text(path, lay)
+    try:
+        texts, sizes = _read_translation_pdf(path)
+    except ImportError:
+        return jsonify({"error": "PyMuPDF is required to edit a translation."}), 400
+    except Exception as e:
+        return jsonify({"error": f"Could not read the PDF: {e}"}), 500
+    if request.method == "GET":
+        return jsonify({"ok": True, "pages": {str(k): v for k, v in texts.items()},
+                        "count": len(sizes)})
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        pages = sorted((int(k), str(v)) for k, v in (data.get("pages") or {}).items())
+    except (TypeError, ValueError, AttributeError):
+        return jsonify({"error": "Invalid 'pages'"}), 400
+    try:
+        pdf_bytes = _build_translation_pdf(pages, sizes)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_bytes(pdf_bytes)
+        os.replace(tmp, path)
+    except Exception as e:
+        return jsonify({"error": f"Could not save the edited translation: {e}"}), 500
+    return jsonify({"ok": True, "size": len(pdf_bytes)})
+
+
+@app.route("/api/docs/<doc_id>/save-translation", methods=["POST"])
+def save_pdf_translation(doc_id):
+    """Save a PDF's side-by-side translation as a new PDF document in the
+    same folder, named "<original name> Chinese.pdf" (the language's short
+    name replaces "Chinese" for other target languages).
+
+    Body: { "pages": {"1": "text", ...}, "language": str, "node_id": str|null,
+    "name": str (original display name), "sizes": [[w, h], ...] (optional,
+    the source pages' sizes in points, so page N lines up with page N) }
+    Returns { ok, doc_id, name, size, mime } -- the client then registers the
+    document in the tree/index exactly as for a pasted screenshot.
+    """
+    docs_dir = get_docs_dir()
+    if not docs_dir:
+        return jsonify({"error": "Storage path not configured"}), 503
+    data = request.get_json(force=True, silent=True) or {}
+    raw_pages = data.get("pages") or {}
+    try:
+        pages = sorted((int(k), str(v)) for k, v in raw_pages.items() if str(v).strip())
+    except (TypeError, ValueError, AttributeError):
+        return jsonify({"error": "Invalid 'pages'"}), 400
+    if not pages:
+        return jsonify({"error": "No translated pages to save"}), 400
+
+    language = (data.get("language") or "").strip()
+    if "Chinese" in language or "Cantonese" in language or not language:
+        lang_word = "Chinese"
+    else:
+        lang_word = re.sub(r"\s*\(.*\)", "", language).strip() or "Translated"
+    orig_name = (data.get("name") or "").strip() or "document.pdf"
+    stem = Path(orig_name).stem or "document"
+    node_id = (data.get("node_id") or "").strip() or None
+
+    try:
+        pdf_bytes = _build_translation_pdf(pages, data.get("sizes") if isinstance(data.get("sizes"), list) else None)
+    except ImportError:
+        return jsonify({"error": "缺少 PDF 渲染库（PyMuPDF）。 / PyMuPDF is required to save a translation."}), 400
+    except Exception as e:
+        return jsonify({"error": f"Could not build the translated PDF: {e}"}), 500
+
+    new_id = secrets.token_hex(8)
+    tree = read_index().get("tree")
+    out_dir = (_get_node_docs_dir(node_id, tree) if node_id else None) or docs_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    base = _safe_filename_part(f"{stem} {lang_word}")
+    # _safe_filename_part clips to 80 chars incl. extension; keep room for ".pdf".
+    safe_name = f"{base}.pdf"
+    n = 1
+    while (out_dir / _doc_filename(new_id, safe_name)).exists() or _doc_display_name_in_use(docs_dir, safe_name):
+        n += 1
+        safe_name = f"{base} ({n}).pdf"
+    out_path = out_dir / _doc_filename(new_id, safe_name)
+    try:
+        out_path.write_bytes(pdf_bytes)
+    except OSError as e:
+        return jsonify({"error": f"Could not save file to disk: {e}"}), 500
+    print(f"[DMS] save-translation → {out_path.name} ({len(pdf_bytes)} bytes)")
+    return jsonify({"ok": True, "doc_id": new_id, "name": safe_name,
+                    "size": len(pdf_bytes), "mime": "application/pdf"})
 
 
 @app.route("/api/check-typos-cn", methods=["POST"])
@@ -6980,6 +7531,64 @@ def post_node_save_description_text(node_id):
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
+    return jsonify({"ok": True, **result})
+
+
+def _build_text_pdf(text: str) -> bytes:
+    """Plain text -> a multi-page A4 PDF (PyMuPDF Story; CJK etc. render via
+    its bundled fonts). Line breaks and spacing are preserved."""
+    import html as _html
+    import pymupdf
+    body = "<br>".join(_html.escape(ln) or "&nbsp;" for ln in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"))
+    story = pymupdf.Story(html=f"<p>{body}</p>", user_css="p{font-size:11pt;line-height:1.4}")
+    buf = io.BytesIO()
+    writer = pymupdf.DocumentWriter(buf)
+    mediabox = pymupdf.paper_rect("a4")
+    where = mediabox + (48, 48, -48, -48)
+    more = True
+    while more:
+        dev = writer.begin_page(mediabox)
+        more, _ = story.place(where)
+        story.draw(dev)
+        writer.end_page()
+    writer.close()
+    return buf.getvalue()
+
+
+@app.route("/api/nodes/<node_id>/paste-text", methods=["POST"])
+def post_node_paste_text(node_id):
+    """Save clipboard text (the "Paste screenshot" button's fallback when the
+    clipboard holds text, not an image) as a PDF filed into the folder.
+
+    Body (JSON): { "text": str }.  Returns { ok, doc_id, name, size, node_id }.
+    """
+    docs_dir = get_docs_dir()
+    if not docs_dir:
+        return jsonify({"error": "Storage path not configured"}), 503
+    if "/" in node_id or "\\" in node_id or ".." in node_id:
+        return jsonify({"error": "Invalid node_id"}), 400
+    text = ((request.get_json(force=True, silent=True) or {}).get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "Provide non-empty 'text'"}), 400
+    idx = read_index()
+    tree = idx.get("tree")
+    if not tree or _find_node_by_id(tree, node_id) is None:
+        return jsonify({"error": "Folder not found"}), 404
+    try:
+        pdf_bytes = _build_text_pdf(text[:500000])
+    except ImportError:
+        return jsonify({"error": "PyMuPDF is required to save pasted text."}), 400
+    except Exception as e:
+        return jsonify({"error": f"PDF generation failed: {e}"}), 500
+    display_name = "Pasted text " + datetime.now().strftime("%Y-%m-%d %H%M%S") + ".pdf"
+    try:
+        result = _save_or_update_node_derived_doc(
+            idx, tree, node_id, pdf_bytes, "application/pdf", display_name,
+            "pasted_text", False)
+    except _DocLimitReached as e:
+        return jsonify({"error": str(e), "code": "upload_limit_reached"}), 403
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     return jsonify({"ok": True, **result})
 
 
@@ -8207,6 +8816,101 @@ def _walk_doc_node_refs(node, path=""):
             yield doc_id, node.get("id"), here
     for child in (node.get("children") or []):
         yield from _walk_doc_node_refs(child, here)
+
+
+def _open_with_default_app(file_path: str) -> None:
+    _unblock_downloaded_file(file_path)
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", file_path])
+    elif sys.platform == "win32":
+        subprocess.Popen(["start", "", file_path], shell=True)
+    else:
+        subprocess.Popen(["xdg-open", file_path])
+
+
+def _description_to_plain(raw: str) -> str:
+    """Plain text of a folder Description (stored as lightweight HTML with
+    <br> and inline <img>); legacy descriptions are plain text."""
+    import html as _html
+    import re as _re
+    if not raw:
+        return ""
+    s = _re.sub(r"<br\s*/?>", "\n", raw, flags=_re.I)
+    s = _re.sub(r"<img\b[^>]*>", "[screenshot]", s, flags=_re.I)
+    s = _re.sub(r"</(div|p|li)>", "\n", s, flags=_re.I)
+    s = _re.sub(r"<[^>]+>", "", s)
+    return _html.unescape(s).strip()
+
+
+@app.route("/api/export-logins-xlsx", methods=["POST"])
+def export_logins_xlsx():
+    """Write an .xlsx listing every saved website login in the tree to a
+    temp folder and open it in the OS default spreadsheet app (no browser
+    download): Folder | Website | User name | Password | Folder description.
+    One row per login (a folder may carry several). The Password column is
+    the decrypted password in plain text."""
+    import tempfile as _tf
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment
+
+    if not get_storage_root():
+        return jsonify({"error": "Storage path not configured"}), 503
+    idx = read_index()
+    tree = idx.get("tree")
+
+    def logins_of(node):
+        if isinstance(node.get("logins"), list):
+            return node["logins"]
+        if node.get("websiteUrl") or node.get("accountName") or node.get("passwordEnc"):
+            return [node]
+        return []
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Logins"
+    ws.append(["Folder", "Website", "User name", "Password", "Folder description"])
+    for c in ws[1]:
+        c.font = Font(bold=True)
+
+    def put_row(values):
+        ws.append(values)
+        for c in ws[ws.max_row]:
+            c.data_type = "s"  # force text so "=..." passwords aren't formulas
+            c.alignment = Alignment(vertical="top", wrap_text=False)
+
+    stack = [tree] if tree else []
+    while stack:
+        node = stack.pop(0)
+        stack = list(node.get("children") or []) + stack  # depth-first, tree order
+        entries = logins_of(node)
+        if not entries:
+            continue
+        desc = _description_to_plain(node.get("description", ""))
+        for e in entries:
+            pw = ""
+            enc = e.get("passwordEnc", "")
+            if enc == SAVED_PASSWORD_MARKER:
+                # A stray "saved" marker got written over the real
+                # ciphertext at some point; the password is gone.
+                pw = "(lost - please re-enter in DMS)"
+            elif enc:
+                try:
+                    pw = decrypt_secret(enc)
+                except Exception:
+                    pw = "(cannot decrypt - saved on another computer?)"
+            put_row([node.get("name", ""), e.get("websiteUrl", ""),
+                     e.get("accountName", ""), pw, desc])
+
+    for col, w in zip("ABCDE", (30, 40, 28, 28, 60)):
+        ws.column_dimensions[col].width = w
+    ws.freeze_panes = "A2"
+
+    out_dir = Path(_tf.gettempdir()) / "DMS-logins"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"dms-logins-{datetime.now().strftime('%Y%m%d-%H%M%S')}.xlsx"
+    wb.save(path)
+    _open_with_default_app(str(path))
+    return jsonify({"ok": True, "path": str(path)})
 
 
 @app.route("/api/export-csv", methods=["GET"])
