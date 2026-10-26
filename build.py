@@ -82,7 +82,7 @@ def ensure_venv():
         [str(venv_python), "-m", "pip", "install", "--quiet", "--upgrade",
          "pip", "pyinstaller", "flask", "waitress", "pypdf", "reportlab", "Pillow",
          "pillow-heif", "PyMuPDF", "qrcode", "numpy", "cryptography", "google-genai",
-         "openpyxl", "pyzbar", "python-docx"],
+         "openpyxl", "pyzbar", "python-docx", "pymobiledevice3"],
         check=True,
     )
 
@@ -448,11 +448,20 @@ def build_pyinstaller_command() -> list[str]:
     except ImportError:
         print("  numpy not installed — face recognition will be disabled.")
 
+    # pymobiledevice3 reads photos from a USB-connected iPhone ("Import from iPhone")
+    try:
+        import pymobiledevice3  # noqa: F401
+        cmd.extend(["--collect-all", "pymobiledevice3"])
+        print("  pymobiledevice3 found — Import from iPhone (USB) will work.")
+    except ImportError:
+        print("  pymobiledevice3 not installed — Import from iPhone (USB) will be unavailable.")
+
     # Belt-and-suspenders hidden imports
     for mod in ("tkinter", "tkinter.ttk", "tkinter.scrolledtext",
                 "tkinter.font", "tkinter.messagebox",
                 "flask", "dms_server", "databook", "heic_to_jpg", "pdf_extraction",
-                "ai_extraction", "photo_location", "layout_translate", "_dms_trial"):
+                "ai_extraction", "photo_location", "layout_translate", "_dms_trial",
+                "iphone_import"):
         cmd.extend(["--hidden-import", mod])
 
     # The entry point is the launcher

@@ -5,7 +5,7 @@ from PyInstaller.utils.hooks import copy_metadata
 
 datas = [('/Users/david/PMS/dms.html', '.'), ('/Users/david/PMS/vendor', 'vendor'), ('/Users/david/PMS/deepface_worker.py', '.'), ('/Users/david/PMS/PMS用户手册_更新版.docx', '.'), ('/Users/david/PMS/PMS_User_Manual.docx', '.'), ('/Users/david/PMS/Gemini_API_Key_设置指南.docx', '.')]
 binaries = []
-hiddenimports = ['pillow_heif', 'fitz', 'qrcode', 'pyzbar', 'pyngrok', 'pyngrok.ngrok', 'pyngrok.conf', 'google.genai', 'numpy', 'tkinter', 'tkinter.ttk', 'tkinter.scrolledtext', 'tkinter.font', 'tkinter.messagebox', 'flask', 'dms_server', 'databook', 'heic_to_jpg', 'pdf_extraction', 'ai_extraction', 'photo_location', 'layout_translate', '_dms_trial']
+hiddenimports = ['pillow_heif', 'fitz', 'qrcode', 'pyzbar', 'pyngrok', 'pyngrok.ngrok', 'pyngrok.conf', 'google.genai', 'numpy', 'tkinter', 'tkinter.ttk', 'tkinter.scrolledtext', 'tkinter.font', 'tkinter.messagebox', 'flask', 'dms_server', 'databook', 'heic_to_jpg', 'pdf_extraction', 'ai_extraction', 'photo_location', 'layout_translate', '_dms_trial', 'iphone_import']
 datas += copy_metadata('Pillow')
 hiddenimports += collect_submodules('tkinter')
 hiddenimports += collect_submodules('tkinter.ttk')
@@ -39,6 +39,8 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('pyzbar')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('google.genai')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('pymobiledevice3')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 

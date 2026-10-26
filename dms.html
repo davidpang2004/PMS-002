@@ -769,6 +769,8 @@ const buildTreeText = (root, { showMeta = false } = {}) => {
 };
 
 const readPhotoDate = async (file) => {
+  // Import-from-iPhone attaches EXIF date/GPS read server-side (HEIC isn't parsed here).
+  if (file.__dmsMeta && file.__dmsMeta.year) return file.__dmsMeta;
   const fallback = (lat = null, lon = null) => {
     const d = new Date(file.lastModified);
     return {
@@ -7994,6 +7996,307 @@ const HeicToJpgDialog = ({ onClose }) => {
           onSelect={(p) => { if (p) (browse === "folder" ? setFolder : setOutput)(p); setBrowse(null); }}
           onClose={() => setBrowse(null)} />
       )}
+    </div>
+  );
+};
+
+/* =============================================================================
+ * IMPORT FROM iPHONE (USB): plug the phone in with its cable, tap Trust, pick
+ * what to bring over. The server reads the phone's DCIM folder (iphone_import.py);
+ * files are then added with the normal upload path (onImport) so Year/Month/place
+ * routing, EXIF dates and duplicate skipping behave exactly like Upload file.
+ * Already-imported files are remembered (per phone, in this browser) so the next
+ * import can bring over only what's new.
+ * =============================================================================
+ */
+const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onClose }) => {
+  const { t } = useLang();
+  // Destination folder: pick any existing folder, or create a new one first.
+  const folders = [];
+  const walkF = (n, depth) => { folders.push({ id: n.id, name: n.name, depth }); (n.children || []).forEach((c) => walkF(c, depth + 1)); };
+  if (tree) walkF(tree, 0);
+  const [destId, setDestId] = useState(defaultNodeId || (tree && tree.id) || "");
+  const [newOpen, setNewOpen] = useState(false);
+  const [newName, setNewName] = useState(t("iPhone 照片", "iPhone Photos"));
+  const [newParent, setNewParent] = useState(defaultNodeId || (tree && tree.id) || "");
+  const [creating, setCreating] = useState(false);
+  const destName = (folders.find((f) => f.id === destId) || {}).name || "";
+  const [mode, setMode] = useState("usb");        // usb (photos/videos) | files (PDFs etc. over Wi-Fi)
+  const [link, setLink] = useState(null);
+  const [linkErr, setLinkErr] = useState("");
+  const [copied, setCopied] = useState(false);
+  const onImportRef = useRef(onImport);
+  onImportRef.current = onImport;      // always the latest render's closure (tree changes mid-import)
+  const makeFolder = async () => {
+    const nm = newName.trim();
+    if (!nm || !newParent) return;
+    setCreating(true);
+    try { const id = await onCreateFolder(newParent, nm); setDestId(id); setNewOpen(false); }
+    finally { setCreating(false); }
+  };
+  const [st, setSt] = useState({ state: "checking", message: "" });
+  const [items, setItems] = useState(null);       // null until the phone's library is read
+  const [loadErr, setLoadErr] = useState("");
+  const [scope, setScope] = useState("new");      // new | all | range
+  const [kind, setKind] = useState("both");       // both | photos | videos
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
+  const [running, setRunning] = useState(false);
+  const [prog, setProg] = useState({ done: 0, total: 0, name: "" });
+  const [result, setResult] = useState(null);
+  const cancelRef = useRef(false);
+  const pollRef = useRef(null);
+  const udid = st.udid || "";
+  const seenKey = "dms_iphone_imported_" + udid;
+  const itemKey = (i) => i.path + "|" + i.size;
+  const loadSeen = () => { try { return new Set(JSON.parse(localStorage.getItem(seenKey) || "[]")); } catch (e) { return new Set(); } };
+
+  // Poll for the phone until it's ready (stops once connected or while importing).
+  useEffect(() => {
+    let dead = false;
+    const poll = async () => {
+      try {
+        const r = await fetch(API_BASE + "/api/iphone/status");
+        const j = await r.json();
+        if (dead) return;
+        setSt(j);
+        // USB library not in this build: open on the Wi-Fi tab instead of an error.
+        if (j.state === "no_lib") { setMode("files"); return; }
+        if (j.state === "ready") return;
+      } catch (e) { if (!dead) setSt({ state: "error", message: e.message || String(e) }); }
+      if (!dead) pollRef.current = setTimeout(poll, 2000);
+    };
+    poll();
+    return () => { dead = true; if (pollRef.current) clearTimeout(pollRef.current); };
+  }, []);
+
+  // Once connected, read the phone's photo library.
+  useEffect(() => {
+    if (st.state !== "ready" || items) return;
+    (async () => {
+      try {
+        const r = await fetch(API_BASE + "/api/iphone/media?udid=" + encodeURIComponent(st.udid));
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error || "Could not read the phone");
+        setItems(j.items);
+      } catch (e) { setLoadErr(e.message || String(e)); }
+    })();
+  }, [st.state]);
+
+  const seen = items ? loadSeen() : new Set();
+  const picked = (items || []).filter((i) => {
+    if (kind === "photos" && i.video) return false;
+    if (kind === "videos" && !i.video) return false;
+    if (scope === "new") return !seen.has(itemKey(i));
+    if (scope === "range") return (!from || i.date >= from) && (!to || i.date <= to);
+    return true;
+  });
+  const mb = (n) => (n / 1048576 >= 1024 ? (n / 1073741824).toFixed(1) + " GB" : Math.round(n / 1048576) + " MB");
+  const totalBytes = picked.reduce((a, i) => a + i.size, 0);
+
+  const run = async () => {
+    cancelRef.current = false;
+    setRunning(true); setResult(null);
+    const todo = picked.slice().reverse();     // oldest first
+    const doneSet = loadSeen();
+    let ok = 0, failed = 0, lastErr = "";
+    const failNames = [];
+    setProg({ done: 0, total: todo.length, name: "" });
+    // Fetch in small batches so memory stays bounded even with long videos.
+    let batch = [], batchKeys = [], batchBytes = 0;
+    const flush = async () => {
+      if (!batch.length) return;
+      try {
+        await onImportRef.current(destId, batch);
+        batchKeys.forEach((k) => doneSet.add(k));
+        try { localStorage.setItem(seenKey, JSON.stringify([...doneSet])); } catch (e) {}
+        ok += batch.length;
+      } catch (e) { console.error("[DMS] iPhone import: saving batch failed", e); lastErr = (e && e.message) || String(e); failed += batch.length; failNames.push(...batch.map((f) => f.name)); }
+      batch = []; batchKeys = []; batchBytes = 0;
+    };
+    for (let n = 0; n < todo.length && !cancelRef.current; n++) {
+      const it = todo[n];
+      setProg({ done: n, total: todo.length, name: it.name });
+      try {
+        const r = await fetch(API_BASE + "/api/iphone/file?udid=" + encodeURIComponent(udid) + "&path=" + encodeURIComponent(it.path));
+        if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || "copy failed");
+        const blob = await r.blob();
+        const f = new window.File([blob], it.name, { lastModified: Math.round(it.mtime * 1000), type: blob.type });
+        try {
+          const meta = JSON.parse(r.headers.get("X-Photo-Meta") || "{}");
+          if (meta.year) { f.__dmsMeta = { year: meta.year, month: meta.month, day: meta.day || "01", lat: meta.lat ?? null, lon: meta.lon ?? null }; }
+          else if (meta.lat != null) {
+            const d = new Date(f.lastModified);
+            f.__dmsMeta = { year: String(d.getFullYear()), month: String(d.getMonth() + 1).padStart(2, "0"), day: String(d.getDate()).padStart(2, "0"), lat: meta.lat, lon: meta.lon };
+          }
+        } catch (e) {}
+        batch.push(f);
+        batchKeys.push(itemKey(it)); batchBytes += it.size;
+      } catch (e) {
+        console.error("[DMS] iPhone import: copy failed", it.path, e);
+        lastErr = (e && e.message) || String(e);
+        failed++; failNames.push(it.name);
+        if (/unplug|USB|not found|No iPhone/i.test(e.message || "")) { cancelRef.current = true; }
+      }
+      if (batch.length >= 20 || batchBytes >= 150 * 1048576) await flush();
+    }
+    await flush();
+    setProg((p) => ({ ...p, done: ok + failed }));
+    setResult({ ok, failed, lastErr, failNames: failNames.slice(0, 8), cancelled: cancelRef.current });
+    setRunning(false);
+  };
+
+  // Files tab: a Wi-Fi upload link tied to the chosen folder.
+  useEffect(() => {
+    if (mode !== "files" || !destId) return;
+    let dead = false;
+    setLink(null); setLinkErr(""); setCopied(false);
+    (async () => {
+      try {
+        const r = await fetch(API_BASE + "/api/phone-upload-link", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ node_id: destId }) });
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error || "Could not create the link");
+        if (!dead) setLink(j);
+      } catch (e) { if (!dead) setLinkErr(e.message || String(e)); }
+    })();
+    return () => { dead = true; };
+  }, [mode, destId]);
+
+  const stateHelp = {
+    no_device: t("请用数据线把 iPhone 连接到这台电脑，并解锁手机。", "Plug your iPhone into this computer with its USB cable and unlock the phone."),
+    not_trusted: t("请在 iPhone 上点“信任”（如需要，输入手机密码）。", "On your iPhone, tap “Trust” (enter its passcode if asked)."),
+    locked: t("请先解锁 iPhone，然后稍候。", "Unlock your iPhone, then wait a moment."),
+  };
+  const btn = "px-3 py-1 text-sm border border-stone-300 rounded hover:bg-stone-50 disabled:opacity-50";
+  const pct = prog.total ? Math.round((prog.done / prog.total) * 100) : 0;
+  const destBlock = (
+              <div className="space-y-1.5">
+                <div className="font-bold text-stone-700">{t("保存到文件夹", "Save into folder")}</div>
+                <div className="flex gap-1.5 items-center">
+                  <select value={destId} onChange={(e) => setDestId(e.target.value)} disabled={running} className="flex-1 min-w-0 px-2 py-1 border border-stone-300 rounded bg-white">
+                    {folders.map((f) => <option key={f.id} value={f.id}>{"\u00a0\u00a0".repeat(Math.min(f.depth, 6)) + (f.depth ? "└ " : "") + f.name}</option>)}
+                  </select>
+                  <button onClick={() => { setNewParent(destId); setNewOpen((o) => !o); }} disabled={running} className="px-2 py-1 border border-stone-300 rounded hover:bg-stone-50 shrink-0 disabled:opacity-50">{t("＋ 新建文件夹", "+ New folder")}</button>
+                </div>
+                {newOpen && (
+                  <div className="p-2 rounded border border-amber-300 bg-amber-50 space-y-1.5">
+                    <div className="flex items-center gap-1.5 text-[13px]">{t("放在", "Inside")}
+                      <select value={newParent} onChange={(e) => setNewParent(e.target.value)} className="flex-1 min-w-0 px-1.5 py-0.5 border border-stone-300 rounded bg-white">
+                        {folders.map((f) => <option key={f.id} value={f.id}>{"\u00a0\u00a0".repeat(Math.min(f.depth, 6)) + (f.depth ? "└ " : "") + f.name}</option>)}
+                      </select></div>
+                    <div className="flex gap-1.5">
+                      <input value={newName} onChange={(e) => setNewName(e.target.value)} placeholder={t("新文件夹名称", "New folder name")} className="flex-1 min-w-0 px-2 py-1 border border-stone-300 rounded bg-white" />
+                      <button onClick={makeFolder} disabled={creating || !newName.trim()} className="px-3 py-1 bg-amber-600 text-white rounded hover:bg-amber-700 disabled:opacity-50">{t("创建", "Create")}</button>
+                    </div>
+                  </div>
+                )}
+              </div>
+  );
+
+  return (
+    <div className="fixed inset-0 z-[70] bg-black/40 flex items-center justify-center p-4">
+      <div className="bg-white rounded shadow-2xl border border-stone-300 w-full max-w-xl max-h-[88vh] flex flex-col">
+        <div className="flex items-center px-4 py-2.5 border-b border-stone-200">
+          <div className="font-bold text-stone-800">{t("从 iPhone 导入", "Import from iPhone")}</div>
+          <button onClick={onClose} disabled={running} className="ml-auto p-1 text-stone-600 hover:text-stone-800 disabled:opacity-40"><X size={16} /></button>
+        </div>
+        <div className="flex border-b border-stone-200 text-[13px]">
+          {[["usb", t("照片和视频（USB 数据线）", "Photos & videos (USB cable)")], ["files", t("PDF 和其他文件（Wi-Fi）", "PDFs & other files (Wi-Fi)")]].map(([k, label]) => (
+            <button key={k} onClick={() => setMode(k)} disabled={running}
+              className={"px-4 py-2 border-b-2 disabled:opacity-50 " + (mode === k ? "border-amber-600 text-amber-800 font-semibold" : "border-transparent text-stone-600 hover:text-stone-800")}>{label}</button>
+          ))}
+        </div>
+        <div className="px-4 py-3 overflow-auto space-y-3 text-sm">
+          {mode === "files" ? (
+            <>
+              <div className="text-[13px] text-stone-600">{t("iPhone 的“文件”App 和 iCloud 云盘无法通过数据线读取，请用 Wi-Fi：手机和电脑连同一个 Wi-Fi，然后：", "The iPhone's Files app and iCloud Drive can't be read over the USB cable, so use Wi-Fi: put the phone on the same Wi-Fi as this computer, then:")}</div>
+              {destBlock}
+              <div className="flex gap-3 items-start">
+                <div className="shrink-0 w-[150px] h-[150px] border border-stone-200 rounded flex items-center justify-center bg-white">
+                  {link && link.qr ? <img src={link.qr} alt="QR" className="w-full h-full" />
+                    : linkErr ? <span className="text-xs text-red-700 p-2">{linkErr}</span>
+                    : link ? <span className="text-xs text-stone-500 p-2">{t("无二维码，请手动输入链接", "No QR available — type the link")}</span>
+                    : <Loader size={16} className="animate-spin text-stone-500" />}
+                </div>
+                <ol className="list-decimal pl-5 text-[13px] text-stone-700 space-y-1">
+                  <li>{t("用 iPhone 相机扫描二维码（或在 Safari 输入下方链接）", "Scan the QR code with the iPhone camera (or type the link below in Safari)")}</li>
+                  <li>{t("点“选择文件”，选 PDF 或其他文件（来自“文件”App、iCloud 云盘、下载）", "Tap Choose Files and pick your PDFs or other files (from Files, iCloud Drive, Downloads)")}</li>
+                  <li>{t("点“Upload”。文件会进入上面选定的文件夹。", "Tap Upload. The files arrive in the folder chosen above.")}</li>
+                </ol>
+              </div>
+              {link && (
+                <div className="flex gap-1.5 items-center">
+                  <input readOnly value={link.url} onFocus={(e) => e.target.select()} className="flex-1 min-w-0 px-2 py-1 border border-stone-300 rounded bg-stone-50 text-[12px]" />
+                  <button onClick={() => { try { navigator.clipboard.writeText(link.url); setCopied(true); } catch (e) {} }} className="px-2 py-1 border border-stone-300 rounded hover:bg-stone-50 shrink-0">{copied ? t("已复制", "Copied") : t("复制链接", "Copy link")}</button>
+                </div>
+              )}
+              <div className="text-[12px] text-stone-500">{t("此链接 7 天内有效，只能把文件传到所选文件夹。上传后本窗口外的文件列表会自动刷新。", "The link works for 7 days and can only add files to the chosen folder. New files appear in DMS automatically.")}</div>
+            </>
+          ) : st.state !== "ready" ? (
+            <div className="space-y-2">
+              <ol className="list-decimal pl-5 text-[13px] text-stone-700 space-y-0.5">
+                <li>{t("用数据线连接 iPhone 与电脑", "Connect the iPhone to this computer with its cable")}</li>
+                <li>{t("解锁 iPhone", "Unlock the iPhone")}</li>
+                <li>{t("手机上弹出“信任此电脑”时，点“信任”", "When the phone asks “Trust This Computer?”, tap Trust")}</li>
+              </ol>
+              <div className={"text-xs p-2 rounded border flex items-center gap-2 " + (st.state === "no_lib" || st.state === "no_driver" || st.state === "error" ? "border-red-300 bg-red-50 text-red-700" : "border-amber-300 bg-amber-50 text-amber-900")}>
+                {(st.state === "checking" || stateHelp[st.state]) && <Loader size={13} className="animate-spin shrink-0" />}
+                <span>{stateHelp[st.state] || st.message || t("正在查找 iPhone…", "Looking for your iPhone…")}</span>
+              </div>
+            </div>
+          ) : (
+            <>
+              <div className="text-xs p-2 rounded border border-emerald-300 bg-emerald-50 text-emerald-900">
+                {t("已连接：", "Connected: ")}<strong>{st.name}</strong>{st.ios ? ` · iOS ${st.ios}` : ""}
+              </div>
+              {destBlock}
+              {loadErr && <div className="text-xs p-2 rounded border border-red-300 bg-red-50 text-red-700">{loadErr}</div>}
+              {!items && !loadErr && <div className="text-[13px] text-stone-600 flex items-center gap-2"><Loader size={13} className="animate-spin" />{t("正在读取手机里的照片…", "Reading the photos on your phone…")}</div>}
+              {items && (
+                <>
+                  <div className="text-[13px] text-stone-600">{t(`手机上共有 ${items.length} 个照片/视频。`, `${items.length} photos/videos found on the phone.`)}</div>
+                  <div className="space-y-1.5">
+                    <label className="flex items-center gap-1.5"><input type="radio" checked={scope === "new"} onChange={() => setScope("new")} disabled={running} /> {t("只导入新的（上次之后的）", "Only new ones (not imported before)")}</label>
+                    <label className="flex items-center gap-1.5"><input type="radio" checked={scope === "all"} onChange={() => setScope("all")} disabled={running} /> {t("全部", "Everything")}</label>
+                    <label className="flex items-center gap-1.5 flex-wrap"><input type="radio" checked={scope === "range"} onChange={() => setScope("range")} disabled={running} /> {t("指定日期", "Date range")}
+                      <input type="date" value={from} onChange={(e) => { setFrom(e.target.value); setScope("range"); }} className="px-1.5 py-0.5 border border-stone-300 rounded" disabled={running} />
+                      –
+                      <input type="date" value={to} onChange={(e) => { setTo(e.target.value); setScope("range"); }} className="px-1.5 py-0.5 border border-stone-300 rounded" disabled={running} /></label>
+                  </div>
+                  <div className="flex items-center gap-4">
+                    <label className="flex items-center gap-1.5"><input type="radio" checked={kind === "both"} onChange={() => setKind("both")} disabled={running} /> {t("照片和视频", "Photos & videos")}</label>
+                    <label className="flex items-center gap-1.5"><input type="radio" checked={kind === "photos"} onChange={() => setKind("photos")} disabled={running} /> {t("仅照片", "Photos only")}</label>
+                    <label className="flex items-center gap-1.5"><input type="radio" checked={kind === "videos"} onChange={() => setKind("videos")} disabled={running} /> {t("仅视频", "Videos only")}</label>
+                  </div>
+                  <div className="text-[13px] font-medium text-stone-800">{t(`将导入 ${picked.length} 项（约 ${mb(totalBytes)}）`, `${picked.length} item(s) will be imported (about ${mb(totalBytes)})`)}</div>
+                  <div className="text-[12px] text-stone-500">{t("提示：如果开启了“优化 iPhone 储存空间”，部分原图只在 iCloud 里，无法通过数据线导入。", "Note: with “Optimize iPhone Storage” on, some originals live only in iCloud and can't be copied over the cable.")}</div>
+                </>
+              )}
+            </>
+          )}
+          {running && (
+            <div>
+              <div className="h-2 bg-stone-200 rounded overflow-hidden"><div className="h-full bg-amber-500" style={{ width: pct + "%" }} /></div>
+              <div className="text-[12px] text-stone-600 mt-1 break-all">{prog.done} / {prog.total} · {prog.name} — {t("请勿拔出数据线", "please don't unplug the cable")}</div>
+            </div>
+          )}
+          {result && (
+            <div className={"text-xs p-2 rounded border space-y-1 " + (result.failed ? "border-amber-300 bg-amber-50 text-amber-900" : "border-emerald-300 bg-emerald-50 text-emerald-900")}>
+              <div className="font-medium">{result.cancelled ? t("已停止。", "Stopped. ") : ""}{t(`完成：导入 ${result.ok} 项，失败 ${result.failed} 项。`, `Done: ${result.ok} imported, ${result.failed} failed.`)}</div>
+              {result.lastErr && <div className="text-red-700 break-all">{t("原因：", "Reason: ")}{result.lastErr}</div>}
+              {result.failNames.map((n) => <div key={n} className="break-all">{n}</div>)}
+            </div>
+          )}
+        </div>
+        <div className="px-4 py-2.5 border-t border-stone-200 flex justify-end gap-2">
+          {running
+            ? <button onClick={() => { cancelRef.current = true; }} className={btn}>{t("停止", "Stop")}</button>
+            : <button onClick={onClose} className={btn}>{result ? t("关闭", "Close") : t("取消", "Cancel")}</button>}
+          {mode === "usb" && <button onClick={run} disabled={running || !items || !picked.length || !destId} className="px-3 py-1 text-sm bg-amber-600 text-white rounded hover:bg-amber-700 disabled:opacity-50 flex items-center gap-1.5">
+            {running && <Loader size={13} className="animate-spin" />}{running ? t("导入中…", "Importing…") : t("开始导入", "Import")}
+          </button>}
+        </div>
+      </div>
     </div>
   );
 };
@@ -19097,6 +19400,7 @@ function DMS({ storagePath, onChangeFolder }) {
   const [showQcUploadDialog, setShowQcUploadDialog] = useState(false);
   const [qcReportBusy, setQcReportBusy] = useState(false);
   const [showHeicDialog, setShowHeicDialog] = useState(false);
+  const [showIphoneDialog, setShowIphoneDialog] = useState(false);
   const [verifyDatesQueue, setVerifyDatesQueue] = useState(null); // docs with an auto-detected date to confirm after upload
   // { duplicates, allFiles, targetNodeId, mirror? }. `mirror` is only set
   // for the "upload as sources" flow — { tree, fileNodeId } — where each
@@ -19973,6 +20277,26 @@ function DMS({ storagePath, onChangeFolder }) {
     setSelectedId(newNode.id);
   };
 
+  // Create a subfolder (or return the existing one with that name) without
+  // touching the selection -- used by the Import-from-iPhone dialog.
+  const createFolderUnder = async (parentId, name) => {
+    const parentNode = findNode(tree, parentId);
+    const existing = (parentNode?.children || []).find((c) => c.name === name);
+    if (existing) return existing.id;
+    const newNode = { id: genNodeId(), name, description: "", children: [], documents: [] };
+    const newTree = updateNodeInTree(tree, parentId, (n) => ({
+      ...n,
+      children: [...(n.children || []), newNode].sort((a, b) => {
+        const na = parseInt(a.name, 10), nb = parseInt(b.name, 10);
+        if (!isNaN(na) && !isNaN(nb)) return na - nb;
+        return a.name.localeCompare(b.name);
+      }),
+    }));
+    await persistTree(newTree);
+    setExpandedIds((prev) => new Set([...prev, parentId]));
+    return newNode.id;
+  };
+
   const handleCommitRename = async (nodeId, newName) => {
     const parentNode = findParentNode(tree, nodeId);
     if (parentNode) {
@@ -20455,7 +20779,7 @@ function DMS({ storagePath, onChangeFolder }) {
     // snapshot from before those folders existed, so its diff-and-merge
     // step at the end would never find them and any doc references
     // pointed at them would silently vanish instead of attaching.
-    { skipDuplicates = false, routeMode = "year-month", baseTreeOverride = null, extraText = "", exactName = false, qcReview = null, locationGrouping = null } = {}
+    { skipDuplicates = false, routeMode = "year-month", baseTreeOverride = null, extraText = "", exactName = false, qcReview = null, locationGrouping = null, photoBaseOverride = null } = {}
   ) => {
     console.log(`[DMS] uploadFilesToNode called, target=${targetNodeId}, files=${files.length}, mode=${routeMode}`);
     if (!files.length) return;
@@ -20689,7 +21013,9 @@ function DMS({ storagePath, onChangeFolder }) {
       let photoBaseNodeId = null;
       let photoLocationName = null;
       if (photoDate && routeMode !== "current-folder") {
-        const baseId = photoRootNodeId || effectiveNodeId || workingTree.id;
+        // photoBaseOverride: the caller picked an explicit folder (Import from iPhone),
+        // so Year/Month go inside it rather than under the project's photo root.
+        const baseId = photoBaseOverride || photoRootNodeId || effectiveNodeId || workingTree.id;
         photoBaseNodeId = baseId;
         [workingTree, finalNodeId] = getOrCreateChild(workingTree, baseId, photoDate.year);
         [workingTree, finalNodeId] = getOrCreateChild(workingTree, finalNodeId, photoDate.month);
@@ -22531,6 +22857,13 @@ function DMS({ storagePath, onChangeFolder }) {
                     <Download size={11} /> {t("导出登录信息", "Export logins")}
                   </button>
                   <button
+                    onClick={() => setShowIphoneDialog(true)}
+                    className="text-[13px] px-2 py-1 border border-stone-300 hover:bg-amber-50 hover:border-amber-400 rounded flex items-center gap-1"
+                    title={t("用数据线连接 iPhone，直接导入照片和视频", "Connect an iPhone with a USB cable and import its photos and videos")}
+                  >
+                    <ImageIcon size={11} /> {t("从 iPhone 导入", "Import from iPhone")}
+                  </button>
+                  <button
                     onClick={() => setShowHeicDialog(true)}
                     className="text-[13px] px-2 py-1 border border-stone-300 hover:bg-amber-50 hover:border-amber-400 rounded flex items-center gap-1"
                     title={t("把文件夹中的 iPhone HEIC 照片批量转换为 JPG", "Batch-convert iPhone HEIC photos in a folder to JPG")}
@@ -23860,6 +24193,12 @@ function DMS({ storagePath, onChangeFolder }) {
       )}
 
       {showHeicDialog && <HeicToJpgDialog onClose={() => setShowHeicDialog(false)} />}
+      {showIphoneDialog && tree && (
+        <IphoneImportDialog tree={tree} defaultNodeId={selectedId || tree.id}
+          onImport={(nodeId, files) => uploadFilesToNode(nodeId, files, { skipDuplicates: true, locationGrouping: locSettingsRef.current, photoBaseOverride: nodeId })}
+          onCreateFolder={createFolderUnder}
+          onClose={() => setShowIphoneDialog(false)} />
+      )}
 
       <EqRecordUploadDialog
         mode="qc"

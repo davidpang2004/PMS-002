@@ -2385,6 +2385,39 @@ def create_remote_token():
     return jsonify({"token": token})
 
 
+@app.route("/api/phone-upload-link", methods=["POST"])
+def create_phone_upload_link():
+    """Wi-Fi upload link (+ QR code) for sending files from a phone into one folder.
+
+    Used by the "Import from iPhone" dialog's Files tab: the phone opens the
+    link in Safari, taps Choose Files and picks PDFs/documents from the Files
+    app or iCloud Drive; they land in the chosen folder.
+    Body: {"node_id": "NODE-XXXX"}  Response: {url, qr (PNG data URL or ""), ip}
+    """
+    _purge_expired_tokens()
+    data = request.get_json(silent=True) or {}
+    node_id = (data.get("node_id") or "").strip()
+    token = secrets.token_hex(16)
+    _REMOTE_TOKENS[token] = {"node_id": node_id, "expiry": _time.time() + 7 * 86400}
+    if _tunnel_base_url:
+        base, ip = _tunnel_base_url, ""
+    else:
+        ip = _get_lan_ip()
+        host = request.host
+        port = host.split(":")[-1] if ":" in host else "8765"
+        base = f"http://{ip}:{port}"
+    url = f"{base}/mobile/r/{token}"
+    qr = ""
+    try:
+        import qrcode, io, base64
+        buf = io.BytesIO()
+        qrcode.make(url, box_size=6, border=2).save(buf, format="PNG")
+        qr = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        pass
+    return jsonify({"ok": True, "url": url, "qr": qr, "ip": ip})
+
+
 @app.route("/mobile/r/<token>")
 def remote_mobile_page(token: str):
     """Token-gated mobile upload page for remote access via ngrok."""
@@ -3787,6 +3820,57 @@ def get_heic_to_jpg(job_id):
     if not job:
         return jsonify({"error": "Unknown job"}), 404
     return jsonify(job)
+
+
+# ---- Import from a USB-connected iPhone (see iphone_import.py) ----
+@app.route("/api/iphone/status", methods=["GET"])
+def get_iphone_status():
+    """Is an iPhone plugged in, trusted and unlocked? { state, message, name? ... }"""
+    import iphone_import
+    return jsonify(iphone_import.status())
+
+
+@app.route("/api/iphone/media", methods=["GET"])
+def get_iphone_media():
+    """List the photos/videos in the phone's DCIM folders (newest first)."""
+    import iphone_import
+    udid = (request.args.get("udid") or "").strip()
+    if not udid:
+        return jsonify({"error": "Missing 'udid'"}), 400
+    try:
+        return jsonify({"ok": True, "items": iphone_import.list_media(udid)})
+    except Exception as e:
+        state, msg = iphone_import._classify(e)
+        return jsonify({"error": msg, "state": state}), 500
+
+
+@app.route("/api/iphone/file", methods=["GET"])
+def get_iphone_file():
+    """Stream one DCIM file from the phone (copied to a temp file first)."""
+    import iphone_import
+    import shutil
+    import tempfile
+    udid = (request.args.get("udid") or "").strip()
+    path = (request.args.get("path") or "").strip()
+    if not udid or not path:
+        return jsonify({"error": "Missing 'udid' or 'path'"}), 400
+    tmp = tempfile.mkdtemp(prefix="dms-iphone-")
+    try:
+        local = iphone_import.pull_file(udid, path, tmp)
+    except ValueError as e:
+        shutil.rmtree(tmp, ignore_errors=True)
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        shutil.rmtree(tmp, ignore_errors=True)
+        return jsonify({"error": iphone_import._classify(e)[1]}), 500
+    resp = send_file(local, as_attachment=True, download_name=Path(local).name)
+    if Path(local).suffix.lower() not in (".mov", ".mp4", ".m4v", ".3gp"):
+        # Capture date + GPS read here (the browser can't read them from HEIC);
+        # the dialog hands them to the normal upload so location folders work.
+        import json as _json
+        resp.headers["X-Photo-Meta"] = _json.dumps(iphone_import.photo_meta(local))
+    resp.call_on_close(lambda: shutil.rmtree(tmp, ignore_errors=True))
+    return resp
 
 
 @app.route("/api/browse-folder", methods=["GET"])
