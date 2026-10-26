@@ -16024,7 +16024,7 @@ const ExportImportProgress = ({ progress }) => {
 };
 
 const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onOpenHierarchyImport, onOpenZipImport, onTriggerImport, onOpenEmailSettings, onOpenAISettings, tree }) => {
-  const { t } = useLang();
+  const { t, lang } = useLang();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const [opProgress, setOpProgress] = useState(null); // { label, pct: number|null } while an export/import is running
@@ -16531,7 +16531,7 @@ const ProjectMenu = ({ open, onClose, onProjectChanged, onOpenKeyParameters, onO
           {/* ── Downloads ── */}
           <div className="px-3 pt-2 pb-0.5 text-[12px] font-semibold uppercase tracking-wider text-stone-600">{t("文档下载 Downloads", "Downloads")}</div>
           <a
-            href="/api/download-user-manual"
+            href={"/api/download-user-manual?lang=" + (lang === "en" ? "en" : "zh")}
             download
             onClick={() => onClose()}
             className="w-full text-left px-3 py-2 hover:bg-amber-50 flex items-start gap-2 block"

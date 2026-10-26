@@ -477,6 +477,9 @@ def _doc_display_name_in_use(docs_dir: Path, display_name: str) -> bool:
     )
 
 
+_DOC_ID_TOKEN_RE = re.compile(r"^(?:[0-9a-f]{16}|DOC-\d{8}-[A-Z0-9]+)$")
+
+
 def _doc_id_from_filename(name: str) -> str:
     """Recover the DOC-ID embedded in an on-disk filename, under either
     layout (see _doc_filename): the current "name+DOC-ID.ext" suffix
@@ -485,10 +488,15 @@ def _doc_id_from_filename(name: str) -> str:
     is always the separator) or the older "DOC-ID__name.ext" prefix
     (DOC-ID is everything before the first "__"). Falls back to the bare
     stem if neither separator is present."""
+    stem = Path(name).stem
+    # A display name may itself contain "__" (e.g. a folder name's "#:" is
+    # sanitized to "__"), so recognise the suffix layout first, by the shape
+    # of the token after the last "+", before falling back to the prefix one.
+    if "+" in stem and _DOC_ID_TOKEN_RE.match(stem.rsplit("+", 1)[-1]):
+        return stem.rsplit("+", 1)[-1]
     sep = name.find("__")
     if sep != -1:
         return name[:sep]
-    stem = Path(name).stem
     if "+" in stem:
         return stem.rsplit("+", 1)[-1]
     return stem
@@ -5431,7 +5439,9 @@ def download_user_manual():
     tens of thousands of lines. Bundled as a PyInstaller data file instead
     (see build.py), same as dms.html.
     """
-    manual_path = SCRIPT_DIR / "PMS用户手册_更新版.docx"
+    # ?lang=en serves the English manual; anything else the Chinese one.
+    english = request.args.get("lang", "").lower() == "en"
+    manual_path = SCRIPT_DIR / ("PMS_User_Manual.docx" if english else "PMS用户手册_更新版.docx")
     if not manual_path.exists():
         return jsonify({"error": "User manual file not found"}), 404
     resp = send_file(
@@ -5442,6 +5452,9 @@ def download_user_manual():
     # Flask's auto-generated ASCII fallback filename drops non-ASCII characters
     # entirely (e.g. "PMS.docx"), losing "用户手册"; set an explicit readable
     # fallback for browsers that don't support the UTF-8 filename* form.
+    if english:
+        resp.headers["Content-Disposition"] = 'attachment; filename="DMS_User_Manual_EN.docx"'
+        return resp
     resp.headers["Content-Disposition"] = (
         'attachment; filename="PMS_User_Manual.docx"; '
         "filename*=UTF-8''PMS%E7%94%A8%E6%88%B7%E6%89%8B%E5%86%8C.docx"

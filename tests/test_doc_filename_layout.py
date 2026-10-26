@@ -106,3 +106,12 @@ class SyncDocFilesToTreePathsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_id_recovered_when_display_name_contains_double_underscore():
+    # a folder named "Account #: W-070" is sanitized to "Account __ W-070";
+    # that "__" must not be mistaken for the legacy "DOC-ID__name" separator
+    import dms_server as d
+    name = "US Treasure Direct Yang Account __ W-070-378-171#001+a7e1b09a5d6350fd.png"
+    assert d._doc_id_from_filename(name) == "a7e1b09a5d6350fd"
+    assert d._doc_id_from_filename("DOC-20260811-EEYCEO__a+b.pdf") == "DOC-20260811-EEYCEO"

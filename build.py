@@ -49,6 +49,7 @@ DATA_FILES = [
     ("vendor", "vendor"),          # vendor/ dir → _MEIPASS/vendor/ (offline JS)
     ("deepface_worker.py", "."),   # deepface subprocess worker
     ("PMS用户手册_更新版.docx", "."),  # served by /api/download-user-manual
+    ("PMS_User_Manual.docx", "."),  # English manual, /api/download-user-manual?lang=en
     ("Gemini_API_Key_设置指南.docx", "."),  # served by /api/download-gemini-guide
 ]
 

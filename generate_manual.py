@@ -202,6 +202,7 @@ toc_entries = [
     ("3.6", "Login Credentials (can save multiple sets)"), ("3.7", "Text Tree Preview"),
     ("3.8", "Batch Folder Operations (Multi-select)"), ("3.9", "Setting a Photo Root Folder"),
     ("3.10", "Pasting Screenshots Directly into a Description"),
+    ("3.11", "Export Logins"),
     ("4", "Working with Documents"), ("4.1", "Uploading Files"), ("4.2", "Uploading a Folder"),
     ("4.3", "Pasting Screenshots"), ("4.4", "Linking Existing Documents"),
     ("4.5", "Viewing a Document"), ("4.6", "Downloading, Sending, and Deleting Documents"),
@@ -212,6 +213,7 @@ toc_entries = [
     ("4.13", "Upload Eq Record (AN^SN^PN naming)"), ("4.14", "QC Review and the QC Review Report"),
     ("4.15", "Convert HEIC Photos to JPG"), ("4.16", "PDF Translation, Find Text, and Edit Metadata"),
     ("4.17", "AI: Detect Service Date"),
+    ("4.18", "Grouping Photos into Location Folders"),
     ("5", "OCR - Extract Text from Documents"), ("5.1", "How OCR Works"),
     ("5.2", "Running OCR"), ("5.3", "Saving OCR Text for Search"),
     ("6", "Key Parameter Extraction"), ("6.1", "What Are Key Parameters?"),
@@ -422,7 +424,7 @@ note("For security, passwords are stored encrypted on the server (the key lives 
 h2("3.7  Text Tree Preview")
 para("If you need to copy or export the entire folder structure as plain text (for example, to paste into a chat app or a document), use the text tree feature.")
 numbered("Click the Text Tree button at the top-left of the Tree tab.")
-numbered("The preview window shows the complete folder hierarchy as an ASCII tree.")
+numbered("The preview window shows the folder hierarchy of the currently selected folder (the selected folder is the root, including all its subfolders) as an ASCII tree. Select a different folder in the tree first, then open Text Tree, to see that folder's structure.")
 numbered("Check Show Serial Numbers to append each folder's SN and document count next to its name.")
 numbered("Click Copy to copy the text to the clipboard, or Export .txt to save it as a text file.")
 figure("17_text_tree.png", "Figure 3-6  Text tree preview window")
@@ -450,6 +452,14 @@ bullet("The pasted screenshot is saved as a real image document in the current f
 bullet("Pasting into a Description does not also trigger the \u201cpaste a screenshot as a new document\u201d behavior from section 4.3 - the two don't interfere. Pasting anything else (e.g. formatted text copied from a web page) keeps the plain text only, without its original formatting.")
 bullet("AI Polish and Check Typos only work on the text portion; screenshots already inserted are kept, not lost. When the description is exported as .txt/PDF or shown in search results, each screenshot appears as a \u201c[screenshot]\u201d placeholder.")
 note("A description now stores text plus images. Plain-text descriptions saved by older versions keep working and open without any conversion.")
+
+h2("3.11  Export Logins")
+para("If you have saved website logins in many folders (section 3.6), you can collect all of them into one spreadsheet to review, tidy up or back up separately.")
+numbered("Click Export logins in the document toolbar.")
+numbered("DMS builds an Excel spreadsheet and opens it straight in your default spreadsheet program (Excel, LibreOffice, etc.) - it does not go through a browser download.")
+numbered("Each row is one login. The columns are Folder, Website, User name, Password and Folder description. A folder with several saved logins gets one row per login, and folders appear in tree order.")
+bullet("The Password column is in PLAIN TEXT. The spreadsheet is a temporary file (in a DMS-logins folder inside the system temp directory), so keep it safe or delete it when you are done, and don't forward it.")
+bullet("A password shown as \u201c(cannot decrypt - saved on another computer?)\u201d was saved on a different computer and can't be decrypted here; \u201c(lost - please re-enter in DMS)\u201d means the password was lost and must be typed in again in DMS.")
 page_break()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -482,7 +492,7 @@ add_table(
     ],
     col_widths=[1.5, 5.0]
 )
-tip("For photos, DMS automatically reads the capture date and GPS location from EXIF metadata and stores it with the document; the coordinates are reverse-geocoded into a readable place name automatically whenever you're online.")
+tip("For photos, DMS automatically reads the capture date and GPS location from EXIF metadata and stores it with the document; the coordinates are reverse-geocoded into a readable place name automatically whenever you're online. Photos with a location can also be split one level further, into place folders inside each month - see section 4.18.")
 
 h2("4.2  Uploading a Folder")
 numbered("Select the destination folder in the tree.")
@@ -503,6 +513,7 @@ numbered("Select the destination folder in the Tree tab.")
 numbered("Take a screenshot (or copy an image) to the system clipboard.")
 numbered("Click Paste Screenshot, or simply press Ctrl+V (Windows) / Cmd+V (Mac).")
 numbered("DMS saves the clipboard image as a PDF and adds it to the current folder.")
+para("If the clipboard holds TEXT instead of an image (for example a passage copied from a web page or chat), pasting works too: click Paste Screenshot or press Ctrl+V / Cmd+V and DMS typesets the text into a PDF named \u201cPasted text <date> <time>.pdf\u201d in the current folder. If the clipboard has neither an image nor text, DMS asks you to take a screenshot or copy something first.")
 
 h2("4.4  Linking Existing Documents")
 para("The same document can be linked into multiple folders without duplicating the file on disk.")
@@ -511,6 +522,7 @@ numbered("Click Link Existing Document.")
 numbered("A dialog lists all documents in the system.")
 numbered("Check the document(s) you want and click Add Link.")
 numbered("The document now appears in both the original folder and the new folder.")
+tip("The Link Existing Document dialog has been upgraded: drag its title bar to move the window and drag the divider between the two columns to resize them; the folder tree on the left has Expand all / Collapse all buttons, so you can open folders and tick the documents to link; on the right, Target folders can be ticked, or you can simply drag a document onto a target folder; and a Delete button permanently deletes the selected documents from disk (this cannot be undone - use with care).")
 tip("A faster way: drag a document card onto the target folder in the left-hand tree. Dropping it normally MOVES the document (it leaves its old folder and goes into the target). Hold Alt (Option on a Mac) while dropping to LINK it instead - the document stays in its original folder and also appears in the target, exactly like the steps above without opening the picker. While Alt/Option is held, the target folder highlights blue to show it will be a link, not a move.")
 
 h2("4.5  Viewing a Document")
@@ -628,7 +640,18 @@ h3("Translate (side-by-side)")
 para("Open a PDF and click Translate in the viewer's top toolbar. The right half of the window shows the translation beside the original PDF on the left; the two scroll in sync, so the translation always lines up with the page you're reading.")
 bullet("Translation happens page by page, and only for the pages near what's on screen, so a large file doesn't take forever. If a page fails, click Retry; pages with no text are marked \u201cNo translatable text on this page\u201d.")
 bullet("The top dropdown picks the target language (Chinese by default, with other major languages available); the dropdown on the right picks Gemini or DeepSeek; the - and + buttons change the translation's font size; click the x at top right to close the translation.")
-bullet("Translation needs the matching AI key to be configured (section 6.4). For scanned files with no text layer, run OCR first (chapter 5).")
+bullet("The dropdown on the right now offers three engines: Fast (free) - the default, no AI key needed - plus Gemini and DeepSeek. Gemini and DeepSeek need the matching AI key configured first (section 6.4). For scanned files with no text layer, run OCR first (chapter 5).")
+bullet("If Gemini reports \u201cAPI quota exceeded\u201d, the free quota (usually a daily limit) has run out: retry later, enable billing on the Google project, use another API key, or switch to Fast (free) / DeepSeek.")
+h3("Save the translation as a PDF")
+para("The translation bar has two save buttons. Both translate the WHOLE document and create a new PDF in the same folder as the original, named \u201coriginal name + language\u201d (e.g. \u201cxxx Chinese.pdf\u201d):")
+bullet("Save as PDF - lays the translated text out page by page as a plain-text PDF. Simple and fast.")
+bullet("Save with layout - puts each translation back where the original text was, keeping tables, columns and other layout (needs a PDF with selectable text; may take a minute or two).")
+h3("Original | Translation (saved translations)")
+para("Once a translation is saved, the original and the translated PDF are paired. Open either one and an Original | Translation button appears in the viewer's toolbar: click it to see the original on the left and the saved translation on the right, scrolling in sync. Click it again to leave.")
+h3("Editing a translation (voice input and colours)")
+para("For a saved translation, click Edit at the top of the right-hand pane to correct the text, page by page (cell by cell / paragraph by paragraph for layout translations). You can dictate with the microphone.")
+bullet("Select text in the box, then click a colour in the palette to set a text colour or highlight on the selection; Clear removes the colour from the selected text.")
+bullet("Click Save to write the changes back into the translated PDF, or Cancel to discard them.")
 h3("Search text")
 para("Search text in the viewer's toolbar finds a passage inside the current document using fuzzy matching (about 70% similarity counts as a hit), so it doesn't need to match the original exactly and still works with a few OCR errors; a match can jump straight to its page. Documents with no searchable text prompt you to run OCR first.")
 h3("Edit metadata")
@@ -640,6 +663,21 @@ bullet("Document list toolbar: click AI: Detect service date, tick several PDFs/
 bullet("Folder multi-select mode (see section 3.8): tick some folders and click AI: Detect service date to process every PDF/image in them and all their subfolders.")
 bullet("Progress shows as \u201cDetecting... done/total\u201d. When it finishes, the same confirmation dialog used for upload-time dates opens - nothing is written to a document's date until you review it. Documents where no service date was found don't appear in the dialog; they're only counted in the message.")
 note("This needs a Gemini API key (see section 6.4) and only runs when you trigger it.")
+
+h2("4.18  Grouping Photos into Location Folders")
+para("Photos that carry location data can now be split one level further than year/month (section 4.1): inside each MONTH folder, photos taken within the same radius of each other go into one place folder, named automatically after the place (for example \u201cBoston, Massachusetts\u201d).")
+h3("Setting the radius when you upload")
+numbered("When you upload photos, a confirmation window first appears. Tick Group photos into location folders (inside each month).")
+numbered("Enter a Radius and choose miles or km. The first time it defaults to 10 miles; afterwards DMS remembers the value you used last, so if you don't want to change it just click Upload.")
+numbered("To skip place grouping, untick the box - photos are still filed by year/month.")
+bullet("Photos within the same radius go into the same place folder, centred on the first photo in that folder. Photos with no location stay in the month folder. Phone uploads (chapter 11) follow the same rule.")
+bullet("Place names are looked up in the background after the upload finishes, so uploads aren't slowed down (the progress bar shows \u201cNaming location folders\u201d). If a name can't be found, the folder is temporarily called \u201cLocation 1\u201d, \u201cLocation 2\u201d, ...")
+h3("Not happy with the grouping? Regroup")
+para("A radius that is too large lumps different places together; too small splits one place apart. You can change it any time:")
+numbered("Right-click the folder holding the photos and choose Regroup photos by location...")
+numbered("Enter a new radius and unit; the window previews how many place folders it will produce.")
+numbered("When you're happy, click Regroup. You can tick Also use this radius as the default for future uploads. Repeat as often as you like.")
+tip("This also tidies up photos you uploaded earlier that were never grouped by place. When regrouping, place folders whose names you edited by hand are renamed again; other folders and documents are not affected.")
 page_break()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -784,6 +822,7 @@ figure("07_search.png", "Figure 7-1  Example search results")
 h2("7.3  Opening and Jumping to Results")
 bullet("Click a result card to open the Document Viewer for that document.")
 bullet("Double-click a result card to switch to the Tree tab and jump straight to the folder containing that document.")
+bullet("When a search hit is inside a PDF, the viewer shows a Jump to page N button: click it to go straight to the page of the match, with the matching text highlighted in RED, so you don't have to hunt page by page.")
 
 page_break()
 
@@ -1095,6 +1134,10 @@ add_table(
         [
             "macOS says \u2018cannot verify the developer\u2019",
             "Go to System Settings -> Privacy & Security, find the notice, and click Open Anyway."
+        ],
+        [
+            "Gemini says \u201cAPI quota exceeded\u201d (RESOURCE_EXHAUSTED / 429)",
+            "The free Gemini tier has daily (or per-minute) limits, and the message says roughly when it resets. Retry later, enable billing on the Google project, use another API key, or switch to DeepSeek (section 6.4); for translation you can use Fast (free)."
         ],
         [
             "The browser does not open automatically",
