@@ -1902,6 +1902,7 @@ _PUBLIC_ENDPOINTS = {
     "remote_mobile_browse_page",  # token-gated remote browse page
     "send_gallery_page",    # Send-to-iPhone gallery -- token is the auth
     "send_gallery_file",
+    "send_gallery_list",
     "send_gallery_thumb",
 }
 
@@ -2788,7 +2789,6 @@ def create_send_to_iphone_link():
     if not items:
         return jsonify({"error": "No photos or videos found in that folder."}), 400
     token = secrets.token_hex(16)
-    _SEND_TOKENS[token] = {"items": items, "expiry": _time.time() + _SEND_TOKEN_TTL}
     if _tunnel_base_url:
         base, ip = _tunnel_base_url, ""
     else:
@@ -2796,6 +2796,7 @@ def create_send_to_iphone_link():
         host = request.host
         port = host.split(":")[-1] if ":" in host else "8765"
         base = f"http://{ip}:{port}"
+    _SEND_TOKENS[token] = {"items": items, "base": base, "expiry": _time.time() + _SEND_TOKEN_TTL}
     url = f"{base}/send/{token}"
     qr = ""
     try:
@@ -2852,14 +2853,25 @@ button:disabled{opacity:.5}
 <button id="save" class="p" style="display:none">Save to Photos</button>
 </div><div id="msg">Tap photos to select them.</div></header>
 <div class="help" id="help"></div>
+<div class="help" id="sc" style="background:#fffbeb;border-bottom:1px solid #fcd34d">
+<b>Save ALL to Photos with a Shortcut (one-time setup)</b><br>
+<input id="lu" readonly value="__LISTURL__" style="width:100%;box-sizing:border-box;font-size:12px;padding:6px;margin:6px 0">
+<button id="cp">1. Copy list link</button>
+<ol style="padding-left:18px;margin:8px 0 0">
+<li>Open the <b>Shortcuts</b> app &rarr; <b>+</b> &rarr; name it "DMS Photos".</li>
+<li>Add actions in this order: <b>Get Clipboard</b> &rarr; <b>Get Contents of URL</b> (URL = Clipboard) &rarr; <b>Split Text</b> (Contents of URL, by New Lines) &rarr; <b>Repeat with Each</b> (Split Text) &rarr; inside it: <b>Get Contents of URL</b> (Repeat Item) and <b>Save to Photo Album</b> (Contents of URL, Recents).</li>
+<li>Next time: tap Copy list link above, then run the shortcut. All photos and videos are saved.</li>
+</ol></div>
 <div class="grid" id="g"></div>
 <script>
 var T="__TOKEN__",ITEMS=__ITEMS__,sel={},files=[];
 var g=document.getElementById("g"),msg=document.getElementById("msg");
 var canShare=!!(navigator.canShare&&navigator.share);
-document.getElementById("help").textContent=canShare
- ?"Select photos, tap Prepare, then Save to Photos."
- :"Select photos and tap Prepare, or press and hold a single photo and choose Add to Photos (videos: tap Open, then Share > Save Video).";
+document.getElementById("cp").onclick=function(){var i=document.getElementById("lu");i.focus();i.select();i.setSelectionRange(0,9999);
+ var ok=false;try{ok=document.execCommand("copy")}catch(e){}msg.textContent=ok?"List link copied.":"Press and hold the link box to copy it."};
+if(canShare){document.getElementById("help").textContent="Select photos, tap Prepare, then Save to Photos."}
+else{document.getElementById("help").textContent="Tap a photo to open it, then press and hold it and choose Add to Photos. To save many at once use the Shortcut below.";
+ ["all","prep"].forEach(function(x){document.getElementById(x).style.display="none"});msg.textContent="";}
 function n(){return Object.keys(sel).length}
 function upd(){var b=document.getElementById("prep");b.disabled=!n();b.textContent=n()?"Prepare "+n():"Prepare";
  document.getElementById("save").style.display="none";files=[]}
@@ -2869,6 +2881,7 @@ ITEMS.forEach(function(it,i){
  var k=document.createElement("div");k.className="k";
  d.appendChild(im);d.appendChild(k);
  if(it.video){var v=document.createElement("div");v.className="v";v.textContent="video";d.appendChild(v)}
+ if(!canShare){var a=document.createElement("a");a.href="/send/"+T+"/file/"+it.id+"/"+encodeURIComponent(it.name);a.target="_blank";a.appendChild(im);d.appendChild(a);d.removeChild(k);g.appendChild(d);return}
  d.onclick=function(){if(sel[it.id]){delete sel[it.id];d.classList.remove("on");k.textContent=""}
   else{sel[it.id]=1;d.classList.add("on");k.textContent="✓"}upd()};
  g.appendChild(d)});
@@ -2899,6 +2912,7 @@ def send_gallery_page(token: str):
     html = (_SEND_GALLERY_HTML
             .replace("__COUNT__", str(len(info["items"])))
             .replace("__TOKEN__", token)
+            .replace("__LISTURL__", f"{info['base']}/send/{token}/list.txt")
             .replace("__ITEMS__", json.dumps(info["items"]).replace("</", "<\\/")))
     resp = Response(html, mimetype="text/html")
     resp.headers["Cache-Control"] = "no-store"
@@ -2917,8 +2931,23 @@ def _send_resolve(token: str, doc_id: str):
     return item, matches[0]
 
 
+@app.route("/send/<token>/list.txt")
+def send_gallery_list(token: str):
+    """One absolute file URL per line, for the iOS 'save all' Shortcut. The
+    trailing file name gives Shortcuts the extension (jpg/heic/mov)."""
+    from urllib.parse import quote
+    info = _send_token_info(token)
+    if not info:
+        abort(404)
+    lines = [f"{info['base']}/send/{token}/file/{i['id']}/{quote(i['name'])}" for i in info["items"]]
+    resp = Response("\n".join(lines), mimetype="text/plain")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 @app.route("/send/<token>/file/<doc_id>")
-def send_gallery_file(token: str, doc_id: str):
+@app.route("/send/<token>/file/<doc_id>/<path:_name>")
+def send_gallery_file(token: str, doc_id: str, _name: str = ""):
     item, path = _send_resolve(token, doc_id)
     mime = mimetypes.guess_type(item["name"])[0] or mimetypes.guess_type(str(path))[0] or "application/octet-stream"
     if path.suffix.lower() in (".heic", ".heif"):
