@@ -1903,6 +1903,7 @@ _PUBLIC_ENDPOINTS = {
     "send_gallery_page",    # Send-to-iPhone gallery -- token is the auth
     "send_gallery_file",
     "send_gallery_list",
+    "send_shortcut_file",
     "send_gallery_thumb",
 }
 
@@ -2854,21 +2855,18 @@ button:disabled{opacity:.5}
 </div><div id="msg">Tap photos to select them.</div></header>
 <div class="help" id="help"></div>
 <div class="help" id="sc" style="background:#fffbeb;border-bottom:1px solid #fcd34d">
-<b>Save ALL to Photos with a Shortcut (one-time setup)</b><br>
-<input id="lu" readonly value="__LISTURL__" style="width:100%;box-sizing:border-box;font-size:12px;padding:6px;margin:6px 0">
-<button id="cp">1. Copy list link</button>
-<ol style="padding-left:18px;margin:8px 0 0">
-<li>Open the <b>Shortcuts</b> app &rarr; <b>+</b> &rarr; name it "DMS Photos".</li>
-<li>Add actions in this order: <b>Get Clipboard</b> &rarr; <b>Get Contents of URL</b> (URL = Clipboard) &rarr; <b>Split Text</b> (Contents of URL, by New Lines) &rarr; <b>Repeat with Each</b> (Split Text) &rarr; inside it: <b>Get Contents of URL</b> (Repeat Item) and <b>Save to Photo Album</b> (Contents of URL, Recents).</li>
-<li>Next time: tap Copy list link above, then run the shortcut. All photos and videos are saved.</li>
-</ol></div>
+<b>Save ALL to Photos</b><br>
+<div style="margin:8px 0"><button id="runsc" class="p">Save all to Photos</button></div>
+First time only: <a id="inst" href="/send/DMS-Photos.shortcut">install the free DMS Photos shortcut</a>
+(tap it, then <b>Add Shortcut</b>), then come back to this page and press the button.
+</div>
 <div class="grid" id="g"></div>
 <script>
 var T="__TOKEN__",ITEMS=__ITEMS__,sel={},files=[];
 var g=document.getElementById("g"),msg=document.getElementById("msg");
 var canShare=!!(navigator.canShare&&navigator.share);
-document.getElementById("cp").onclick=function(){var i=document.getElementById("lu");i.focus();i.select();i.setSelectionRange(0,9999);
- var ok=false;try{ok=document.execCommand("copy")}catch(e){}msg.textContent=ok?"List link copied.":"Press and hold the link box to copy it."};
+document.getElementById("runsc").onclick=function(){
+ location.href="shortcuts://run-shortcut?name="+encodeURIComponent("DMS Photos")+"&input=text&text="+encodeURIComponent("__LISTURL__")};
 if(canShare){document.getElementById("help").textContent="Select photos, tap Prepare, then Save to Photos."}
 else{document.getElementById("help").textContent="Tap a photo to open it, then press and hold it and choose Add to Photos. To save many at once use the Shortcut below.";
  ["all","prep"].forEach(function(x){document.getElementById(x).style.display="none"});msg.textContent="";}
@@ -2929,6 +2927,16 @@ def _send_resolve(token: str, doc_id: str):
     if not matches:
         abort(404)
     return item, matches[0]
+
+
+@app.route("/send/DMS-Photos.shortcut")
+def send_shortcut_file():
+    """The signed iOS shortcut that saves a whole list.txt of photos to Photos."""
+    path = SCRIPT_DIR / "assets" / "DMS-Photos.shortcut"
+    if not path.is_file():
+        abort(404)
+    return send_file(path, mimetype="application/vnd.apple.shortcut",
+                     download_name="DMS-Photos.shortcut", as_attachment=False)
 
 
 @app.route("/send/<token>/list.txt")

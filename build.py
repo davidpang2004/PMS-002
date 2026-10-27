@@ -48,6 +48,7 @@ DATA_FILES = [
     ("dms.html", "."),             # dms.html → _MEIPASS/dms.html
     ("vendor", "vendor"),          # vendor/ dir → _MEIPASS/vendor/ (offline JS)
     ("deepface_worker.py", "."),   # deepface subprocess worker
+    ("assets", "assets"),          # signed iOS shortcut served by /send/DMS-Photos.shortcut
     ("PMS用户手册_更新版.docx", "."),  # served by /api/download-user-manual
     ("PMS_User_Manual.docx", "."),  # English manual, /api/download-user-manual?lang=en
     ("Gemini_API_Key_设置指南.docx", "."),  # served by /api/download-gemini-guide
@@ -317,6 +318,12 @@ def build_pyinstaller_command() -> list[str]:
         # On Windows: --windowed prevents a console window from appearing
         cmd.append("--windowed")
         cmd.append("--onefile")  # Single .exe is much friendlier on Windows
+        # Unpack into an app-owned folder rather than %TEMP%: temp cleaners
+        # and Storage Sense (especially on a nearly full disk) delete the
+        # unpacked files the running app hasn't loaded yet, e.g. pillow_heif's
+        # native module, which broke HEIC thumbnails. The bootloader expands
+        # %VAR% here on Windows.
+        cmd.extend(["--runtime-tmpdir", r"%LOCALAPPDATA%\DMS\runtime"])
         if WIN_ICON.exists():
             cmd.extend(["--icon", str(WIN_ICON)])
         # Bundle cloudflared.exe so users never need to download it at runtime.
