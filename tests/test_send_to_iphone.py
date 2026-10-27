@@ -42,10 +42,6 @@ class SendToIphoneTests(unittest.TestCase):
             self.assertEqual(len(lst), 2)
             self.assertTrue(lst[0].startswith("http://") and lst[0].endswith("/a.jpg"))
             self.assertEqual(c.get("/send/%s/file/DOC-20260101-AAAAAA/a.jpg" % token).data, b"JPEGDATA")
-            sc = c.get("/send/DMS-Photos.shortcut")
-            self.assertEqual(sc.status_code, 200)
-            self.assertIn("DMS Photos.shortcut", sc.headers["Content-Disposition"])
-            self.assertIn("shortcuts://run-shortcut", c.get(f"/send/{token}").get_data(as_text=True))
             # not part of the token (a PDF) -> 404; bad token -> 410
             self.assertEqual(c.get(f"/send/{token}/file/DOC-20260101-BBBBBB").status_code, 404)
             self.assertEqual(c.get("/send/nope").status_code, 410)

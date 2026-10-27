@@ -8251,7 +8251,6 @@ const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onC
                 <ol className="list-decimal pl-5 text-[13px] text-stone-700 space-y-1">
                   <li>{t("用 iPhone 相机扫描二维码（或在 Safari 输入下方链接）", "Scan the QR code with the iPhone camera (or type the link below in Safari)")}</li>
                   <li>{t("单张：点照片打开，长按选“添加到照片”", "One photo: tap it to open, press and hold, choose Add to Photos")}</li>
-                  <li>{t("全部：点页面上的“Save all to Photos”。第一次需先点页面里的链接安装“DMS Photos”快捷指令（点“添加快捷指令”即可）", "All at once: tap “Save all to Photos” on the page. The first time, tap the page's link to install the free “DMS Photos” shortcut (just tap Add Shortcut)")}</li>
                 </ol>
               </div>
               {sendLink && (
@@ -8263,7 +8262,7 @@ const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onC
                   </div>
                 </>
               )}
-              <div className="text-[12px] text-stone-500">{t("链接 24 小时内有效（重启 DMS 后失效），只能查看所选文件夹里的照片和视频。", "The link works for 24 hours (or until DMS restarts) and only exposes the photos and videos listed above. Safari can only save one photo at a time over plain Wi-Fi links; the Shortcut on the page saves them all.")}</div>
+              <div className="text-[12px] text-stone-500">{t("链接 24 小时内有效（重启 DMS 后失效），只能查看所选文件夹里的照片和视频。", "The link works for 24 hours (or until DMS restarts) and only exposes the photos and videos listed above. Over plain Wi-Fi links Safari can only save one photo at a time.")}</div>
             </>
           ) : mode === "files" ? (
             <>

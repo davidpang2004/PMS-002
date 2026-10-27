@@ -1903,7 +1903,6 @@ _PUBLIC_ENDPOINTS = {
     "send_gallery_page",    # Send-to-iPhone gallery -- token is the auth
     "send_gallery_file",
     "send_gallery_list",
-    "send_shortcut_file",
     "send_gallery_thumb",
 }
 
@@ -2854,24 +2853,13 @@ button:disabled{opacity:.5}
 <button id="save" class="p" style="display:none">Save to Photos</button>
 </div><div id="msg">Tap photos to select them.</div></header>
 <div class="help" id="help"></div>
-<div class="help" id="sc" style="background:#fffbeb;border-bottom:1px solid #fcd34d">
-<b>Save ALL to Photos</b><br>
-<div style="margin:8px 0"><button id="runsc" class="p">Save all to Photos</button></div>
-First time only: <a id="inst" href="#">install the free DMS Photos shortcut</a>
-(then tap <b>Add Shortcut</b>) and come back to this page.
-<div style="margin-top:6px;font-size:12px">Not working? <a href="/send/DMS-Photos.shortcut">Download the file</a>, tap
-the download icon in Safari's address bar, open the file, and choose <b>Shortcuts</b> &rarr; <b>Add Shortcut</b>.</div>
-</div>
 <div class="grid" id="g"></div>
 <script>
 var T="__TOKEN__",ITEMS=__ITEMS__,sel={},files=[];
 var g=document.getElementById("g"),msg=document.getElementById("msg");
 var canShare=!!(navigator.canShare&&navigator.share);
-document.getElementById("inst").href="shortcuts://import-shortcut?name="+encodeURIComponent("DMS Photos")+"&url="+encodeURIComponent(location.origin+"/send/DMS-Photos.shortcut");
-document.getElementById("runsc").onclick=function(){
- location.href="shortcuts://run-shortcut?name="+encodeURIComponent("DMS Photos")+"&input=text&text="+encodeURIComponent("__LISTURL__")};
 if(canShare){document.getElementById("help").textContent="Select photos, tap Prepare, then Save to Photos."}
-else{document.getElementById("help").textContent="Tap a photo to open it, then press and hold it and choose Add to Photos. To save many at once use the Shortcut below.";
+else{document.getElementById("help").textContent="Tap a photo to open it, then press and hold it and choose Add to Photos.";
  ["all","prep"].forEach(function(x){document.getElementById(x).style.display="none"});msg.textContent="";}
 function n(){return Object.keys(sel).length}
 function upd(){var b=document.getElementById("prep");b.disabled=!n();b.textContent=n()?"Prepare "+n():"Prepare";
@@ -2930,17 +2918,6 @@ def _send_resolve(token: str, doc_id: str):
     if not matches:
         abort(404)
     return item, matches[0]
-
-
-@app.route("/send/DMS-Photos.shortcut")
-def send_shortcut_file():
-    """The signed iOS shortcut that saves a whole list.txt of photos to Photos."""
-    path = SCRIPT_DIR / "assets" / "DMS-Photos.shortcut"
-    if not path.is_file():
-        abort(404)
-    return send_file(path, mimetype="application/vnd.apple.shortcut",
-                     download_name="DMS Photos.shortcut",  # becomes the shortcut's name, which the page runs
-                     as_attachment=False)
 
 
 @app.route("/send/<token>/list.txt")
