@@ -2857,14 +2857,17 @@ button:disabled{opacity:.5}
 <div class="help" id="sc" style="background:#fffbeb;border-bottom:1px solid #fcd34d">
 <b>Save ALL to Photos</b><br>
 <div style="margin:8px 0"><button id="runsc" class="p">Save all to Photos</button></div>
-First time only: <a id="inst" href="/send/DMS-Photos.shortcut">install the free DMS Photos shortcut</a>
-(tap it, then <b>Add Shortcut</b>), then come back to this page and press the button.
+First time only: <a id="inst" href="#">install the free DMS Photos shortcut</a>
+(then tap <b>Add Shortcut</b>) and come back to this page.
+<div style="margin-top:6px;font-size:12px">Not working? <a href="/send/DMS-Photos.shortcut">Download the file</a>, tap
+the download icon in Safari's address bar, open the file, and choose <b>Shortcuts</b> &rarr; <b>Add Shortcut</b>.</div>
 </div>
 <div class="grid" id="g"></div>
 <script>
 var T="__TOKEN__",ITEMS=__ITEMS__,sel={},files=[];
 var g=document.getElementById("g"),msg=document.getElementById("msg");
 var canShare=!!(navigator.canShare&&navigator.share);
+document.getElementById("inst").href="shortcuts://import-shortcut?name="+encodeURIComponent("DMS Photos")+"&url="+encodeURIComponent(location.origin+"/send/DMS-Photos.shortcut");
 document.getElementById("runsc").onclick=function(){
  location.href="shortcuts://run-shortcut?name="+encodeURIComponent("DMS Photos")+"&input=text&text="+encodeURIComponent("__LISTURL__")};
 if(canShare){document.getElementById("help").textContent="Select photos, tap Prepare, then Save to Photos."}
