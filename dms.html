@@ -8025,6 +8025,9 @@ const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onC
   const [link, setLink] = useState(null);
   const [linkErr, setLinkErr] = useState("");
   const [copied, setCopied] = useState(false);
+  const [sendLink, setSendLink] = useState(null);   // "send" tab: computer -> iPhone gallery link
+  const [sendErr, setSendErr] = useState("");
+  const [sendSub, setSendSub] = useState(true);     // include subfolders
   const onImportRef = useRef(onImport);
   onImportRef.current = onImport;      // always the latest render's closure (tree changes mid-import)
   const makeFolder = async () => {
@@ -8162,6 +8165,22 @@ const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onC
     return () => { dead = true; };
   }, [mode, destId]);
 
+  // Send tab: a gallery link for the chosen folder's photos/videos.
+  useEffect(() => {
+    if (mode !== "send" || !destId) return;
+    let dead = false;
+    setSendLink(null); setSendErr(""); setCopied(false);
+    (async () => {
+      try {
+        const r = await fetch(API_BASE + "/api/send-to-iphone-link", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ node_id: destId, recursive: sendSub, kind }) });
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error || "Could not create the link");
+        if (!dead) setSendLink(j);
+      } catch (e) { if (!dead) setSendErr(e.message || String(e)); }
+    })();
+    return () => { dead = true; };
+  }, [mode, destId, sendSub, kind]);
+
   const stateHelp = {
     no_device: t("请用数据线把 iPhone 连接到这台电脑，并解锁手机。", "Plug your iPhone into this computer with its USB cable and unlock the phone."),
     not_trusted: t("请在 iPhone 上点“信任”（如需要，输入手机密码）。", "On your iPhone, tap “Trust” (enter its passcode if asked)."),
@@ -8201,13 +8220,52 @@ const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onC
           <button onClick={onClose} disabled={running} className="ml-auto p-1 text-stone-600 hover:text-stone-800 disabled:opacity-40"><X size={16} /></button>
         </div>
         <div className="flex border-b border-stone-200 text-[13px]">
-          {[["usb", t("照片和视频（USB 数据线）", "Photos & videos (USB cable)")], ["files", t("PDF 和其他文件（Wi-Fi）", "PDFs & other files (Wi-Fi)")]].map(([k, label]) => (
+          {[["usb", t("照片和视频（USB 数据线）", "Photos & videos (USB cable)")], ["files", t("PDF 和其他文件（Wi-Fi）", "PDFs & other files (Wi-Fi)")], ["send", t("发送到 iPhone（Wi-Fi）", "Send to iPhone (Wi-Fi)")]].map(([k, label]) => (
             <button key={k} onClick={() => setMode(k)} disabled={running}
               className={"px-4 py-2 border-b-2 disabled:opacity-50 " + (mode === k ? "border-amber-600 text-amber-800 font-semibold" : "border-transparent text-stone-600 hover:text-stone-800")}>{label}</button>
           ))}
         </div>
         <div className="px-4 py-3 overflow-auto space-y-3 text-sm">
-          {mode === "files" ? (
+          {mode === "send" ? (
+            <>
+              <div className="text-[13px] text-stone-600">{t("把电脑上的照片和视频发到 iPhone：手机和电脑连同一个 Wi-Fi，然后选择要发送的文件夹：", "Send photos and videos from this computer to the iPhone: put the phone on the same Wi-Fi as this computer, then choose the folder to send:")}</div>
+              <div className="space-y-1.5">
+                <div className="font-bold text-stone-700">{t("发送此文件夹中的照片", "Send photos from folder")}</div>
+                <select value={destId} onChange={(e) => setDestId(e.target.value)} className="w-full px-2 py-1 border border-stone-300 rounded bg-white">
+                  {folders.map((f) => <option key={f.id} value={f.id}>{"\u00a0\u00a0".repeat(Math.min(f.depth, 6)) + (f.depth ? "└ " : "") + f.name}</option>)}
+                </select>
+                <label className="flex items-center gap-1.5"><input type="checkbox" checked={sendSub} onChange={(e) => setSendSub(e.target.checked)} /> {t("包含子文件夹", "Include subfolders")}</label>
+                <div className="flex items-center gap-4">
+                  <label className="flex items-center gap-1.5"><input type="radio" checked={kind === "both"} onChange={() => setKind("both")} /> {t("照片和视频", "Photos & videos")}</label>
+                  <label className="flex items-center gap-1.5"><input type="radio" checked={kind === "photos"} onChange={() => setKind("photos")} /> {t("仅照片", "Photos only")}</label>
+                  <label className="flex items-center gap-1.5"><input type="radio" checked={kind === "videos"} onChange={() => setKind("videos")} /> {t("仅视频", "Videos only")}</label>
+                </div>
+              </div>
+              <div className="flex gap-3 items-start">
+                <div className="shrink-0 w-[150px] h-[150px] border border-stone-200 rounded flex items-center justify-center bg-white">
+                  {sendLink && sendLink.qr ? <img src={sendLink.qr} alt="QR" className="w-full h-full" />
+                    : sendErr ? <span className="text-xs text-red-700 p-2">{sendErr}</span>
+                    : sendLink ? <span className="text-xs text-stone-500 p-2">{t("无二维码，请手动输入链接", "No QR available — type the link")}</span>
+                    : <Loader size={16} className="animate-spin text-stone-500" />}
+                </div>
+                <ol className="list-decimal pl-5 text-[13px] text-stone-700 space-y-1">
+                  <li>{t("用 iPhone 相机扫描二维码（或在 Safari 输入下方链接）", "Scan the QR code with the iPhone camera (or type the link below in Safari)")}</li>
+                  <li>{t("点选要保存的照片，再点“Prepare”", "Tap the photos you want, then tap Prepare")}</li>
+                  <li>{t("点“Save to Photos”，选“存储图像”。（若无此按钮：长按照片，选“添加到照片”）", "Tap Save to Photos and choose Save Image. (If the button isn't offered: press and hold a photo and choose Add to Photos.)")}</li>
+                </ol>
+              </div>
+              {sendLink && (
+                <>
+                  <div className="text-[13px] font-medium text-stone-800">{t(`共 ${sendLink.count} 项（${sendLink.photos} 张照片，${sendLink.videos} 个视频）`, `${sendLink.count} item(s) ready (${sendLink.photos} photos, ${sendLink.videos} videos)`)}</div>
+                  <div className="flex gap-1.5 items-center">
+                    <input readOnly value={sendLink.url} onFocus={(e) => e.target.select()} className="flex-1 min-w-0 px-2 py-1 border border-stone-300 rounded bg-stone-50 text-[12px]" />
+                    <button onClick={() => { try { navigator.clipboard.writeText(sendLink.url); setCopied(true); } catch (e) {} }} className="px-2 py-1 border border-stone-300 rounded hover:bg-stone-50 shrink-0">{copied ? t("已复制", "Copied") : t("复制链接", "Copy link")}</button>
+                  </div>
+                </>
+              )}
+              <div className="text-[12px] text-stone-500">{t("链接 24 小时内有效（重启 DMS 后失效），只能查看所选文件夹里的照片和视频。", "The link works for 24 hours (or until DMS restarts) and only exposes the photos and videos listed above. iOS can only save to Photos from Safari one tap at a time over plain Wi-Fi links; with a secure (https) link it can save many at once.")}</div>
+            </>
+          ) : mode === "files" ? (
             <>
               <div className="text-[13px] text-stone-600">{t("iPhone 的“文件”App 和 iCloud 云盘无法通过数据线读取，请用 Wi-Fi：手机和电脑连同一个 Wi-Fi，然后：", "The iPhone's Files app and iCloud Drive can't be read over the USB cable, so use Wi-Fi: put the phone on the same Wi-Fi as this computer, then:")}</div>
               {destBlock}

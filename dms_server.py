@@ -67,6 +67,18 @@ except ImportError:
     print("    python3 -m pip install flask")
     sys.exit(1)
 
+# Load pillow_heif (HEIC/HEIF decoding for thumbnails/previews) at startup
+# instead of lazily on the first HEIC request. In the Windows --onefile build
+# its native _pillow_heif.pyd + libheif DLLs are unpacked to a temp folder;
+# temp cleaners / Storage Sense delete any unpacked file that isn't loaded,
+# so a lazy import later failed with "No module named '_pillow_heif'" and
+# every HEIC thumbnail broke. Loading now keeps those files locked in use.
+try:
+    import pillow_heif as _pillow_heif_mod
+    _pillow_heif_mod.register_heif_opener()
+except Exception as _heif_err:  # optional dependency
+    print(f"[DMS] pillow_heif unavailable -- HEIC previews disabled: {_heif_err}")
+
 
 # ---------------------------------------------------------------------------
 # Configuration — where the server stores its own settings (NOT documents)
@@ -1888,6 +1900,9 @@ _PUBLIC_ENDPOINTS = {
     "download_token",       # one-time download links sent to phone
     "mobile_browse_page",         # browse page handles its own auth in JS
     "remote_mobile_browse_page",  # token-gated remote browse page
+    "send_gallery_page",    # Send-to-iPhone gallery -- token is the auth
+    "send_gallery_file",
+    "send_gallery_thumb",
 }
 
 # Endpoints that switch (or just inspect) which project is active. These must
@@ -2693,6 +2708,249 @@ def remote_mobile_browse_page(token: str):
     resp.headers["Pragma"] = "no-cache"
     resp.headers["Expires"] = "0"
     return resp
+
+
+# ---- Send to iPhone (computer -> phone over Wi-Fi) ---------------------------
+# The Import-from-iPhone dialog's third tab. The user picks a folder; we mint a
+# token bound to that folder's photo/video doc ids, and the phone opens a
+# gallery page from the QR code and saves the items to its Photos app.
+_SEND_TOKENS: dict[str, dict] = {}
+_SEND_TOKEN_TTL = 24 * 3600
+_SEND_MEDIA_EXTS = {
+    ".jpg", ".jpeg", ".png", ".gif", ".heic", ".heif", ".webp", ".tif", ".tiff", ".bmp",
+    ".mov", ".mp4", ".m4v", ".3gp",
+}
+_SEND_VIDEO_EXTS = {".mov", ".mp4", ".m4v", ".3gp"}
+
+
+def _send_collect_media(node_id: str, recursive: bool) -> list:
+    """[{id, name, video}] for the photo/video docs in a folder (optionally its subfolders)."""
+    idx = read_index()
+    meta = {d.get("id"): d for d in idx.get("docIndex", [])}
+
+    def find(n):
+        if n.get("id") == node_id:
+            return n
+        for c in n.get("children") or []:
+            r = find(c)
+            if r:
+                return r
+        return None
+
+    root = find(idx.get("tree") or {})
+    if not root:
+        return []
+    out, seen = [], set()
+
+    def walk(n, top):
+        if top or recursive:
+            for ref in n.get("documents") or []:
+                did = ref.get("id")
+                m = meta.get(did)
+                if not m or did in seen:
+                    continue
+                ext = os.path.splitext(m.get("name") or "")[1].lower()
+                mime = (m.get("mime") or "").lower()
+                is_video = ext in _SEND_VIDEO_EXTS or mime.startswith("video/")
+                if ext in _SEND_MEDIA_EXTS or mime.startswith("image/") or is_video:
+                    seen.add(did)
+                    out.append({"id": did, "name": m.get("name") or did, "video": is_video})
+        if recursive:
+            for c in n.get("children") or []:
+                walk(c, False)
+
+    walk(root, True)
+    return out
+
+
+def _purge_expired_send_tokens() -> None:
+    now = _time.time()
+    for t in [t for t, i in _SEND_TOKENS.items() if i["expiry"] < now]:
+        del _SEND_TOKENS[t]
+
+
+@app.route("/api/send-to-iphone-link", methods=["POST"])
+def create_send_to_iphone_link():
+    """Wi-Fi link (+ QR) that lets a phone fetch a folder's photos/videos.
+
+    Body: {"node_id": "NODE-XXXX", "recursive": bool, "kind": "both|photos|videos"}
+    Response: {url, qr, ip, count, photos, videos}
+    """
+    _purge_expired_send_tokens()
+    data = request.get_json(silent=True) or {}
+    node_id = (data.get("node_id") or "").strip()
+    kind = data.get("kind") or "both"
+    items = _send_collect_media(node_id, bool(data.get("recursive")))
+    if kind == "photos":
+        items = [i for i in items if not i["video"]]
+    elif kind == "videos":
+        items = [i for i in items if i["video"]]
+    if not items:
+        return jsonify({"error": "No photos or videos found in that folder."}), 400
+    token = secrets.token_hex(16)
+    _SEND_TOKENS[token] = {"items": items, "expiry": _time.time() + _SEND_TOKEN_TTL}
+    if _tunnel_base_url:
+        base, ip = _tunnel_base_url, ""
+    else:
+        ip = _get_lan_ip()
+        host = request.host
+        port = host.split(":")[-1] if ":" in host else "8765"
+        base = f"http://{ip}:{port}"
+    url = f"{base}/send/{token}"
+    qr = ""
+    try:
+        import qrcode, io, base64
+        buf = io.BytesIO()
+        qrcode.make(url, box_size=6, border=2).save(buf, format="PNG")
+        qr = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        pass
+    videos = sum(1 for i in items if i["video"])
+    return jsonify({"ok": True, "url": url, "qr": qr, "ip": ip, "count": len(items),
+                    "photos": len(items) - videos, "videos": videos})
+
+
+def _send_token_info(token: str):
+    info = _SEND_TOKENS.get(token)
+    if not info or _time.time() > info["expiry"]:
+        return None
+    return info
+
+
+_SEND_EXPIRED_HTML = (
+    "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'></head>"
+    "<body style='font-family:sans-serif;padding:40px'><h2>Link expired</h2>"
+    "<p>This link has expired or DMS was restarted. Create a new one in DMS.</p></body></html>"
+)
+
+_SEND_GALLERY_HTML = r"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DMS &rarr; iPhone</title>
+<style>
+body{font-family:-apple-system,sans-serif;margin:0;background:#f5f5f4;color:#1c1917}
+header{position:sticky;top:0;background:#fff;border-bottom:1px solid #d6d3d1;padding:10px 12px;z-index:5}
+h1{font-size:17px;margin:0 0 6px}
+.bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+button{font-size:15px;padding:8px 12px;border-radius:8px;border:1px solid #d6d3d1;background:#fff}
+button.p{background:#d97706;color:#fff;border-color:#d97706}
+button:disabled{opacity:.5}
+#msg{font-size:13px;color:#57534e;margin-top:6px}
+.help{font-size:13px;color:#57534e;padding:8px 12px}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:3px;padding:3px}
+.c{position:relative;aspect-ratio:1;background:#e7e5e4;overflow:hidden}
+.c img{width:100%;height:100%;object-fit:cover;display:block}
+.c .v{position:absolute;left:4px;bottom:4px;background:rgba(0,0,0,.6);color:#fff;font-size:11px;padding:1px 5px;border-radius:4px}
+.c .k{position:absolute;right:4px;top:4px;width:22px;height:22px;border-radius:50%;border:2px solid #fff;background:rgba(0,0,0,.25);color:#fff;text-align:center;line-height:20px;font-size:14px}
+.c.on .k{background:#d97706}
+.c.on img{opacity:.7}
+</style></head><body>
+<header><h1>Photos from DMS (__COUNT__)</h1>
+<div class="bar">
+<button id="all">Select all</button>
+<button id="prep" class="p" disabled>Prepare</button>
+<button id="save" class="p" style="display:none">Save to Photos</button>
+</div><div id="msg">Tap photos to select them.</div></header>
+<div class="help" id="help"></div>
+<div class="grid" id="g"></div>
+<script>
+var T="__TOKEN__",ITEMS=__ITEMS__,sel={},files=[];
+var g=document.getElementById("g"),msg=document.getElementById("msg");
+var canShare=!!(navigator.canShare&&navigator.share);
+document.getElementById("help").textContent=canShare
+ ?"Select photos, tap Prepare, then Save to Photos."
+ :"Select photos and tap Prepare, or press and hold a single photo and choose Add to Photos (videos: tap Open, then Share > Save Video).";
+function n(){return Object.keys(sel).length}
+function upd(){var b=document.getElementById("prep");b.disabled=!n();b.textContent=n()?"Prepare "+n():"Prepare";
+ document.getElementById("save").style.display="none";files=[]}
+ITEMS.forEach(function(it,i){
+ var d=document.createElement("div");d.className="c";
+ var im=document.createElement("img");im.loading="lazy";im.src="/send/"+T+"/thumb/"+it.id;
+ var k=document.createElement("div");k.className="k";
+ d.appendChild(im);d.appendChild(k);
+ if(it.video){var v=document.createElement("div");v.className="v";v.textContent="video";d.appendChild(v)}
+ d.onclick=function(){if(sel[it.id]){delete sel[it.id];d.classList.remove("on");k.textContent=""}
+  else{sel[it.id]=1;d.classList.add("on");k.textContent="✓"}upd()};
+ g.appendChild(d)});
+document.getElementById("all").onclick=function(){
+ var all=n()<ITEMS.length;sel={};
+ [].forEach.call(g.children,function(d,i){var k=d.children[1];
+  if(all){sel[ITEMS[i].id]=1;d.classList.add("on");k.textContent="✓"}else{d.classList.remove("on");k.textContent=""}});
+ this.textContent=all?"Clear":"Select all";upd()};
+document.getElementById("prep").onclick=async function(){
+ var ids=ITEMS.filter(function(x){return sel[x.id]}),btn=this;btn.disabled=true;files=[];
+ try{for(var i=0;i<ids.length;i++){msg.textContent="Downloading "+(i+1)+" / "+ids.length+"…";
+  var r=await fetch("/send/"+T+"/file/"+ids[i].id);if(!r.ok)throw new Error("HTTP "+r.status);
+  var b=await r.blob();files.push(new File([b],ids[i].name,{type:b.type||"image/jpeg"}))}
+  msg.textContent="Ready: "+files.length+" item(s).";
+  if(canShare&&navigator.canShare({files:files})){document.getElementById("save").style.display=""}
+  else msg.textContent="Ready, but this browser can't share files directly. Press and hold a photo and choose Add to Photos. (Links starting with https:// support one-tap saving.)";
+ }catch(e){msg.textContent="Failed: "+e.message}btn.disabled=false};
+document.getElementById("save").onclick=async function(){
+ try{await navigator.share({files:files});msg.textContent="Done."}catch(e){if(e.name!="AbortError")msg.textContent="Failed: "+e.message}};
+</script></body></html>"""
+
+
+@app.route("/send/<token>")
+def send_gallery_page(token: str):
+    info = _send_token_info(token)
+    if not info:
+        return Response(_SEND_EXPIRED_HTML, status=410, mimetype="text/html")
+    html = (_SEND_GALLERY_HTML
+            .replace("__COUNT__", str(len(info["items"])))
+            .replace("__TOKEN__", token)
+            .replace("__ITEMS__", json.dumps(info["items"]).replace("</", "<\\/")))
+    resp = Response(html, mimetype="text/html")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+def _send_resolve(token: str, doc_id: str):
+    info = _send_token_info(token)
+    item = next((i for i in info["items"] if i["id"] == doc_id), None) if info else None
+    if not item:
+        abort(404)
+    docs_dir = get_docs_dir()
+    matches = _find_doc_files(docs_dir, doc_id) if docs_dir else []
+    if not matches:
+        abort(404)
+    return item, matches[0]
+
+
+@app.route("/send/<token>/file/<doc_id>")
+def send_gallery_file(token: str, doc_id: str):
+    item, path = _send_resolve(token, doc_id)
+    mime = mimetypes.guess_type(item["name"])[0] or mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+    if path.suffix.lower() in (".heic", ".heif"):
+        mime = "image/heic"
+    return send_file(path, mimetype=mime, download_name=item["name"], as_attachment=False, conditional=True)
+
+
+@app.route("/send/<token>/thumb/<doc_id>")
+def send_gallery_thumb(token: str, doc_id: str):
+    """Small JPEG preview so a big folder doesn't pull every original. Falls
+    back to the original file for formats Pillow can't read (HEIC, video)."""
+    item, path = _send_resolve(token, doc_id)
+    if not item["video"]:
+        try:
+            from PIL import Image, ImageOps
+            import io
+            with Image.open(path) as im:
+                im = ImageOps.exif_transpose(im)
+                im.thumbnail((360, 360))
+                buf = io.BytesIO()
+                im.convert("RGB").save(buf, format="JPEG", quality=75)
+            resp = Response(buf.getvalue(), mimetype="image/jpeg")
+            resp.headers["Cache-Control"] = "private, max-age=3600"
+            return resp
+        except Exception:
+            pass
+    if item["video"]:
+        # 1x1 grey placeholder; the grid cell shows a "video" badge.
+        import base64
+        gif = base64.b64decode("R0lGODlhAQABAIAAAMzMzAAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==")
+        return Response(gif, mimetype="image/gif")
+    return send_gallery_file(token, doc_id)
 
 
 # ---- Mobile upload API -----------------------------------------------------
