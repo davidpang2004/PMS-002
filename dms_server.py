@@ -2936,7 +2936,8 @@ def send_shortcut_file():
     if not path.is_file():
         abort(404)
     return send_file(path, mimetype="application/vnd.apple.shortcut",
-                     download_name="DMS-Photos.shortcut", as_attachment=False)
+                     download_name="DMS Photos.shortcut",  # becomes the shortcut's name, which the page runs
+                     as_attachment=False)
 
 
 @app.route("/send/<token>/list.txt")
