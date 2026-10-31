@@ -214,6 +214,7 @@ toc_entries = [
     ("4.15", "Convert HEIC Photos to JPG"), ("4.16", "PDF Translation, Find Text, and Edit Metadata"),
     ("4.17", "AI: Detect Service Date"),
     ("4.18", "Grouping Photos into Location Folders"),
+    ("4.19", "Importing Photos from an iPhone (USB / Wi-Fi)"),
     ("5", "OCR - Extract Text from Documents"), ("5.1", "How OCR Works"),
     ("5.2", "Running OCR"), ("5.3", "Saving OCR Text for Search"),
     ("6", "Key Parameter Extraction"), ("6.1", "What Are Key Parameters?"),
@@ -375,6 +376,7 @@ para("Delete:")
 bullet("Right-click the folder, choose Delete, and confirm.")
 bullet("Documents inside are not removed from disk immediately - they move into a hidden holding folder named \u201cNot Show in Tree\u201d (a soft-delete / recycle-bin mechanism).")
 bullet("To recover them, find the \u201cNot Show in Tree\u201d node in the tree and re-link or move the documents elsewhere.")
+bullet("Deleting a subfolder inside \u201cNot Show in Tree\u201d (shown in the tree as Deleted files) erases it for good together with all its subfolders and the documents in them - the files are no longer moved back to the top of Deleted files, so there is no second round of deleting. A document that is also linked from a folder outside Deleted files only loses the link here; its file stays.")
 note("Only deleting a document directly inside the \u201cNot Show in Tree\u201d folder permanently removes the file from disk - that action cannot be undone. This is a different folder from the \u201cNot Shown in The Tree\u201d archive folder mentioned in section 12.4 for old .dms backups: the former lives inside the document tree and holds soft-deleted documents; the latter lives at the root of the storage folder and holds backup files beyond the retention limit.")
 
 h2("3.3  Reordering and Moving Folders")
@@ -672,12 +674,33 @@ numbered("Enter a Radius and choose miles or km. The first time it defaults to 1
 numbered("To skip place grouping, untick the box - photos are still filed by year/month.")
 bullet("Photos within the same radius go into the same place folder, centred on the first photo in that folder. Photos with no location stay in the month folder. Phone uploads (chapter 11) follow the same rule.")
 bullet("Place names are looked up in the background after the upload finishes, so uploads aren't slowed down (the progress bar shows \u201cNaming location folders\u201d). If a name can't be found, the folder is temporarily called \u201cLocation 1\u201d, \u201cLocation 2\u201d, ...")
+h3("Folder structure: three choices")
+para("The photo upload confirmation window (and the Import from iPhone window, section 4.19) has a Folder structure drop-down:")
+bullet("YYYY/MM/Location - year and month folders, with place folders inside each month (the default).")
+bullet("YYYY/MM/DD - year, month and day folders, no place grouping (the radius options are greyed out).")
+bullet("YYYY/MM/DD/Location - year, month and day folders, with place folders inside each day.")
+para("Your choice is remembered as the default next time.")
 h3("Not happy with the grouping? Regroup")
 para("A radius that is too large lumps different places together; too small splits one place apart. You can change it any time:")
 numbered("Right-click the folder holding the photos and choose Regroup photos by location...")
 numbered("Enter a new radius and unit; the window previews how many place folders it will produce.")
 numbered("When you're happy, click Regroup. You can tick Also use this radius as the default for future uploads. Repeat as often as you like.")
 tip("This also tidies up photos you uploaded earlier that were never grouped by place. When regrouping, place folders whose names you edited by hand are renamed again; other folders and documents are not affected.")
+h2("4.19  Importing Photos from an iPhone (USB / Wi-Fi)")
+para("Click Import from iPhone in the toolbar above the document tree. The window has three tabs:")
+h3("Photos & videos (USB cable)")
+numbered("Connect the iPhone to the computer with its cable, unlock it and tap Trust on the phone. When the window says Connected, DMS reads the phone's photos and videos.")
+numbered("Choose the destination folder (an existing one, or create a new one first).")
+numbered("Choose what to import: only new ones (not imported before), everything, or a date range; then Photos & videos, Photos only or Videos only.")
+numbered("Pick the Folder structure - YYYY/MM/Location, YYYY/MM/DD or YYYY/MM/DD/Location (see section 4.18); for location grouping you can also set the radius and unit.")
+numbered("Check the \u201cN item(s) will be imported\u201d line, then click Import. Don't unplug the cable while it runs; you can click Stop at any time.")
+bullet("Photos are filed by capture date into year/month(/day) folders under the destination folder; GPS data (including from HEIC photos) is read for the place folders. Photos already imported are skipped the next time you choose Only new ones.")
+bullet("Photos and videos in the phone's Recently Deleted album (recoverable for 30 days) are NOT imported. They are still physically on the phone, so DMS reads the phone's Photos database to exclude them. If that database can't be read, the import falls back to the old behaviour and includes them.")
+note("With Optimize iPhone Storage turned on, some originals live only in iCloud and can't be copied over the cable.")
+h3("PDFs & other files (Wi-Fi)")
+para("The iPhone's Files app and iCloud Drive can't be read over the cable. Put the phone on the same Wi-Fi as the computer, pick the destination folder, scan the QR code in the window with the iPhone camera (or type the link in Safari), tap Choose Files to pick your PDFs or other files, then tap Upload. They arrive in the chosen folder.")
+h3("Send to iPhone (Wi-Fi)")
+para("You can also send photos and videos from the computer to the iPhone: choose the folder to send (optionally with subfolders, and photos only or videos only), scan the QR code with the phone to open the gallery page, and for each photo tap it, press and hold, and choose Add to Photos. The link works for 24 hours (or until DMS restarts) and only exposes the photos and videos in the chosen folder.")
 page_break()
 
 # ══════════════════════════════════════════════════════════════════════════════

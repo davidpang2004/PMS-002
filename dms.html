@@ -779,6 +779,57 @@ const readPhotoDate = async (file) => {
     };
   };
   const _ext = file.name.split(".").pop().toLowerCase();
+  if (_ext === "arw") {
+    // Sony RAW is a TIFF container: walk IFD0 -> Exif IFD for DateTimeOriginal.
+    // Any miss falls back to the file's modified date, same as HEIC.
+    try {
+      const buf = await file.slice(0, 262144).arrayBuffer();
+      const v = new DataView(buf);
+      const le = v.getUint16(0) === 0x4949;
+      if (v.getUint16(2, le) === 42) {
+        const findTag = (ifd, tag) => {
+          const n = v.getUint16(ifd, le);
+          for (let i = 0; i < n && i < 512; i++) {
+            const e = ifd + 2 + i * 12;
+            if (e + 12 > buf.byteLength) break;
+            if (v.getUint16(e, le) === tag) return v.getUint32(e + 8, le);
+          }
+          return null;
+        };
+        const exifIfd = findTag(v.getUint32(4, le), 0x8769);
+        const dateOff = exifIfd != null && exifIfd + 2 <= buf.byteLength ? findTag(exifIfd, 0x9003) : null;
+        // GPS IFD: lat/lon as 3 rationals each (deg, min, sec) plus N/S, E/W refs.
+        let lat = null, lon = null;
+        const gpsIfd = findTag(v.getUint32(4, le), 0x8825);
+        if (gpsIfd != null && gpsIfd + 2 <= buf.byteLength) {
+          const dms = (off) => {
+            if (off == null || off + 24 > buf.byteLength) return null;
+            const r = (o) => { const d = v.getUint32(o + 4, le); return d ? v.getUint32(o, le) / d : 0; };
+            return r(off) + r(off + 8) / 60 + r(off + 16) / 3600;
+          };
+          const la = dms(findTag(gpsIfd, 2)), lo = dms(findTag(gpsIfd, 4));
+          const n = v.getUint16(gpsIfd, le);
+          let latRef = "N", lonRef = "E";
+          for (let i = 0; i < n && i < 64; i++) {
+            const e = gpsIfd + 2 + i * 12;
+            if (e + 12 > buf.byteLength) break;
+            const tg = v.getUint16(e, le);
+            if (tg === 1) latRef = String.fromCharCode(v.getUint8(e + 8));
+            else if (tg === 3) lonRef = String.fromCharCode(v.getUint8(e + 8));
+          }
+          if (la != null && lo != null && (la || lo)) {
+            lat = latRef === "S" ? -la : la;
+            lon = lonRef === "W" ? -lo : lo;
+          }
+        }
+        if (dateOff != null && dateOff + 19 <= buf.byteLength) {
+          const s = new TextDecoder("ascii").decode(new Uint8Array(buf, dateOff, 19));
+          if (/^\d{4}:\d{2}:\d{2}/.test(s)) return { year: s.slice(0, 4), month: s.slice(5, 7), day: s.slice(8, 10), lat, lon };
+        }
+      }
+    } catch (e) { /* fall through to the modified date */ }
+    return fallback();
+  }
   const _isJpegLike = file.type.startsWith("image/jpeg") || file.type.startsWith("image/tiff") ||
     _ext === "jpg" || _ext === "jpeg" || _ext === "tif" || _ext === "tiff";
   if (!_isJpegLike) return fallback();
@@ -1639,7 +1690,7 @@ const genDocId = () => {
 const isInlinePreviewable = (meta) => {
   const mime = meta?.mime || "";
   const ext = (meta?.name || "").split(".").pop().toLowerCase();
-  if (mime.startsWith("image/") || ext === "heic" || ext === "heif") return true;
+  if (mime.startsWith("image/") || ext === "heic" || ext === "heif" || ext === "arw") return true;
   if (mime === "application/pdf") return true;
   if (mime.startsWith("text/") || mime === "application/json") return true;
   return false;
@@ -1736,7 +1787,19 @@ const geoDistanceMiles = (lat1, lon1, lat2, lon2) => {
 };
 const locRadiusToMiles = (value, unit) => (unit === "km" ? value / LOC_KM_PER_MILE : value);
 
-// Coerce anything (server reply, dialog draft) into a valid {enabled, radius, unit}.
+// Folder layout for date-routed photo uploads. Kept in the browser (the server
+// only stores {enabled, radius, unit}); "ym-loc" is the long-standing default.
+//   ym-loc  = Year/Month/Location     ymd = Year/Month/Day     ymd-loc = Year/Month/Day/Location
+const LOC_LAYOUTS = ["ym-loc", "ymd", "ymd-loc"];
+const readLocLayout = () => {
+  try {
+    const v = localStorage.getItem("dms:photo-folder-layout");
+    if (LOC_LAYOUTS.includes(v)) return v;
+  } catch {}
+  return "ym-loc";
+};
+
+// Coerce anything (server reply, dialog draft) into a valid {enabled, radius, unit, layout}.
 const normalizeLocSettings = (raw) => {
   const r = raw || {};
   let unit = String(r.unit || "").toLowerCase() === "km" ? "km" : "mi";
@@ -1747,7 +1810,8 @@ const normalizeLocSettings = (raw) => {
     unit = LOC_DEFAULTS.unit;
   }
   const enabled = r.enabled === undefined ? LOC_DEFAULTS.enabled : !!r.enabled;
-  return { enabled, radius, unit };
+  const layout = LOC_LAYOUTS.includes(r.layout) ? r.layout : readLocLayout();
+  return { enabled, radius, unit, layout };
 };
 
 const sortTreeChildren = (children) =>
@@ -1797,15 +1861,15 @@ const makeLocNode = (monthNode, lat, lon) => ({
 });
 
 // Dialog drafts keep the radius as text so it can be typed freely.
-const locSettingsToDraft = (st) => ({ enabled: st.enabled, radius: String(st.radius), unit: st.unit });
+const locSettingsToDraft = (st) => ({ enabled: st.enabled, radius: String(st.radius), unit: st.unit, layout: st.layout || readLocLayout() });
 const locDraftRadius = (d) => {
   const r = parseFloat(d.radius);
   const miles = locRadiusToMiles(r, d.unit);
   return Number.isFinite(r) && miles >= 0.05 && miles <= 12000 ? r : null;
 };
 const locDraftValid = (d) => !d.enabled || locDraftRadius(d) !== null;
-const locDraftToSettings = (d) => normalizeLocSettings({ enabled: d.enabled, radius: locDraftRadius(d), unit: d.unit });
-const LOC_PHOTO_EXTS = new Set(["jpg", "jpeg", "png", "heic", "heif", "tif", "tiff", "webp", "gif", "bmp"]);
+const locDraftToSettings = (d) => normalizeLocSettings({ enabled: d.enabled, radius: locDraftRadius(d), unit: d.unit, layout: d.layout });
+const LOC_PHOTO_EXTS = new Set(["jpg", "jpeg", "png", "heic", "heif", "tif", "tiff", "webp", "gif", "bmp", "arw"]);
 const looksLikePhotoFile = (f) =>
   (f.type || "").startsWith("image/") || LOC_PHOTO_EXTS.has((f.name.split(".").pop() || "").toLowerCase());
 
@@ -2771,21 +2835,38 @@ const TreeNode = ({
  */
 // Radius picker shared by the upload dialogs (and, without the on/off
 // checkbox, the regroup dialog). `draft` = { enabled, radius (text), unit }.
-const LocationGroupingControls = ({ draft, setDraft, showToggle = true, hint = true }) => {
+const LocationGroupingControls = ({ draft, setDraft, showToggle = true, hint = true, showLayout = true }) => {
   const { t } = useLang();
-  const active = draft.enabled || !showToggle;
+  const layout = showLayout ? (draft.layout || "ym-loc") : "ym-loc";
+  const layoutHasLoc = layout !== "ymd";
+  const active = layoutHasLoc && (draft.enabled || !showToggle);
   const invalid = active && !locDraftValid(draft);
   return (
     <div className="flex flex-col gap-1.5 text-sm text-stone-700 border border-stone-200 rounded px-3 py-2 bg-stone-50">
+      {showLayout && (
+        <div className="flex items-center gap-2">
+          {t("文件夹结构", "Folder structure")}
+          <select
+            value={layout}
+            onChange={(e) => setDraft({ ...draft, layout: e.target.value })}
+            className="text-sm px-2 py-1 border border-stone-300 rounded bg-white"
+          >
+            <option value="ym-loc">{t("年/月/地点", "YYYY/MM/Location")}</option>
+            <option value="ymd">{t("年/月/日", "YYYY/MM/DD")}</option>
+            <option value="ymd-loc">{t("年/月/日/地点", "YYYY/MM/DD/Location")}</option>
+          </select>
+        </div>
+      )}
       {showToggle && (
-        <label className="flex items-center gap-2 cursor-pointer">
+        <label className={`flex items-center gap-2 cursor-pointer ${layoutHasLoc ? "" : "opacity-40"}`}>
           <input
             type="checkbox"
             checked={draft.enabled}
+            disabled={!layoutHasLoc}
             onChange={(e) => setDraft({ ...draft, enabled: e.target.checked })}
             className="accent-amber-600"
           />
-          {t("照片按拍摄地点分子文件夹（在月文件夹内）", "Group photos into location folders (inside each month)")}
+          {t("照片按拍摄地点分子文件夹", "Group photos into location folders")}
         </label>
       )}
       <div className={`flex items-center gap-2 ${active ? "" : "opacity-40"}`}>
@@ -3074,6 +3155,33 @@ const useVoiceDictation = (onFinalTranscript) => {
 // on the 5 richer fields.
 // `onFinalTranscript` receives each recognized chunk; callers typically do
 // `(chunk) => setX((prev) => appendWithSpace(prev, chunk))`.
+// Description autosave: once the text differs from what's stored, save it
+// after a short pause (and on unmount), so "Save and make searchable" is
+// effectively automatic. A change of `id` (another document/folder) always
+// re-renders with the reset text before the timer fires, so stale text is
+// never written to the new target.
+const useDescriptionAutosave = (id, storedText, text, onSave, onSaved) => {
+  const pending = React.useRef(null);
+  const saveRef = React.useRef(onSave);
+  saveRef.current = onSave;
+  const flush = () => {
+    const p = pending.current;
+    pending.current = null;
+    if (!p || !saveRef.current) return;
+    Promise.resolve(saveRef.current(p.id, p.text)).then(() => onSaved && onSaved()).catch(() => {});
+  };
+  React.useEffect(() => {
+    // Moving to another document/folder (or closing) with an unsaved edit
+    // pending: save that edit to its own target first.
+    if (pending.current && pending.current.id !== id) flush();
+    if (!onSave || !id || text === (storedText || "")) { pending.current = null; return; }
+    pending.current = { id, text };
+    const timer = setTimeout(flush, 800);
+    return () => clearTimeout(timer);
+  }, [text, id, storedText]);
+  React.useEffect(() => () => flush(), []);
+};
+
 const VoiceMicButton = ({ onFinalTranscript, title, className = "" }) => {
   const { t } = useLang();
   const voice = useVoiceDictation(onFinalTranscript);
@@ -3134,7 +3242,7 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
   // HEIC/HEIF files need server-side conversion to be viewable in the browser
   const _ext = (doc?.name || "").split(".").pop().toLowerCase();
   const isHeic = doc?.mime === "image/heic" || doc?.mime === "image/heif"
-    || _ext === "heic" || _ext === "heif";
+    || _ext === "heic" || _ext === "heif" || _ext === "arw";
   const viewUrl = isHeic
     ? `${API_BASE}/api/docs/${doc.id}/preview`
     : doc?.dataUrl;
@@ -3192,6 +3300,10 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
   // Description / caption state
   const [description, setDescription] = useState("");
   const [descSaved, setDescSaved] = useState(false);
+  useDescriptionAutosave(doc?.id, doc?.description, description, onSaveDescription, () => {
+    setDescSaved(true);
+    setTimeout(() => setDescSaved(false), 1800);
+  });
   // AI "organize & polish" for the description (Gemini / DeepSeek, opt-in).
   const [polishStyle, setPolishStyle] = useState("organize");   // organize | polish | concise
   const [polishing, setPolishing] = useState(false);
@@ -4730,6 +4842,7 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
                 <MetadataEditor
                   metadata={doc.metadata || {}}
                   keyParameters={keyParameters}
+                  onAddKeyParameter={onAddKeyParameter}
                   onChange={onUpdateMeta}
                 />
               </div>
@@ -5521,8 +5634,53 @@ const ImeInput = ({ value, onCommit, placeholder, className }) => {
 // "folder-specific" badge can be shown next to any field that has already
 // forked away from the shared value for this folder. `null`/omitted means
 // the doc isn't multi-linked (or we're not in a folder context) — no badges.
-const MetadataEditor = ({ metadata, onChange, keyParameters = [], baseMetadata = null }) => {
+const LAST_META_KEY_STORAGE = "dms:last-metadata-key";
+const getLastMetaKey = () => { try { return localStorage.getItem(LAST_META_KEY_STORAGE) || ""; } catch { return ""; } };
+const rememberMetaKey = (k) => { try { if (k) localStorage.setItem(LAST_META_KEY_STORAGE, k); } catch {} };
+
+// Replaces window.prompt for naming a new field, so it can have a voice-input
+// mic. Uncontrolled input (like ImeInput) so Chinese IME composition is safe.
+const KeyNameDialog = ({ initial = "", onSubmit, onCancel }) => {
   const { t } = useLang();
+  const ref = React.useRef(null);
+  React.useEffect(() => { ref.current && ref.current.focus(); }, []);
+  const submit = () => onSubmit((ref.current?.value || "").trim());
+  return (
+    <div className="fixed inset-0 z-[300] bg-black/40 flex items-center justify-center" onMouseDown={onCancel}>
+      <div className="bg-white rounded-xl shadow-xl p-5 w-[460px] max-w-[92vw]" onMouseDown={(e) => e.stopPropagation()}>
+        <div className="text-sm text-stone-800 mb-3">
+          {t("请输入新的字段/关键参数名称：", "Enter the new field/key parameter name:")}
+        </div>
+        <div className="flex items-center gap-1.5">
+          <input
+            ref={ref}
+            type="text"
+            defaultValue={initial}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.nativeEvent.isComposing) submit();
+              else if (e.key === "Escape") onCancel();
+            }}
+            className="flex-1 text-sm px-2 py-1.5 border border-stone-300 rounded focus:outline-none focus:border-amber-600"
+          />
+          <VoiceMicButton onFinalTranscript={(chunk) => {
+            if (ref.current) ref.current.value = appendWithSpace(ref.current.value, chunk);
+          }} />
+        </div>
+        <div className="text-[12px] text-stone-600 mt-2">
+          {t("新名称也会加入全局关键参数列表。", "The new name is also added to the global key parameter list.")}
+        </div>
+        <div className="flex justify-end gap-2 mt-4">
+          <button onClick={onCancel} className="px-3 py-1.5 text-sm rounded border border-stone-300 hover:bg-stone-100">{t("取消", "Cancel")}</button>
+          <button onClick={submit} className="px-3 py-1.5 text-sm rounded bg-amber-700 text-white hover:bg-amber-800">{t("确定", "OK")}</button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const MetadataEditor = ({ metadata, onChange, keyParameters = [], baseMetadata = null, onAddKeyParameter }) => {
+  const { t } = useLang();
+  const [namePromptFor, setNamePromptFor] = useState(null); // field key being renamed
   const entries = Object.entries(metadata || {});
   const suggestions = normalizeKeyParameters(keyParameters);
   const isOverridden = (key, val) =>
@@ -5534,6 +5692,7 @@ const MetadataEditor = ({ metadata, onChange, keyParameters = [], baseMetadata =
     const m = { ...(metadata || {}) };
     m[clean] = m[oldKey];
     delete m[oldKey];
+    rememberMetaKey(clean);
     onChange(m);
   };
   // Both "design" and "actual" are stored as a composed display string PLUS
@@ -5564,6 +5723,7 @@ const MetadataEditor = ({ metadata, onChange, keyParameters = [], baseMetadata =
       : { design: typeof prev === "string" ? prev : "", actual: "" };
     const pf = PART_FIELDS[composedKey];
     const nextParts = { ...partsOf(prevObj, composedKey), [field]: val };
+    if (val) rememberMetaKey(key);
     onChange({
       ...(metadata || {}),
       [key]: {
@@ -5578,6 +5738,9 @@ const MetadataEditor = ({ metadata, onChange, keyParameters = [], baseMetadata =
 
   const nextUnusedKey = () => {
     const used = new Set(Object.keys(metadata || {}).map((k) => k.toLowerCase()));
+    // Start from the global parameter used last time, if it's still free here.
+    const last = getLastMetaKey();
+    if (last && !used.has(last.toLowerCase())) return last;
     const suggested = suggestions.find((k) => !used.has(k.toLowerCase()));
     if (suggested) return suggested;
     let key = "field"; let i = 1;
@@ -5598,13 +5761,7 @@ const MetadataEditor = ({ metadata, onChange, keyParameters = [], baseMetadata =
     const isListed = !!matchedSuggestion;
     const selectValue = isListed ? matchedSuggestion : "__current_custom__";
 
-    const renameCustom = () => {
-      const next = window.prompt(t("请输入新的字段/关键参数名称：", "Enter the new field/key parameter name:"), isListed ? "" : currentKey);
-      if (next === null) return;
-      const clean = (next || "").trim();
-      if (!clean) return;
-      updateKey(currentKey, clean);
-    };
+    const renameCustom = () => setNamePromptFor(currentKey);
 
     return (
       <select
@@ -5743,6 +5900,20 @@ const MetadataEditor = ({ metadata, onChange, keyParameters = [], baseMetadata =
       <button onClick={addField} className="text-[13px] text-stone-700 hover:text-amber-700 flex items-center gap-1 mt-1">
         <Plus size={11} /> {t("添加字段", "Add field")}
       </button>
+      {namePromptFor !== null && (
+        <KeyNameDialog
+          initial={suggestions.some((k) => k.toLowerCase() === namePromptFor.toLowerCase()) ? "" : namePromptFor}
+          onCancel={() => setNamePromptFor(null)}
+          onSubmit={(name) => {
+            const from = namePromptFor;
+            setNamePromptFor(null);
+            if (!name) return;
+            updateKey(from, name);
+            // Make it a global parameter too, so it shows in every dropdown.
+            if (onAddKeyParameter) onAddKeyParameter(name);
+          }}
+        />
+      )}
     </div>
   );
 };
@@ -5947,11 +6118,17 @@ const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree,
         entry.name || "",
         entry.sn || "",
         entry.ocrText || "",
-        entry.description || "",
+        stripDescriptionHtml(entry.description || "", ""),
+        entry.docDate || "",
+        entry.dueDate || "",
+        ...(entry.localKeyParams || []),
         ...Object.values(entry.qcReview || {}),   // QC Review: Inspection/SN/Equipment/WO-PO, dates, observation, mitigation, result
         ...Object.keys(entry.metadata || {}),
         ...Object.values(entry.metadata || {}).map((v) => {
-          if (v && typeof v === "object") return `${v.design || ""} ${v.actual || ""}`;
+          if (v && typeof v === "object") {
+            // composed strings plus each value/unit/description part
+            return Object.values(v).filter((x) => typeof x === "string").join(" ");
+          }
           return String(v);
         }),
       ].join(" ").toLowerCase();
@@ -5985,7 +6162,14 @@ const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree,
     return scopeFolders.filter((node) => {
       // QC Review folders are also findable by their review fields (AN/SN/PN/WON,
       // Date Reviewed, Reviewed By, Observation, Mitigation, Review Result).
-      const name = (node.name + " " + (node.qcGeneralComment || "")).toLowerCase();
+      const name = [
+        node.name,
+        node.sn || "",
+        node.dueDate || "",
+        node.qcGeneralComment || "",
+        stripDescriptionHtml(node.description || "", ""),
+        ...getNodeLogins(node).map((l) => `${l.websiteUrl || ""} ${l.accountName || ""}`),
+      ].join(" ").toLowerCase();
       if (matchMode === "phrase") return name.includes(trimmed);
       if (matchMode === "or") return words.some((w) => name.includes(w));
       return words.every((w) => name.includes(w));
@@ -7182,14 +7366,10 @@ const niceTicks = (min, max, tickCount = 5) => {
   return { min: niceMin, max: niceMax, ticks };
 };
 
-// Format a "YYYY-MM-DD" date for an axis tick, adapting precision to how
-// wide a span the whole chart covers so ticks stay unambiguous without
-// wasting space repeating a year that never changes across the chart.
+// Format a "YYYY-MM-DD" date for an axis tick as "MM-DD-YY".
 const formatAxisDate = (iso, spanDays) => {
   const [y, m, d] = iso.split("-");
-  if (spanDays > 800) return y;
-  if (spanDays > 60) return `${y}-${m}`;
-  return `${m}-${d}`;
+  return `${m}-${d}-${y.slice(2)}`;
 };
 
 const TimeSeriesChart = ({ points, paramName, unit, onPointClick, width = 680, height = 300, timeRange = null, valueRange = null }) => {
@@ -7527,11 +7707,10 @@ const GroupedBarChart = ({ points, isCategorical, paramName, unit, onPointClick,
 
   const fmtVal = (v) => unit ? `${v.toLocaleString()} ${unit}` : v.toLocaleString();
   // Categorical (document-name) labels can be arbitrarily long; date labels
-  // are always "YYYY-MM-DD" -- shorten those to "MM-DD" since the year
-  // rarely varies within one chart and full dates crowd narrow bands.
+  // are always "YYYY-MM-DD" -- shown as "MM-DD-YY".
   const fmtLabel = (key) => isCategorical
     ? (key.length > 14 ? key.slice(0, 13) + "…" : key)
-    : key.slice(5);
+    : formatAxisDate(key);
 
   return (
     <div className="relative w-full h-full">
@@ -8009,7 +8188,7 @@ const HeicToJpgDialog = ({ onClose }) => {
  * import can bring over only what's new.
  * =============================================================================
  */
-const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onClose }) => {
+const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onGetLoc, onClose }) => {
   const { t } = useLang();
   // Destination folder: pick any existing folder, or create a new one first.
   const folders = [];
@@ -8021,6 +8200,8 @@ const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onC
   const [newParent, setNewParent] = useState(defaultNodeId || (tree && tree.id) || "");
   const [creating, setCreating] = useState(false);
   const destName = (folders.find((f) => f.id === destId) || {}).name || "";
+  // Folder structure for imported photos (Year/Month/Location, Year/Month/Day, Year/Month/Day/Location).
+  const [locDraft, setLocDraft] = useState(() => locSettingsToDraft(onGetLoc ? onGetLoc() : LOC_DEFAULTS));
   const [mode, setMode] = useState("usb");        // usb (photos/videos) | files (PDFs etc. over Wi-Fi)
   const [link, setLink] = useState(null);
   const [linkErr, setLinkErr] = useState("");
@@ -8099,6 +8280,7 @@ const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onC
 
   const run = async () => {
     cancelRef.current = false;
+    try { localStorage.setItem("dms:photo-folder-layout", locDraft.layout || "ym-loc"); } catch (e) {}
     setRunning(true); setResult(null);
     const todo = picked.slice().reverse();     // oldest first
     const doneSet = loadSeen();
@@ -8110,7 +8292,7 @@ const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onC
     const flush = async () => {
       if (!batch.length) return;
       try {
-        await onImportRef.current(destId, batch);
+        await onImportRef.current(destId, batch, locDraftToSettings(locDraft));
         batchKeys.forEach((k) => doneSet.add(k));
         try { localStorage.setItem(seenKey, JSON.stringify([...doneSet])); } catch (e) {}
         ok += batch.length;
@@ -8325,6 +8507,7 @@ const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onC
                     <label className="flex items-center gap-1.5"><input type="radio" checked={kind === "photos"} onChange={() => setKind("photos")} disabled={running} /> {t("仅照片", "Photos only")}</label>
                     <label className="flex items-center gap-1.5"><input type="radio" checked={kind === "videos"} onChange={() => setKind("videos")} disabled={running} /> {t("仅视频", "Videos only")}</label>
                   </div>
+                  {kind !== "videos" && <LocationGroupingControls draft={locDraft} setDraft={setLocDraft} hint={false} />}
                   <div className="text-[13px] font-medium text-stone-800">{t(`将导入 ${picked.length} 项（约 ${mb(totalBytes)}）`, `${picked.length} item(s) will be imported (about ${mb(totalBytes)})`)}</div>
                   <div className="text-[12px] text-stone-500">{t("提示：如果开启了“优化 iPhone 储存空间”，部分原图只在 iCloud 里，无法通过数据线导入。", "Note: with “Optimize iPhone Storage” on, some originals live only in iCloud and can't be copied over the cable.")}</div>
                 </>
@@ -8349,7 +8532,7 @@ const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onC
           {running
             ? <button onClick={() => { cancelRef.current = true; }} className={btn}>{t("停止", "Stop")}</button>
             : <button onClick={onClose} className={btn}>{result ? t("关闭", "Close") : t("取消", "Cancel")}</button>}
-          {mode === "usb" && <button onClick={run} disabled={running || !items || !picked.length || !destId} className="px-3 py-1 text-sm bg-amber-600 text-white rounded hover:bg-amber-700 disabled:opacity-50 flex items-center gap-1.5">
+          {mode === "usb" && <button onClick={run} disabled={running || !items || !picked.length || !destId || !locDraftValid(locDraft)} className="px-3 py-1 text-sm bg-amber-600 text-white rounded hover:bg-amber-700 disabled:opacity-50 flex items-center gap-1.5">
             {running && <Loader size={13} className="animate-spin" />}{running ? t("导入中…", "Importing…") : t("开始导入", "Import")}
           </button>}
         </div>
@@ -10869,7 +11052,8 @@ const GridPopoutApp = ({ storageKey }) => {
   if (!meta) return null;
 
   const isHeic = (d) => d.mime === "image/heic" || d.mime === "image/heif" ||
-    (d.name || "").split(".").pop().toLowerCase() === "heic" || (d.name || "").split(".").pop().toLowerCase() === "heif";
+    (d.name || "").split(".").pop().toLowerCase() === "heic" || (d.name || "").split(".").pop().toLowerCase() === "heif" ||
+    (d.name || "").split(".").pop().toLowerCase() === "arw";
 
   return (
     <LangContext.Provider value={langCtxValue}>
@@ -12055,8 +12239,18 @@ const EmailSettingsDialog = ({ onClose }) => {
               value={settings.smtp_pass}
               onChange={(e) => set("smtp_pass", e.target.value)}
               placeholder={t("留空则不更改现有密码", "Leave blank to keep the existing password")}
-              className="w-full px-2 py-1.5 text-base border border-stone-300 rounded focus:outline-none focus:border-amber-500 mb-2"
+              className="w-full px-2 py-1.5 text-base border border-stone-300 rounded focus:outline-none focus:border-amber-500 mb-1"
             />
+            <div className="text-[12px] text-stone-600 mb-2 leading-relaxed">
+              {t("这里必须填 16 位“应用专用密码”，不是登录密码。", "Use a 16-character app password here, not your normal login password.")}{" "}
+              <a href="https://myaccount.google.com/apppasswords" target="_blank" rel="noreferrer" className="text-amber-700 underline">
+                {t("Gmail：myaccount.google.com/apppasswords（需先开启两步验证）", "Gmail: myaccount.google.com/apppasswords (turn on 2-Step Verification first)")}
+              </a>
+              {" · "}
+              <a href="https://login.yahoo.com/account/security" target="_blank" rel="noreferrer" className="text-amber-700 underline">
+                {t("Yahoo：账户安全 → 生成应用密码", "Yahoo: Account security → Generate app password")}
+              </a>
+            </div>
 
             <label className="block text-[12px] uppercase tracking-wider text-stone-700 mb-1">
               {t("发件人地址", "Sender address")}{" "}
@@ -13269,7 +13463,7 @@ const FloatingDocPreview = ({ doc, onClose }) => {
   const isImage = doc.mime?.startsWith("image/");
   const isPdf = doc.mime === "application/pdf";
   const _ext = (doc.name || "").split(".").pop().toLowerCase();
-  const isHeic = doc.mime === "image/heic" || doc.mime === "image/heif" || _ext === "heic" || _ext === "heif";
+  const isHeic = doc.mime === "image/heic" || doc.mime === "image/heif" || _ext === "heic" || _ext === "heif" || _ext === "arw";
   const url = isHeic
     ? `${API_BASE}/api/docs/${doc.id}/preview`
     : `${API_BASE}/api/docs/${doc.id}`;
@@ -13575,7 +13769,7 @@ const FloatingDocPreview = ({ doc, onClose }) => {
 
 const DocumentCard = ({
   doc, otherRefCount = 0, nodeSn = "",
-  onOpen, onOpenNative, onDelete, onUpdateMeta, onUpdateName, onUpdateSn, onUpdateDueDate, onUpdateDocDate, formatBytes, keyParameters = [],
+  onOpen, onOpenNative, onDelete, onUpdateMeta, onUpdateName, onUpdateSn, onUpdateDueDate, onUpdateDocDate, formatBytes, keyParameters = [], onAddKeyParameter,
   onOpenEmailSettings,
   faceSelectMode = false, faceSelected = false, onToggleFaceSelect,
   // Generic bulk-select mode (currently used by the recycle bin's
@@ -14195,6 +14389,7 @@ const DocumentCard = ({
             metadata={doc.metadata || {}}
             baseMetadata={otherRefCount > 0 ? (doc._baseMetadata || doc.metadata || {}) : null}
             keyParameters={keyParameters}
+            onAddKeyParameter={onAddKeyParameter}
             onChange={onUpdateMeta}
           />
         </div>
@@ -14233,7 +14428,7 @@ const DocumentGridTile = ({
   const _ext = (doc.name || "").split(".").pop().toLowerCase();
   // HEIC/HEIF needs the server's converted preview to render in a browser
   // <img> at all — same condition the document viewer uses.
-  const isHeic = doc.mime === "image/heic" || doc.mime === "image/heif" || _ext === "heic" || _ext === "heif";
+  const isHeic = doc.mime === "image/heic" || doc.mime === "image/heif" || _ext === "heic" || _ext === "heif" || _ext === "arw";
   const thumbUrl = isImage ? `${API_BASE}/api/docs/${doc.id}${isHeic ? "/preview" : ""}` : null;
   const [thumbError, setThumbError] = useState(false);
   const Icon = isImage ? ImageIcon : FileText;
@@ -17887,6 +18082,8 @@ const LinkPicker = ({
       entry.id,
       entry.name || "",
       entry.ocrText || "",
+      entry.sn || "",
+      stripDescriptionHtml(entry.description || "", ""),
       ...Object.keys(entry.metadata || {}),
       ...Object.values(entry.metadata || {}).map((v) => {
         if (v && typeof v === "object") return `${v.design || ""} ${v.actual || ""}`;
@@ -18817,6 +19014,10 @@ const NodeDescriptionPanel = ({ node, derivedDocs = [], onSaveDescription, onSav
 
   const [description, setDescription] = useState(node.description || "");
   const [descSaved, setDescSaved] = useState(false);
+  useDescriptionAutosave(node.id, node.description, description, onSaveDescription, () => {
+    setDescSaved(true);
+    setTimeout(() => setDescSaved(false), 1800);
+  });
 
   // AI "organize & polish" (Gemini / DeepSeek, opt-in) -- same rubric as the
   // document-level description panel.
@@ -20373,6 +20574,45 @@ function DMS({ storagePath, onChangeFolder }) {
     setRenamingId(null);
   };
 
+  // Moves folders (with everything inside) into the root-level recycle bin
+  // ("Not Show in Tree") instead of deleting them. Folders already inside the
+  // bin, and the bin itself, are not handled here (those delete for real).
+  const moveFoldersToBin = async (ids) => {
+    let next = tree;
+    let binId;
+    const existing = (next.children || []).find((c) => c.name === NOT_SHOW_FOLDER_NAME);
+    if (existing) binId = existing.id;
+    else {
+      binId = genNodeId();
+      next = { ...next, children: [...(next.children || []), { id: binId, name: NOT_SHOW_FOLDER_NAME, children: [], documents: [] }] };
+    }
+    for (const id of ids) {
+      const node = findNode(next, id);
+      if (!node) continue;
+      // Keep sibling names unique inside the bin (on-disk paths follow names).
+      const bin = findNode(next, binId);
+      const taken = new Set((bin.children || []).map((c) => c.name));
+      let name = node.name, n = 2;
+      while (taken.has(name)) name = `${node.name} (${n++})`;
+      next = removeNodeFromTree(next, id);
+      next = updateNodeInTree(next, binId, (b) => ({
+        ...b, children: [...(b.children || []), name === node.name ? node : { ...node, name }],
+      }));
+    }
+    await persistTree(next);
+    return binId;
+  };
+
+  const isInRecycleBin = (id) => {
+    const n = findNode(tree, id);
+    if (!n) return false;
+    if (n.name === NOT_SHOW_FOLDER_NAME && (tree.children || []).some((c) => c.id === id)) return true;
+    return collectAncestorIds(tree, id).some((aid) => {
+      const a = findNode(tree, aid);
+      return a && a.name === NOT_SHOW_FOLDER_NAME && (tree.children || []).some((c) => c.id === aid);
+    });
+  };
+
   const handleDeleteNode = async (nodeId) => {
     if (!tree || nodeId === tree.id) {
       alert(t("无法删除根节点。", "Cannot delete the root node."));
@@ -20380,6 +20620,16 @@ function DMS({ storagePath, onChangeFolder }) {
     }
     const target = findNode(tree, nodeId);
     if (!target) return;
+    if (!isInRecycleBin(nodeId)) {
+      const dc = collectAllDocIds(target).length;
+      if (!confirm(t(
+        `确定删除文件夹"${target.name}"？\n\n该文件夹及其中的 ${dc} 个文档将被移至根目录下的"${NOT_SHOW_FOLDER_NAME}"（已删除文件）文件夹，文件保留在磁盘上。`,
+        `Delete folder "${target.name}"?\n\nIt and its ${dc} document(s) will be moved to the "${NOT_SHOW_FOLDER_NAME}" (Deleted files) folder at the root; the files stay on disk.`
+      ))) return;
+      const binId = await moveFoldersToBin([nodeId]);
+      if (selectedId === nodeId) setSelectedId(binId);
+      return;
+    }
     const childCount = (target.children || []).length;
     const docCount = collectAllDocIds(target).length;
     const detail = childCount || docCount
@@ -20420,6 +20670,20 @@ function DMS({ storagePath, onChangeFolder }) {
     if (!ids.length) return;
     const targets = ids.map((id) => findNode(tree, id)).filter(Boolean);
     const docCount = targets.reduce((sum, n) => sum + collectAllDocIds(n).length, 0);
+    const toBin = ids.filter((id) => !isInRecycleBin(id));
+    if (toBin.length) {
+      if (!confirm(t(
+        `确定删除选中的 ${toBin.length} 个文件夹？\n\n它们及其中的文档将被移至根目录下的"${NOT_SHOW_FOLDER_NAME}"（已删除文件）文件夹，文件保留在磁盘上。`,
+        `Delete the selected ${toBin.length} folder(s)?\n\nThey and their documents will be moved to the "${NOT_SHOW_FOLDER_NAME}" (Deleted files) folder at the root; the files stay on disk.`
+      ))) return;
+      setFolderBulkBusy(true);
+      const binId = await moveFoldersToBin(toBin);
+      if (toBin.includes(selectedId)) setSelectedId(binId);
+      setFolderSelectedIds(new Set());
+      setFolderSelectMode(false);
+      setFolderBulkBusy(false);
+      return;
+    }
     if (!confirm(t(
       `确定删除选中的 ${targets.length} 个文件夹？\n\n共包含 ${docCount} 个文档。这些文件夹及其下所有子文件夹和文件将从硬盘永久删除，无法恢复。\n\n此操作无法撤销。`,
       `Delete the selected ${targets.length} folder(s)?\n\nThey contain ${docCount} document(s) in total. These folders and everything inside them will be permanently deleted from disk and cannot be recovered.\n\nThis cannot be undone.`
@@ -20515,6 +20779,53 @@ function DMS({ storagePath, onChangeFolder }) {
     const info = dropInfoRef.current;
     handleDragEnd();
     if (!dragId || !info) return;
+
+    // Dragging one of several ticked folders (Select folders mode) moves
+    // the whole selection together, keeping their tree order.
+    if (folderSelectMode && folderSelectedIds.has(dragId) && folderSelectedIds.size > 1) {
+      const top = new Set(topLevelFolderSelection(Array.from(folderSelectedIds)));
+      const ordered = [];
+      const walk = (n) => { if (top.has(n.id)) ordered.push(n.id); (n.children || []).forEach(walk); };
+      walk(tree);
+      const movers = ordered.filter((id) => id !== info.targetId && id !== tree.id);
+      if (movers.length > 1) {
+        let next = tree;
+        let anchor = info.targetId;
+        let lastId = null;
+        const allRemap = new Map();
+        for (const id of movers) {
+          const node = findNode(next, id);
+          if (!node || findNode(node, info.targetId)) continue; // target inside this folder
+          if (info.position === "into") {
+            const target = findNode(next, info.targetId);
+            const conflict = target && (target.children || []).find((c) => c.name === node.name && c.id !== id);
+            if (conflict) {
+              const { mergedNode, docRemap } = mergeNodesDeep(conflict, node);
+              next = removeNodeFromTree(next, id);
+              next = updateNodeInTree(next, conflict.id, () => mergedNode);
+              docRemap.forEach((v, k) => allRemap.set(k, v));
+              lastId = conflict.id;
+              continue;
+            }
+            next = moveNodeToPosition(next, id, info.targetId, "into");
+          } else if (info.position === "before") {
+            next = moveNodeToPosition(next, id, info.targetId, "before");
+          } else {
+            next = moveNodeToPosition(next, id, anchor, "after");
+            anchor = id;
+          }
+          lastId = id;
+        }
+        if (allRemap.size > 0) {
+          await persistIndex(docIndex.map((e) =>
+            allRemap.has(e.id) ? { ...e, originalNodeId: allRemap.get(e.id) } : e
+          ));
+        }
+        await persistTree(next);
+        if (lastId) setSelectedId(lastId);
+        return;
+      }
+    }
 
     // When dropping "into" a target, check for a same-named sibling and merge
     if (info.position === "into") {
@@ -20721,6 +21032,7 @@ function DMS({ storagePath, onChangeFolder }) {
   const rememberLocSettings = async (cfg) => {
     locSettingsRef.current = cfg;
     setLocSettings(cfg);
+    try { if (cfg.layout) localStorage.setItem("dms:photo-folder-layout", cfg.layout); } catch {}
     try {
       await StorageAdapter.savePhotoLocationSettings(cfg);
     } catch (e) {
@@ -20845,7 +21157,8 @@ function DMS({ storagePath, onChangeFolder }) {
     // for date-routed uploads. Callers that don't pass locationGrouping get
     // the remembered setting (10 miles until the user changes it).
     const locCfg = normalizeLocSettings(locationGrouping || locSettingsRef.current);
-    const locRadiusMi = locCfg.enabled && routeMode === "year-month"
+    const locLayout = locCfg.layout;
+    const locRadiusMi = locCfg.enabled && routeMode === "year-month" && locLayout !== "ymd"
       ? locRadiusToMiles(locCfg.radius, locCfg.unit) : 0;
     const newLocPoints = [];   // location folders created by this upload, to be named after it
 
@@ -21016,7 +21329,7 @@ function DMS({ storagePath, onChangeFolder }) {
       }
 
       console.log(`[DMS] Processing file: ${file.name} (${file.size} bytes, ${file.type}) → ${docId}`);
-      const _photoExts = new Set(["jpg","jpeg","png","heic","heif","tif","tiff","webp","gif","bmp"]);
+      const _photoExts = new Set(["jpg","jpeg","png","heic","heif","tif","tiff","webp","gif","bmp","arw"]);
       const _isPhoto = file.type.startsWith("image/") ||
         _photoExts.has(file.name.split(".").pop().toLowerCase());
       // Videos have no EXIF "date taken" -- readVideoDate() reads the mvhd
@@ -21076,6 +21389,11 @@ function DMS({ storagePath, onChangeFolder }) {
         photoBaseNodeId = baseId;
         [workingTree, finalNodeId] = getOrCreateChild(workingTree, baseId, photoDate.year);
         [workingTree, finalNodeId] = getOrCreateChild(workingTree, finalNodeId, photoDate.month);
+        // Day level (YYYY/MM/DD layouts); only date-routed uploads and only
+        // when the file's day is known. Location folders then sit inside it.
+        if ((locLayout === "ymd" || locLayout === "ymd-loc") && routeMode === "year-month" && photoDate.day) {
+          [workingTree, finalNodeId] = getOrCreateChild(workingTree, finalNodeId, photoDate.day);
+        }
         // Photos with GPS go one level deeper, into the location folder
         // within the radius (or a new one). The distance check is a few
         // math operations per photo -- no network, no extra file reads.
@@ -21102,7 +21420,8 @@ function DMS({ storagePath, onChangeFolder }) {
       const targetNodeSn = (findNode(workingTree, finalNodeId)?.sn || "").trim();
 
       const doc = {
-        id: docId, name: uploadName, mime: file.type || "application/octet-stream",
+        id: docId, name: uploadName,
+        mime: file.type || (file.name.toLowerCase().endsWith(".arw") ? "image/x-sony-arw" : "application/octet-stream"),
         size: file.size, uploadedAt: new Date().toISOString(),
         file, nodeId: finalNodeId, routeMode, metadata: {},
         ...(photoDate ? {
@@ -23967,6 +24286,7 @@ function DMS({ storagePath, onChangeFolder }) {
                         scheduleMode={scheduleMode}
                         urgency={urgencyTier(doc.dueDate, doc.remindDays)}
                         keyParameters={keyParameters}
+                        onAddKeyParameter={handleAddKeyParameter}
                         formatBytes={formatBytes}
                         onOpenEmailSettings={() => setShowEmailSettings(true)}
                         faceSelectMode={faceSelectMode && doc.mime?.startsWith("image/")}
@@ -24252,7 +24572,8 @@ function DMS({ storagePath, onChangeFolder }) {
       {showHeicDialog && <HeicToJpgDialog onClose={() => setShowHeicDialog(false)} />}
       {showIphoneDialog && tree && (
         <IphoneImportDialog tree={tree} defaultNodeId={selectedId || tree.id}
-          onImport={(nodeId, files) => uploadFilesToNode(nodeId, files, { skipDuplicates: true, locationGrouping: locSettingsRef.current, photoBaseOverride: nodeId })}
+          onGetLoc={() => locSettingsRef.current}
+          onImport={(nodeId, files, loc) => uploadFilesToNode(nodeId, files, { skipDuplicates: true, locationGrouping: loc || locSettingsRef.current, photoBaseOverride: nodeId })}
           onCreateFolder={createFolderUnder}
           onClose={() => setShowIphoneDialog(false)} />
       )}
@@ -24623,7 +24944,7 @@ function DMS({ storagePath, onChangeFolder }) {
                    "Rebuilds the location folders inside each month using a new radius. Too large and different places merge together; too small and one place splits apart — you can regroup again with another value at any time. Photos without GPS stay in the month folder. Location folders you renamed by hand are renamed again; other folders and documents are untouched.")}
               </div>
               <LocationGroupingControls
-                draft={rd.draft} showToggle={false} hint={false}
+                draft={rd.draft} showToggle={false} hint={false} showLayout={false}
                 setDraft={(d) => setRegroupDialog((cur) => cur && ({ ...cur, draft: d }))}
               />
               <div className="text-sm text-stone-800 min-h-[1.5rem]">

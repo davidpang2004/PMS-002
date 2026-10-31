@@ -67,6 +67,9 @@ except ImportError:
     print("    python3 -m pip install flask")
     sys.exit(1)
 
+# Python doesn't know Sony RAW; without this an .arw upload is tagged octet-stream.
+mimetypes.add_type("image/x-sony-arw", ".arw")
+
 # Load pillow_heif (HEIC/HEIF decoding for thumbnails/previews) at startup
 # instead of lazily on the first HEIC request. In the Windows --onefile build
 # its native _pillow_heif.pyd + libheif DLLs are unpacked to a temp folder;
@@ -700,9 +703,98 @@ def _location_patch_flush_loop() -> None:
 _threading.Thread(target=_location_patch_flush_loop, daemon=True, name="location-patch-flush").start()
 
 
-def _read_photo_gps(data: bytes) -> "tuple[float, float] | tuple[None, None]":
+def _jpeg_span_end(data: bytes, start: int):
+    """End offset (exclusive) of the JPEG starting at data[start], by walking its
+    marker segments (so a thumbnail nested inside an EXIF segment is skipped
+    rather than mistaken for the end). None if it isn't a well-formed JPEG."""
+    pos, n = start + 2, len(data)
+    while pos + 4 <= n:
+        if data[pos] != 0xFF:
+            return None
+        marker = data[pos + 1]
+        if marker == 0xDA:  # start of scan: entropy data follows
+            pos += 2 + int.from_bytes(data[pos + 2:pos + 4], "big")
+            m = re.compile(rb"\xff(?![\x00\xd0-\xd7\xff])").search(data, pos)
+            return m.start() + 2 if m and data[m.start() + 1] == 0xD9 else None
+        if marker == 0xD9:
+            return pos + 2
+        pos += 2 + int.from_bytes(data[pos + 2:pos + 4], "big")
+    return None
+
+
+def _arw_embedded_jpegs(data: bytes) -> list:
+    """Embedded JPEGs in a Sony ARW (TIFF container), largest first.
+    ARW has no browser-viewable form of its own; the camera stores a JPEG
+    preview inside it."""
+    found, pos = [], 0
+    while len(found) < 40:
+        pos = data.find(b"\xff\xd8\xff", pos)
+        if pos < 0:
+            break
+        end = _jpeg_span_end(data, pos)
+        if end:
+            found.append(data[pos:end])
+            pos = end
+        else:
+            pos += 3
+    found.sort(key=len, reverse=True)
+    return found
+
+
+def _arw_exif_objects(data: bytes):
+    """Yield EXIF objects for an ARW: its own TIFF header first, then each
+    embedded JPEG's (the preview often carries the date even when the
+    container's directory is unreadable)."""
+    from PIL import Image
+    from io import BytesIO
+    try:
+        # Read the container's own EXIF directly; Image.open would also need
+        # decodable image data, which a RAW file may not offer.
+        exif = Image.Exif()
+        exif.load(data)
+        yield exif
+    except Exception:
+        pass
+    for jpg in _arw_embedded_jpegs(data)[:3]:
+        try:
+            yield Image.open(BytesIO(jpg)).getexif()
+        except Exception:
+            pass
+
+
+def _arw_photo_date(data: bytes) -> tuple:
+    """(year, month) from an ARW's EXIF, or (None, None)."""
+    try:
+        for exif in _arw_exif_objects(data):
+            vals = [exif.get_ifd(34665).get(t) for t in (36867, 36868)] + [exif.get(306)]
+            for val in vals:
+                if val and isinstance(val, str) and len(val) >= 7:
+                    parts = val.split(":")
+                    if len(parts) >= 2 and parts[0].isdigit() and len(parts[1]) >= 2:
+                        return parts[0], parts[1][:2]
+    except Exception:
+        pass
+    return None, None
+
+
+def _arw_photo_gps(data: bytes) -> "tuple[float, float] | tuple[None, None]":
+    try:
+        for exif in _arw_exif_objects(data):
+            g = exif.get_ifd(34853)
+            if g and g.get(2) and g.get(4):
+                lat = float(g[2][0]) + float(g[2][1]) / 60 + float(g[2][2]) / 3600
+                lon = float(g[4][0]) + float(g[4][1]) / 60 + float(g[4][2]) / 3600
+                return (-lat if g.get(1) == "S" else lat), (-lon if g.get(3) == "W" else lon)
+    except Exception:
+        pass
+    return None, None
+
+
+def _read_photo_gps(data: bytes, ext: str = "") -> "tuple[float, float] | tuple[None, None]":
     """Return (lat, lon) from EXIF GPS tags using Pillow, or (None, None).
     Supports JPEG, HEIC, TIFF, PNG and any format Pillow can open."""
+    if ext == "arw":
+        return _arw_photo_gps(data)
     try:
         try:
             import pillow_heif
@@ -784,10 +876,12 @@ def _get_or_create_child_node(parent_node: dict, child_name: str) -> dict:
     return new_node
 
 
-def _read_photo_date(data: bytes, mime: str) -> tuple:
+def _read_photo_date(data: bytes, mime: str, ext: str = "") -> tuple:
     """Return (year, month) strings from EXIF if available, else today's date."""
     year, month = None, None
-    if mime.startswith("image/"):
+    if ext == "arw":
+        year, month = _arw_photo_date(data)
+    if not year and mime.startswith("image/"):
         try:
             from PIL import Image
             from io import BytesIO
@@ -863,7 +957,7 @@ def _get_node_docs_dir(node_id: str | None, tree: dict | None = None) -> "Path |
     return subdir
 
 
-_PHOTO_EXTS = {"jpg", "jpeg", "png", "heic", "heif", "tif", "tiff", "webp", "gif", "bmp"}
+_PHOTO_EXTS = {"jpg", "jpeg", "png", "heic", "heif", "tif", "tiff", "webp", "gif", "bmp", "arw"}
 _VIDEO_EXTS = {"mp4", "mov", "m4v", "avi", "mkv", "webm", "wmv", "3gp", "3g2", "mpg", "mpeg", "flv"}
 
 
@@ -3077,8 +3171,8 @@ def mobile_upload():
         photo_year, photo_month = (None, None)
         gps_lat, gps_lon = None, None
         if is_photo:
-            photo_year, photo_month = _read_photo_date(data, mime)
-            gps_lat, gps_lon = _read_photo_gps(data)
+            photo_year, photo_month = _read_photo_date(data, mime, ext.lower())
+            gps_lat, gps_lon = _read_photo_gps(data, ext.lower())
             if gps_lat is not None:
                 _reverse_geocode_and_patch(doc_id, gps_lat, gps_lon)
 
@@ -4446,7 +4540,7 @@ def post_doc():
 
     _valid_date = _valid_photo_year_month(photo_year, photo_month)
     if is_photo and not _valid_date and route_mode != "current-folder":
-        photo_year, photo_month = _read_photo_date(file_data, mime)
+        photo_year, photo_month = _read_photo_date(file_data, mime, ext.lower())
         _valid_date = _valid_photo_year_month(photo_year, photo_month)
     # Videos have no server-side date scan (dms.html already computed
     # photo_year/photo_month client-side from the file's modified date before
@@ -4535,7 +4629,7 @@ def post_doc():
         # — try server-side Pillow fallback for any image format. Gated on is_photo (rather
         # than running unconditionally) so a big video/PDF/other upload never pays for a
         # second full-size copy of file_data into a BytesIO just to have Pillow reject it.
-        lat, lon = _read_photo_gps(file_data)
+        lat, lon = _read_photo_gps(file_data, ext.lower())
         if lat is not None:
             gps_lat, gps_lon = lat, lon
     if gps_lat is not None:
@@ -4714,6 +4808,21 @@ def get_doc_preview(doc_id):
         except Exception as e:
             print(f"[DMS] HEIC preview conversion failed: {e}")
             return jsonify({"error": f"Cannot preview HEIC: {e}. Install pillow-heif: pip install pillow-heif"}), 500
+
+    if ext == "arw":
+        # Sony RAW isn't browser-viewable: serve the JPEG preview the camera embedded in it.
+        try:
+            from PIL import Image
+            from io import BytesIO
+            for jpg in _arw_embedded_jpegs(file_path.read_bytes()):
+                try:
+                    Image.open(BytesIO(jpg)).verify()
+                except Exception:
+                    continue
+                return Response(jpg, mimetype="image/jpeg")
+        except Exception as e:
+            print(f"[DMS] ARW preview failed: {e}")
+        return jsonify({"error": "No embedded preview found in this ARW"}), 500
 
     # Non-HEIC: serve the file directly
     idx = read_index()
@@ -4909,6 +5018,18 @@ def _send_via_applescript(to_email, subject, body, file_path):
     return jsonify({"error": err}), 500
 
 
+def _smtp_login(srv, user, password):
+    """Log in with AUTH PLAIN only. smtplib.login() retries with AUTH LOGIN after a
+    535, and Gmail/Yahoo drop the connection on that, hiding the real rejection."""
+    import smtplib
+    try:
+        srv.auth("PLAIN", lambda challenge=None: "\0%s\0%s" % (user, password),
+                 initial_response_ok=True)
+    except smtplib.SMTPAuthenticationError as exc:
+        detail = exc.smtp_error.decode("utf-8", "replace") if isinstance(exc.smtp_error, bytes) else str(exc.smtp_error)
+        raise RuntimeError(f"登录被邮件服务器拒绝（{exc.smtp_code}）：用户名或密码/应用专用密码不正确。{detail}") from None
+
+
 def _send_via_smtp(to_email, subject, body, file_path, doc_name, cfg):
     """Send email with attachment via SMTP (cross-platform)."""
     import smtplib
@@ -4945,7 +5066,7 @@ def _send_via_smtp(to_email, subject, body, file_path, doc_name, cfg):
         if use_ssl:
             with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=30) as srv:
                 if smtp_user and smtp_pass:
-                    srv.login(smtp_user, smtp_pass)
+                    _smtp_login(srv, smtp_user, smtp_pass)
                 srv.send_message(msg)
         else:
             with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as srv:
@@ -4953,7 +5074,7 @@ def _send_via_smtp(to_email, subject, body, file_path, doc_name, cfg):
                 srv.starttls()
                 srv.ehlo()
                 if smtp_user and smtp_pass:
-                    srv.login(smtp_user, smtp_pass)
+                    _smtp_login(srv, smtp_user, smtp_pass)
                 srv.send_message(msg)
         return jsonify({"ok": True, "method": "smtp"})
     except Exception as exc:
@@ -5022,7 +5143,7 @@ def test_email_settings():
         if test_cfg["email_ssl"]:
             with smtplib.SMTP_SSL(test_cfg["email_smtp_host"], test_cfg["email_smtp_port"], timeout=30) as srv:
                 if test_cfg["email_smtp_user"] and test_cfg["email_smtp_pass"]:
-                    srv.login(test_cfg["email_smtp_user"], test_cfg["email_smtp_pass"])
+                    _smtp_login(srv, test_cfg["email_smtp_user"], test_cfg["email_smtp_pass"])
                 srv.send_message(msg)
         else:
             with smtplib.SMTP(test_cfg["email_smtp_host"], test_cfg["email_smtp_port"], timeout=30) as srv:
@@ -5030,7 +5151,7 @@ def test_email_settings():
                 srv.starttls()
                 srv.ehlo()
                 if test_cfg["email_smtp_user"] and test_cfg["email_smtp_pass"]:
-                    srv.login(test_cfg["email_smtp_user"], test_cfg["email_smtp_pass"])
+                    _smtp_login(srv, test_cfg["email_smtp_user"], test_cfg["email_smtp_pass"])
                 srv.send_message(msg)
         return jsonify({"ok": True})
     except Exception as exc:
@@ -5847,6 +5968,14 @@ def delete_node(node_id):
     if target.get("name") == NOT_SHOW_FOLDER_NAME:
         return jsonify({"error": "Use the document-level delete to remove items from this folder"}), 400
 
+    # A folder already inside the recycle bin is deleted for real: its
+    # documents are erased too, not re-filed into the bin's top level.
+    bin_node = next((c for c in (tree.get("children") or [])
+                     if c.get("name") == NOT_SHOW_FOLDER_NAME), None)
+    if bin_node is not None and target.get("id") in _collect_node_ids(bin_node) \
+            and target.get("id") != bin_node.get("id"):
+        return _hard_delete_node(idx, tree, target, node_id, docs_dir)
+
     # Collect all doc IDs in the entire subtree, from the tree's own
     # bookkeeping (node.documents).
     def _collect_doc_ids(node):
@@ -5952,6 +6081,48 @@ def delete_node(node_id):
     write_index(idx)
 
     return jsonify({"ok": True, "savedDocs": len(doc_ids), "recycleBinId": not_show_id})
+
+
+def _hard_delete_node(idx, tree, target, node_id, docs_dir):
+    """Permanently delete a folder (and its subfolders) from the recycle bin,
+    along with every document filed in it that isn't linked anywhere else."""
+    subtree_ids = _collect_node_ids(target)
+
+    def _remove(node):
+        return {**node, "children": [_remove(c) for c in (node.get("children") or [])
+                                     if c["id"] != node_id]}
+    new_tree = _remove(tree)
+
+    def _doc_refs(node, out):
+        for d in (node.get("documents") or []):
+            if d.get("id"):
+                out.add(d["id"])
+        for c in (node.get("children") or []):
+            _doc_refs(c, out)
+    inside = set(); _doc_refs(target, inside)
+    inside |= {d.get("id") for d in (idx.get("docIndex") or [])
+               if d.get("id") and d.get("originalNodeId") in subtree_ids}
+    elsewhere = set(); _doc_refs(new_tree, elsewhere)
+    doomed = inside - elsewhere
+
+    failed = []
+    for did in doomed:
+        for m in _find_doc_files(docs_dir, did):
+            try:
+                m.unlink()
+            except OSError as e:
+                failed.append(f"{m.name}: {e}")
+    if failed:
+        return jsonify({"error": "Could not delete: " + "; ".join(failed)}), 500
+
+    node_folder = _get_node_docs_dir(node_id, tree)
+    if node_folder and node_folder != docs_dir and node_folder.exists():
+        shutil.rmtree(node_folder, ignore_errors=True)
+
+    idx["tree"] = new_tree
+    idx["docIndex"] = [d for d in (idx.get("docIndex") or []) if d.get("id") not in doomed]
+    write_index(idx)
+    return jsonify({"ok": True, "deletedDocs": len(doomed)})
 
 
 def _find_node(tree, node_id):
@@ -10458,11 +10629,11 @@ def import_zip_docs():
 
                 mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
-                _photo_exts = {"jpg","jpeg","png","heic","heif","tif","tiff","webp","gif","bmp"}
+                _photo_exts = {"jpg","jpeg","png","heic","heif","tif","tiff","webp","gif","bmp","arw"}
                 _is_photo = ext in _photo_exts or mime.startswith("image/")
                 gps_lat, gps_lon = None, None
                 if _is_photo:
-                    lat, lon = _read_photo_gps(data)
+                    lat, lon = _read_photo_gps(data, ext.lower())
                     if lat is not None:
                         gps_lat, gps_lon = lat, lon
                         # Resolved in the background and patched into the

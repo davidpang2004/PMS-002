@@ -12,6 +12,9 @@ from __future__ import annotations
 
 import asyncio
 import posixpath
+import shutil
+import sqlite3
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -112,9 +115,36 @@ class _Session:
             await self.lk.close()
 
 
+async def _trashed_names(afc) -> set[str]:
+    """Device paths of photos in "Recently Deleted". iOS keeps their files in
+    DCIM for ~30 days, but the Photos database flags them as trashed. Returns an
+    empty set if the database can't be read (the import then behaves as before)."""
+    tmp = tempfile.mkdtemp(prefix="dms-photosdb-")
+    try:
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                await afc.pull("/PhotoData/Photos.sqlite" + suffix, tmp, progress_bar=False)
+            except Exception:
+                if suffix == "":
+                    return set()
+        con = sqlite3.connect(str(Path(tmp) / "Photos.sqlite"))
+        try:
+            rows = con.execute(
+                "SELECT ZDIRECTORY, ZFILENAME FROM ZASSET WHERE ZTRASHEDSTATE = 1").fetchall()
+        finally:
+            con.close()
+        # ZDIRECTORY is stored as "DCIM/100APPLE" (no leading slash).
+        return {posixpath.join("/", d, f).lower() for d, f in rows if d and f}
+    except Exception:
+        return set()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 async def _list_media(udid: str) -> list[dict]:
     items: list[dict] = []
     async with _Session(udid) as afc:
+        trashed = await _trashed_names(afc)
         for folder in await afc.listdir(DCIM):
             fdir = posixpath.join(DCIM, folder)
             try:
@@ -128,6 +158,8 @@ async def _list_media(udid: str) -> list[dict]:
                 if ext not in MEDIA_EXTS or ext in SKIP_EXTS or name.startswith("."):
                     continue
                 path = posixpath.join(fdir, name)
+                if path.lower() in trashed:
+                    continue
                 try:
                     st = await afc.stat(path)
                 except Exception:
