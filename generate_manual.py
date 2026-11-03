@@ -230,7 +230,7 @@ toc_entries = [
     ("10", "Face Recognition"), ("10.1", "Installing the Face Recognition Component"),
     ("10.2", "Tagging Faces"), ("10.3", "Browsing by Person / Auto-Matching"),
     ("11", "Remote and Mobile Upload"), ("11.1", "Sending a Single Document to a Phone"),
-    ("11.2", "Remote Upload (QR-Code Batch Intake)"),
+    ("11.2", "Receiving Files from a Phone (Wi-Fi)"),
     ("12", "Project Management"), ("12.1", "Export Index Backup (METADATA)"),
     ("12.2", "Export Full Backup (COMP)"), ("12.3", "Export Selected Folders (PART)"),
     ("12.4", "Backup Retention Rules"), ("12.5", "Import a Project (.dms)"),
@@ -270,7 +270,7 @@ add_table(
         ["RAM", "4 GB minimum, 8 GB recommended (8 GB+ recommended if you enable face recognition)"],
         ["Disk Space", "About 150-250 MB for the app itself; roughly another 200 MB if you install the optional face-recognition component; plus space for your documents"],
         ["Display", "1280 x 720 or larger"],
-        ["Internet", "Not required for day-to-day use (runs fully offline). Only needed for GPS address lookup, face recognition setup, sending email, or remote upload."],
+        ["Internet", "Not required for day-to-day use (runs fully offline). Only needed for GPS address lookup, face recognition setup, or sending email."],
     ],
     col_widths=[1.8, 4.2]
 )
@@ -934,9 +934,8 @@ h1("11  Remote and Mobile Upload")
 h2("11.1  Sending a Single Document to a Phone")
 para("Click the \u201csend to phone\u201d icon on any document card to generate a link that opens the document directly on a phone's browser - share it by SMS/iMessage, or copy the link and send it any way you like.")
 
-h2("11.2  Remote Upload (QR-Code Batch Intake)")
-para("To receive a batch of photos or files from someone else's phone (or your own) without emailing them one by one, use Remote Upload from the desktop launcher: it shows a QR code that, once scanned, opens an upload page on the phone's browser, and anything uploaded there lands directly in the folder you chose on the desktop.")
-note("Remote upload works over your local network by default; sending or receiving across the open internet requires the tunnel/ngrok setup described alongside that feature in the app, which is outside the scope of this manual section.")
+h2("11.2  Receiving Files from a Phone (Wi-Fi)")
+para("To receive a batch of photos or files from a phone without emailing them one by one, use the Wi-Fi tab of the Upload/Download from iPhone window (section 4.19): put the phone on the same Wi-Fi as the computer, choose the destination folder, scan the QR code, and upload - the files land directly in the folder you chose. The old Remote Upload button in the launcher window has been removed.")
 
 page_break()
 
@@ -1032,7 +1031,7 @@ page_break()
 # 14  PASSWORD
 # ══════════════════════════════════════════════════════════════════════════════
 h1("14  Password Protection")
-para("You can protect DMS with a password so that only authorized users can access the data - strongly recommended once you've enabled LAN access, remote upload, or saved any website login credentials (section 3.6).")
+para("You can protect DMS with a password so that only authorized users can access the data - strongly recommended once you've enabled LAN access or saved any website login credentials (section 3.6).")
 
 para("Set a password:")
 numbered("Click Project, then Set Password.")
@@ -1087,7 +1086,7 @@ numbered("Click the Project menu in the header bar and choose the \u201copen ano
 numbered("DMS starts a separate window and its own service for the new project, on a different local port, completely independent of the first window - both can be logged in and used at the same time without kicking each other's session out.")
 numbered("Opening the same project folder again is detected, and DMS switches to the existing window for it instead of starting a duplicate service.")
 tip("Besides switching to an existing project, the Project menu's Settings group also has Create New Blank Project, which starts a brand-new, empty project in a new folder at any time - no restart, and no need to go through the section 1.3 startup screen.")
-note("Every normal quit (the red close button, the Quit DMS button, Cmd+Q, Dock right-click quit, and so on) records that project's path, so the next plain double-click launch's Continue with last project (section 1.3) points to it - if several project windows were open, \u201clast\u201d means whichever one you quit most recently.")
+note("Every normal quit (the Quit DMS button in the web app, Cmd+Q, Dock right-click quit, and so on) records that project's path, so the next plain double-click launch's Continue with last project (section 1.3) points to it - if several project windows were open, \u201clast\u201d means whichever one you quit most recently.")
 
 page_break()
 
@@ -1168,7 +1167,7 @@ add_table(
         ],
         [
             "Browser shows \u2018this site can't be reached\u2019, or an action reports \u2018Failed to fetch\u2019",
-            "Make sure the DMS background process is still running (a console window or tray icon on Windows; a menu-bar / Dock icon on Mac). Relaunch DMS if it has quit. If you just clicked Quit DMS, the server shutting down is expected."
+            "Make sure the DMS background process is still running (a console window or tray icon on Windows; a menu-bar / Dock icon on Mac). Relaunch DMS if it has quit. If you just quit DMS, the server shutting down is expected. (The small launcher status window is now hidden; quit from the web app's Quit DMS button or Cmd+Q.)"
         ],
         [
             "Clicking \u2018Auto-install deepface\u2019 shows \u2018Installing...\u2019 for a long time",
@@ -1261,7 +1260,7 @@ add_table(
         ["Merge files into one PDF", "Select folder -> Merge Documents -> select files -> Merge"],
         ["Tag faces in photos", "Tag Faces -> check photos -> detect -> name each face"],
         ["Send a document to a phone", "Document card -> send-to-phone icon -> enter number"],
-        ["Receive files from someone else remotely", "Desktop launcher -> Remote Upload -> they scan the QR code"],
+        ["Receive files from someone else remotely", "Upload/Download from iPhone -> Wi-Fi tab -> scan the QR code"],
         ["Move a folder", "Drag and drop the folder to its new place in the tree"],
         ["Set a serial number", "Pencil icon on folder -> enter SN -> Done"],
         ["Export index / full / selected backup", "Project menu -> Export Index / Full / Selected Backup"],
