@@ -926,24 +926,6 @@ class LauncherWindow:
 
         tk.Frame(root, bg="#e7e5e4", height=1).pack(fill="x", padx=20, pady=12)
 
-        # ── Buttons ──────────────────────────────────────────────────────────
-        btn_row = tk.Frame(root, bg=BG)
-        btn_row.pack(fill="x", padx=20, pady=(0, 16))
-
-        # Pack Quit FIRST so it always claims its space on the right.
-        tk.Button(
-            btn_row, text="Quit DMS",
-            command=self._quit,
-            fg=QUIT_FG, activeforeground=QUIT_FG,
-            relief="groove", padx=14, pady=5, cursor="hand2",
-        ).pack(side="right")
-
-        tk.Button(
-            btn_row, text="Remote Upload",
-            command=self._show_remote_upload,
-            relief="groove", padx=10, pady=4,
-        ).pack(side="left", padx=(8, 0))
-
         # ── Footer ───────────────────────────────────────────────────────────
         tk.Label(
             root, text="Closing this window quits the DMS server.",
@@ -1363,6 +1345,10 @@ class LauncherWindow:
 def main() -> None:
     root = tk.Tk()
     win = LauncherWindow(root)
+    # The status window has no use -- hide it. The Tk root still runs the
+    # event loop (Cmd+Q / dock Quit / signals); quitting is also available
+    # from the web UI's "退出 DMS" button.
+    root.withdraw()
 
     # macOS: hook into the application-level Quit event (Cmd+Q, dock Quit).
     # This is the correct Tk/macOS bridge — works regardless of window focus.

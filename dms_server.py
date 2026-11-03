@@ -878,7 +878,13 @@ def _get_or_create_child_node(parent_node: dict, child_name: str) -> dict:
 
 def _read_photo_date(data: bytes, mime: str, ext: str = "") -> tuple:
     """Return (year, month) strings from EXIF if available, else today's date."""
-    year, month = None, None
+    return _read_photo_ymd(data, mime, ext)[:2]
+
+
+def _read_photo_ymd(data: bytes, mime: str, ext: str = "") -> tuple:
+    """Return (year, month, day) strings from EXIF if available, else today's
+    date. Day is "01" when only year/month are known (matches the desktop app)."""
+    year, month, day = None, None, None
     if ext == "arw":
         year, month = _arw_photo_date(data)
     if not year and mime.startswith("image/"):
@@ -894,13 +900,16 @@ def _read_photo_date(data: bytes, mime: str, ext: str = "") -> tuple:
                         parts = val.split(":")
                         if len(parts) >= 2 and parts[0].isdigit() and len(parts[1]) >= 2:
                             year, month = parts[0], parts[1][:2]
+                            day = parts[2][:2] if len(parts) >= 3 and parts[2][:2].isdigit() else None
                             break
         except Exception:
             pass
     if not year:
         now = datetime.now()
-        year, month = now.strftime("%Y"), now.strftime("%m")
-    return year, month
+        year, month, day = now.strftime("%Y"), now.strftime("%m"), now.strftime("%d")
+    if not (day and len(day) == 2 and day.isdigit() and 1 <= int(day) <= 31):
+        day = "01"
+    return year, month, day
 
 
 def _get_node_path_parts(tree: dict, node_id: str) -> list:
@@ -2340,6 +2349,13 @@ input[type=file]::file-selector-button{
     __FOLDER_SELECTOR__
     __HIDDEN_TOKEN__
 
+    <span class="lbl">🗂 Photo folder structure</span>
+    <select name="layout">
+      <option value="ymd-loc" selected>YYYY / MM / DD / Location</option>
+      <option value="ym-loc">YYYY / MM / Location</option>
+      <option value="ymd">YYYY / MM / DD</option>
+    </select>
+
     <span class="lbl">📁 Choose files from library</span>
     <input type="file" name="file" multiple
            accept="image/*,application/pdf,text/*,.txt,.csv,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.zip">
@@ -3146,6 +3162,12 @@ def mobile_upload():
     loc_settings = _photo_location_settings()
     loc_radius_mi = _ploc.settings_radius_miles(loc_settings)
     new_location_node_ids: list[str] = []
+    # Folder structure picked on the phone's upload page (default Y/M/D/Location).
+    layout = (request.form.get("layout") or "ymd-loc").strip()
+    if layout not in ("ym-loc", "ymd", "ymd-loc"):
+        layout = "ymd-loc"
+    use_day = layout in ("ymd", "ymd-loc")
+    use_loc = layout in ("ym-loc", "ymd-loc") and loc_settings["enabled"]
 
     limit_reached = False
     for i, f in enumerate(all_files):
@@ -3171,7 +3193,7 @@ def mobile_upload():
         photo_year, photo_month = (None, None)
         gps_lat, gps_lon = None, None
         if is_photo:
-            photo_year, photo_month = _read_photo_date(data, mime, ext.lower())
+            photo_year, photo_month, photo_day = _read_photo_ymd(data, mime, ext.lower())
             gps_lat, gps_lon = _read_photo_gps(data, ext.lower())
             if gps_lat is not None:
                 _reverse_geocode_and_patch(doc_id, gps_lat, gps_lon)
@@ -3201,7 +3223,13 @@ def mobile_upload():
                         base_node_id=base_node_id,
                     )
                 ) or docs_dir
-            if loc_settings["enabled"] and gps_lat is not None and attach_node_id and tree:
+            if use_day and tree and attach_node_id:
+                month_node_d = _find_node_by_id(tree, attach_node_id)
+                if month_node_d is not None:
+                    day_node = _get_or_create_child_node(month_node_d, photo_day)
+                    attach_node_id = day_node.get("id")
+                    out_dir = _get_node_docs_dir(attach_node_id, tree) or out_dir
+            if use_loc and gps_lat is not None and attach_node_id and tree:
                 month_node = _find_node_by_id(tree, attach_node_id)
                 if month_node is not None and not month_node.get("geoCluster"):
                     hit = _ploc.find_cluster(_ploc.node_centers(month_node), gps_lat, gps_lon, loc_radius_mi)

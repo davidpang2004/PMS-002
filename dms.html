@@ -1788,7 +1788,7 @@ const geoDistanceMiles = (lat1, lon1, lat2, lon2) => {
 const locRadiusToMiles = (value, unit) => (unit === "km" ? value / LOC_KM_PER_MILE : value);
 
 // Folder layout for date-routed photo uploads. Kept in the browser (the server
-// only stores {enabled, radius, unit}); "ym-loc" is the long-standing default.
+// only stores {enabled, radius, unit}); "ymd-loc" is the default.
 //   ym-loc  = Year/Month/Location     ymd = Year/Month/Day     ymd-loc = Year/Month/Day/Location
 const LOC_LAYOUTS = ["ym-loc", "ymd", "ymd-loc"];
 const readLocLayout = () => {
@@ -1796,7 +1796,7 @@ const readLocLayout = () => {
     const v = localStorage.getItem("dms:photo-folder-layout");
     if (LOC_LAYOUTS.includes(v)) return v;
   } catch {}
-  return "ym-loc";
+  return "ymd-loc";
 };
 
 // Coerce anything (server reply, dialog draft) into a valid {enabled, radius, unit, layout}.
@@ -2508,7 +2508,8 @@ const TreeNode = ({
   const isRenaming = renamingId === node.id;
   const isAddingChild = addingChildToId === node.id;
   const hasChildren = (node.children || []).length > 0;
-  const docCount = (node.documents || []).length;
+  // Every document in this folder and all its subfolders (a doc linked twice counts once).
+  const docCount = useMemo(() => new Set(collectAllDocIds(node)).size, [node]);
   const isLast = siblingIndex === siblingCount - 1;
   const isPhotoRoot = node.id === photoRootNodeId;
   const isRecycleBin = node.name === NOT_SHOW_FOLDER_NAME;
@@ -2837,7 +2838,7 @@ const TreeNode = ({
 // checkbox, the regroup dialog). `draft` = { enabled, radius (text), unit }.
 const LocationGroupingControls = ({ draft, setDraft, showToggle = true, hint = true, showLayout = true }) => {
   const { t } = useLang();
-  const layout = showLayout ? (draft.layout || "ym-loc") : "ym-loc";
+  const layout = showLayout ? (draft.layout || "ymd-loc") : "ym-loc";
   const layoutHasLoc = layout !== "ymd";
   const active = layoutHasLoc && (draft.enabled || !showToggle);
   const invalid = active && !locDraftValid(draft);
@@ -2896,6 +2897,29 @@ const LocationGroupingControls = ({ draft, setDraft, showToggle = true, hint = t
         </span>
       )}
     </div>
+  );
+};
+
+// "Add text to filenames" box shared by the upload dialogs.
+const FilenameTextField = ({ value, setValue }) => {
+  const { t } = useLang();
+  return (
+    <label className="flex flex-col gap-1 text-sm text-stone-700 border border-stone-200 rounded px-3 py-2 bg-stone-50">
+      {t("在文件名中添加文字（可选）", "Add text to filenames (optional)")}
+      <div className="flex gap-1.5">
+        <input
+          type="text"
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          placeholder={t("留空则不添加", "Leave blank to add nothing")}
+          className="flex-1 min-w-0 text-sm px-2 py-1 border border-stone-300 rounded focus:outline-none focus:border-amber-500"
+        />
+        <VoiceMicButton onFinalTranscript={(chunk) => setValue((prev) => appendWithSpace(prev, chunk))} />
+      </div>
+      <span className="text-[12px] text-stone-600">
+        {t("有日期时添加在日期之后，例如 2026-09-17-文字-原文件名；没有日期时添加在文件名最前面。", "Placed right after the date when there is one (e.g. 2026-09-17-text-original name), or at the very front of the name when there isn't.")}
+      </span>
+    </label>
   );
 };
 
@@ -8280,7 +8304,7 @@ const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onG
 
   const run = async () => {
     cancelRef.current = false;
-    try { localStorage.setItem("dms:photo-folder-layout", locDraft.layout || "ym-loc"); } catch (e) {}
+    try { localStorage.setItem("dms:photo-folder-layout", locDraft.layout || "ymd-loc"); } catch (e) {}
     setRunning(true); setResult(null);
     const todo = picked.slice().reverse();     // oldest first
     const doneSet = loadSeen();
@@ -8398,7 +8422,7 @@ const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onG
     <div className="fixed inset-0 z-[70] bg-black/40 flex items-center justify-center p-4">
       <div className="bg-white rounded shadow-2xl border border-stone-300 w-full max-w-xl max-h-[88vh] flex flex-col">
         <div className="flex items-center px-4 py-2.5 border-b border-stone-200">
-          <div className="font-bold text-stone-800">{t("从 iPhone 导入", "Import from iPhone")}</div>
+          <div className="font-bold text-stone-800">{t("从 iPhone 上传/下载", "Upload/Download from iPhone")}</div>
           <button onClick={onClose} disabled={running} className="ml-auto p-1 text-stone-600 hover:text-stone-800 disabled:opacity-40"><X size={16} /></button>
         </div>
         <div className="flex border-b border-stone-200 text-[13px]">
@@ -11880,7 +11904,7 @@ const SendToPhoneDialog = ({ doc, onClose }) => {
                     <div className="pl-2">{t("→ 上方显示的 IP 是否是", "→ Is the IP shown above")} <strong>192.168.x.x</strong> {t("或", "or")} <strong>10.x.x.x</strong>{t("（局域网）？若是 VPN IP，请先断开 VPN。", " (local network)? If it's a VPN IP, disconnect the VPN first.")}</div>
                     <div className="font-medium text-stone-800">{t("④ 路由器开启了 AP 隔离", "④ The router has AP/client isolation enabled")}</div>
                     <div className="pl-2">{t("→ 登录路由器管理页，关闭「AP 隔离」/「客户端隔离」。", "→ Log into the router's admin page and turn off “AP isolation” / “client isolation”.")}</div>
-                    <div className="pt-1 text-amber-700 font-medium">{t("以上都试过还是不行？使用 Launcher 窗口中的「Remote Upload」，通过公网发送，不受 Wi-Fi 限制。", "Still not working after trying all of these? Use “Remote Upload” in the Launcher window to send over the public internet, unaffected by Wi-Fi restrictions.")}</div>
+                    <div className="pt-1 text-amber-700 font-medium">{t("以上都试过还是不行？改用 USB 数据线连接 iPhone，不受 Wi-Fi 限制。", "Still not working after trying all of these? Connect the iPhone with a USB cable instead — it is unaffected by Wi-Fi restrictions.")}</div>
                   </div>
                 )}
               </div>
@@ -19677,6 +19701,7 @@ function DMS({ storagePath, onChangeFolder }) {
   // all) documents inside "Not Show in Tree" and permanently delete them
   // in one action, instead of one confirm dialog per document.
   const [recycleSelectMode, setRecycleSelectMode] = useState(false);
+  const [recycleEmptying, setRecycleEmptying] = useState(false);
   const [recycleSelectedIds, setRecycleSelectedIds] = useState(new Set());
   // Leaving the folder (including navigating away from the recycle bin)
   // drops any in-progress bulk selection rather than carrying it silently
@@ -20012,6 +20037,63 @@ function DMS({ storagePath, onChangeFolder }) {
     }
   };
 
+  // Thumbnails ticked inside the results dialog for deleting right there.
+  const [dupePicked, setDupePicked] = useState(new Set());
+  const [dupeDeleting, setDupeDeleting] = useState(false);
+  useEffect(() => { setDupePicked(new Set()); }, [dupeDialog?.result]);
+  const toggleDupePicked = (id) => setDupePicked((prev) => {
+    const next = new Set(prev);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    return next;
+  });
+  // Tick every photo except each group's recommended one (★).
+  const pickDupeAllButRecommended = () => {
+    const next = new Set();
+    for (const g of dupeDialog?.result?.groups || []) {
+      g.docIds.forEach((id) => { if (id !== g.recommendedDocId) next.add(id); });
+    }
+    setDupePicked(next);
+  };
+  // Delete the ticked photos: every link is removed and the files move to
+  // "Deleted files" (recoverable), same as deleting inside a dupe-review folder.
+  const deleteDupePicked = async () => {
+    const ids = Array.from(dupePicked);
+    if (!ids.length || dupeDeleting) return;
+    if (!confirm(t(
+      `确定删除选中的 ${ids.length} 张照片？\n\n它们的所有链接都会被移除，文件会先移至根目录下的"${NOT_SHOW_FOLDER_NAME}"（已删除文件）文件夹（磁盘上的文件也随之移入），之后在那里再删除才会永久清除。`,
+      `Delete the selected ${ids.length} photo(s)?\n\nAll their links are removed and the files are first moved (on disk too) into the "${NOT_SHOW_FOLDER_NAME}" (Deleted files) folder at the root; delete them there to erase them permanently.`
+    ))) return;
+    setDupeDeleting(true);
+    try {
+      const idSet = new Set(ids);
+      let workingTree = stripDocsFromAllNodes(tree, idSet);
+      let notShowId;
+      [workingTree, notShowId] = getOrCreateNotShowNode(workingTree);
+      workingTree = updateNodeInTree(workingTree, notShowId, (n) => ({
+        ...n, documents: [...(n.documents || []), ...ids.map((id) => ({ id }))],
+      }));
+      // Save docIndex first so the server's file-sync reads the new originalNodeId.
+      await StorageAdapter.saveDocumentIndex(docIndex.map((e) => (idSet.has(e.id) ? { ...e, originalNodeId: notShowId } : e)));
+      await StorageAdapter.saveTree(workingTree);
+      const { tree: freshTree } = await StorageAdapter.getTree();
+      const freshIndex = await StorageAdapter.listDocumentIndex();
+      setTree(freshTree);
+      setDocIndex(freshIndex);
+      // Drop the deleted photos from the results; a group left with one photo is no longer a group.
+      setDupeDialog((d) => {
+        if (!d || !d.result) return d;
+        const groups = d.result.groups
+          .map((g) => ({ ...g, docIds: g.docIds.filter((id) => !idSet.has(id)) }))
+          .filter((g) => g.docIds.length >= 2);
+        return { ...d, result: { ...d.result, groups } };
+      });
+    } catch (e) {
+      setDupeDialog((d) => (d ? { ...d, error: e.message || String(e) } : d));
+    } finally {
+      setDupeDeleting(false);
+    }
+  };
+
   const markDupeGroups = async () => {
     if (!dupeDialog?.result?.groups?.length) return;
     setDupeDialog((d) => (d ? { ...d, marking: true } : d));
@@ -20232,7 +20314,15 @@ function DMS({ storagePath, onChangeFolder }) {
   const [locSettings, setLocSettings] = useState(LOC_DEFAULTS);
   const locSettingsRef = useRef(LOC_DEFAULTS);
   const [locDraft, setLocDraft] = useState(locSettingsToDraft(LOC_DEFAULTS));
-  const [locPrompt, setLocPrompt] = useState(null);       // { files }
+  const [locPrompt, setLocPrompt] = useState(null);       // { files, nodeId, mode: "year-month" | "current-folder" | "plain" }
+  const [locPromptExtraText, setLocPromptExtraText] = useState("");
+  // Every non-folder upload path opens this one dialog (optional filename text,
+  // plus the location radius when photos are headed for year/month folders).
+  const promptUpload = (files, nodeId, mode) => {
+    setLocDraft(locSettingsToDraft(locSettingsRef.current));
+    setLocPromptExtraText("");
+    setLocPrompt({ files, nodeId, mode });
+  };
   const [regroupDialog, setRegroupDialog] = useState(null); // { nodeId, name, draft, busy, ... }
   const multiFolderInputRef = useRef(null);
   const [draggingId, setDraggingId] = useState(null);
@@ -21640,13 +21730,21 @@ function DMS({ storagePath, onChangeFolder }) {
   };
 
   const confirmLocPrompt = async () => {
-    if (!locPrompt || !locDraftValid(locDraft)) return;
-    const { files, nodeId } = locPrompt;
-    const cfg = locDraftToSettings(locDraft);
+    if (!locPrompt || (locPrompt.mode === "year-month" && !locDraftValid(locDraft))) return;
+    const { files, nodeId, mode } = locPrompt;
+    const extraText = locPromptExtraText.trim();
     setLocPrompt(null);
-    await rememberLocSettings(cfg);
+    setLocPromptExtraText("");
     try {
-      await uploadFilesToNode(nodeId, files, { locationGrouping: cfg });
+      if (mode === "year-month") {
+        const cfg = locDraftToSettings(locDraft);
+        await rememberLocSettings(cfg);
+        await uploadFilesToNode(nodeId, files, { locationGrouping: cfg, extraText });
+      } else if (mode === "current-folder") {
+        await uploadFilesToNode(nodeId, files, { routeMode: "current-folder", extraText });
+      } else {
+        await uploadFilesToNode(nodeId, files, { extraText });
+      }
     } catch (err) {
       console.error("[DMS] ✗ Top-level upload error:", err);
       alert(t("上传过程中发生意外错误：", "An unexpected error occurred during upload: ") + err.message);
@@ -21672,22 +21770,10 @@ function DMS({ storagePath, onChangeFolder }) {
       alert(t("请先在装配树中点击选择一个文件夹。", "Please click to select a folder in the assembly tree first."));
       return;
     }
-    if (files.some(looksLikePhotoFile)) {
-      // Photos: confirm the location-grouping radius first (pre-filled with
-      // the one used last time), then upload from confirmLocPrompt.
-      e.target.value = "";
-      setLocDraft(locSettingsToDraft(locSettingsRef.current));
-      setLocPrompt({ files, nodeId: selectedId });
-      return;
-    }
-    console.log(`[DMS] Uploading ${files.length} file(s) to selected node ${selectedId}`);
-    try {
-      await uploadFilesToNode(selectedId, files);
-    } catch (e) {
-      console.error("[DMS] ✗ Top-level upload error:", e);
-      alert(t("上传过程中发生意外错误：", "An unexpected error occurred during upload: ") + e.message);
-    }
+    // Confirm first: filename text, plus (for photos) the location-grouping
+    // radius pre-filled with the one used last time; upload from confirmLocPrompt.
     e.target.value = "";
+    promptUpload(files, selectedId, files.some(looksLikePhotoFile) ? "year-month" : "plain");
   };
 
   const openMultiFolderDialog = () => {
@@ -21762,28 +21848,18 @@ function DMS({ storagePath, onChangeFolder }) {
       alert(t("请先在装配树中点击选择一个文件夹。", "Please click to select a folder in the assembly tree first."));
       return;
     }
-    try {
-      await uploadFilesToNode(selectedId, files, { routeMode: "current-folder" });
-    } catch (err) {
-      console.error("[DMS] ✗ Current-folder upload error:", err);
-      alert(t("上传过程中发生意外错误：", "An unexpected error occurred during upload: ") + err.message);
-    }
     e.target.value = "";
+    promptUpload(files, selectedId, "current-folder");
   };
 
   const handleTreeUpload = async (nodeId, e) => {
     console.log(`[DMS] handleTreeUpload triggered for node ${nodeId}, files=`, e.target.files);
     const files = Array.from(e.target.files || []);
     if (!files.length) return;
-    try {
-      await uploadFilesToNode(nodeId, files);
-    } catch (e2) {
-      console.error("[DMS] ✗ Top-level tree upload error:", e2);
-      alert("Unexpected error during upload: " + e2.message);
-    }
+    e.target.value = "";
     setSelectedId(nodeId);
     setExpandedIds((prev) => new Set([...prev, nodeId]));
-    e.target.value = "";
+    promptUpload(files, nodeId, files.some(looksLikePhotoFile) ? "year-month" : "plain");
   };
 
   const handlePanelDragOver = (e) => {
@@ -21835,10 +21911,10 @@ function DMS({ storagePath, onChangeFolder }) {
         setFolderPickerOpen(true);
         return;
       }
-      uploadFilesToNode(selectedId, files, { routeMode: "current-folder" });
+      promptUpload(files, selectedId, "current-folder");
       return;
     }
-    uploadFilesToNode(selectedId, Array.from(e.dataTransfer.files), { routeMode: "current-folder" });
+    promptUpload(Array.from(e.dataTransfer.files), selectedId, "current-folder");
   };
 
   // The single choke point every "open this document" action goes through
@@ -22444,6 +22520,42 @@ function DMS({ storagePath, onChangeFolder }) {
     await purgeDocumentIds(ids);
     setRecycleSelectedIds(new Set());
     setRecycleSelectMode(false);
+  };
+
+  // One-click "empty the recycle bin": permanently deletes the bin's own
+  // documents and every subfolder (with its subfolders and files) under it.
+  const emptyRecycleBin = async () => {
+    const bin = (tree.children || []).find((c) => c.name === NOT_SHOW_FOLDER);
+    if (!bin) return;
+    const subs = bin.children || [];
+    const ownIds = (bin.documents || []).map((d) => d.id);
+    const total = new Set(collectAllDocIds(bin)).size;
+    if (!subs.length && !ownIds.length) return;
+    if (!confirm(t(
+      `确定清空"已删除文件"？\n\n将永久删除其中的 ${subs.length} 个子文件夹（含所有下级子文件夹）和共 ${total} 份文档，文件将从磁盘上删除。此操作无法撤销。`,
+      `Empty "Deleted files"?\n\nThis permanently deletes its ${subs.length} subfolder(s) (with all their subfolders) and ${total} document(s) in total; the files are erased from disk. This cannot be undone.`
+    ))) return;
+    setRecycleEmptying(true);
+    const failures = [];
+    try {
+      if (ownIds.length) await purgeDocumentIds(ownIds);
+      for (const c of subs) {
+        try {
+          const res = await fetch(`/api/nodes/${c.id}`, { method: "DELETE" });
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            failures.push(`${c.name}: ${err.error || res.status}`);
+          }
+        } catch (e) { failures.push(`${c.name}: ${e.message}`); }
+      }
+      const { tree: freshTree } = await StorageAdapter.getTree();
+      const freshIndex = await StorageAdapter.listDocumentIndex();
+      setTree(freshTree);
+      setDocIndex(freshIndex);
+    } finally {
+      setRecycleEmptying(false);
+    }
+    if (failures.length) alert(t("部分子文件夹删除失败：\n\n", "Some subfolders failed to delete:\n\n") + failures.join("\n"));
   };
 
   // Add a link from one or more existing documents to one or more nodes
@@ -23237,7 +23349,7 @@ function DMS({ storagePath, onChangeFolder }) {
                     className="text-[13px] px-2 py-1 border border-stone-300 hover:bg-amber-50 hover:border-amber-400 rounded flex items-center gap-1"
                     title={t("用数据线连接 iPhone，直接导入照片和视频", "Connect an iPhone with a USB cable and import its photos and videos")}
                   >
-                    <ImageIcon size={11} /> {t("从 iPhone 导入", "Import from iPhone")}
+                    <ImageIcon size={11} /> {t("从 iPhone 上传/下载", "Upload/Download from iPhone")}
                   </button>
                   <button
                     onClick={() => setShowHeicDialog(true)}
@@ -23366,7 +23478,7 @@ function DMS({ storagePath, onChangeFolder }) {
                       onFileDrop={(nodeId, files) => {
                         setSelectedId(nodeId);
                         setExpandedIds((prev) => new Set([...prev, nodeId]));
-                        uploadFilesToNode(nodeId, Array.from(files), { routeMode: "current-folder" });
+                        promptUpload(Array.from(files), nodeId, "current-folder");
                       }}
                       draggingId={draggingId}
                       dropInfo={dropInfo}
@@ -23825,6 +23937,20 @@ function DMS({ storagePath, onChangeFolder }) {
                     </button>
                   </div>
                 </div>
+
+                {isRecycleBinNode && ((selectedNode.documents || []).length > 0 || (selectedNode.children || []).length > 0) && (
+                  <div className="flex items-center justify-between mb-3 px-3 py-2 border border-red-200 rounded bg-red-50">
+                    <span className="text-[13px] text-stone-700">{t(`共 ${new Set(collectAllDocIds(selectedNode)).size} 份文档，${(selectedNode.children || []).length} 个子文件夹`, `${new Set(collectAllDocIds(selectedNode)).size} document(s), ${(selectedNode.children || []).length} subfolder(s)`)}</span>
+                    <button
+                      onClick={emptyRecycleBin}
+                      disabled={recycleEmptying}
+                      className="text-sm px-3 py-1.5 border border-red-400 bg-white hover:bg-red-100 text-red-700 rounded flex items-center gap-1.5 disabled:opacity-40"
+                      title={t("永久删除这里的所有文档和子文件夹（含下级子文件夹），此操作无法撤销", "Permanently delete everything here — documents and all subfolders (with their subfolders); this cannot be undone")}
+                    >
+                      {recycleEmptying ? <Loader size={12} className="animate-spin" /> : <Trash2 size={12} />} {t("清空已删除文件", "Empty Deleted files")}
+                    </button>
+                  </div>
+                )}
 
                 {isRecycleBinNode && (selectedNode.documents || []).length > 0 && (
                   <div className="flex items-center justify-between mb-3 px-3 py-2 border border-stone-300 rounded bg-stone-50">
@@ -24874,22 +25000,7 @@ function DMS({ storagePath, onChangeFolder }) {
             {folderUploadMode === "year-month" && (
               <LocationGroupingControls draft={locDraft} setDraft={setLocDraft} />
             )}
-            <label className="flex flex-col gap-1 text-sm text-stone-700 border border-stone-200 rounded px-3 py-2 bg-stone-50">
-              {t("在文件名中添加文字（可选）", "Add text to filenames (optional)")}
-              <div className="flex gap-1.5">
-                <input
-                  type="text"
-                  value={folderUploadExtraText}
-                  onChange={(e) => setFolderUploadExtraText(e.target.value)}
-                  placeholder={t("留空则不添加", "Leave blank to add nothing")}
-                  className="flex-1 min-w-0 text-sm px-2 py-1 border border-stone-300 rounded focus:outline-none focus:border-amber-500"
-                />
-                <VoiceMicButton onFinalTranscript={(chunk) => setFolderUploadExtraText((prev) => appendWithSpace(prev, chunk))} />
-              </div>
-              <span className="text-[12px] text-stone-600">
-                {t("有日期时添加在日期之后，例如 2026-09-17-文字-原文件名；没有日期时添加在文件名最前面。", "Placed right after the date when there is one (e.g. 2026-09-17-text-original name), or at the very front of the name when there isn't.")}
-              </span>
-            </label>
+            <FilenameTextField value={folderUploadExtraText} setValue={setFolderUploadExtraText} />
             <div className="flex justify-end gap-2">
               <button onClick={() => { setFolderPickerOpen(false); setPendingFolderFiles([]); setFolderUploadMode("year-month"); setFolderUploadExtraText(""); }} className="text-sm px-3 py-1.5 rounded border border-stone-300 hover:bg-stone-50 text-stone-700">{t("取消", "Cancel")}</button>
               <button
@@ -24908,19 +25019,24 @@ function DMS({ storagePath, onChangeFolder }) {
         <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center"
              onClick={(e) => { if (e.target === e.currentTarget) setLocPrompt(null); }}>
           <div className="bg-white rounded-lg shadow-xl p-6 w-96 flex flex-col gap-4"
-               onKeyDown={(e) => { if (e.key === "Enter") confirmLocPrompt(); else if (e.key === "Escape") setLocPrompt(null); }}>
+               onKeyDown={(e) => { if (e.key === "Enter" && e.target.tagName !== "BUTTON") confirmLocPrompt(); else if (e.key === "Escape") setLocPrompt(null); }}>
             <h3 className="font-semibold text-base text-stone-800">
               {t(`上传 ${locPrompt.files.length} 个文件`, `Upload ${locPrompt.files.length} file(s)`)}
             </h3>
-            <div className="text-sm text-stone-700">
-              {t("照片会按拍摄日期放入 年/月 文件夹。", "Photos are filed into year/month folders by the date taken.")}
-            </div>
-            <LocationGroupingControls draft={locDraft} setDraft={setLocDraft} />
+            {locPrompt.mode === "year-month" && (
+              <>
+                <div className="text-sm text-stone-700">
+                  {t("照片会按拍摄日期放入 年/月 文件夹。", "Photos are filed into year/month folders by the date taken.")}
+                </div>
+                <LocationGroupingControls draft={locDraft} setDraft={setLocDraft} />
+              </>
+            )}
+            <FilenameTextField value={locPromptExtraText} setValue={setLocPromptExtraText} />
             <div className="flex justify-end gap-2">
               <button onClick={() => setLocPrompt(null)} className="text-sm px-3 py-1.5 rounded border border-stone-300 hover:bg-stone-50 text-stone-700">{t("取消", "Cancel")}</button>
               <button
                 onClick={confirmLocPrompt}
-                disabled={!locDraftValid(locDraft)}
+                disabled={locPrompt.mode === "year-month" && !locDraftValid(locDraft)}
                 className="text-sm px-3 py-1.5 rounded bg-amber-600 hover:bg-amber-700 text-white disabled:opacity-40 disabled:cursor-not-allowed"
               >{t("上传", "Upload")}</button>
             </div>
@@ -25268,6 +25384,11 @@ function DMS({ storagePath, onChangeFolder }) {
                   </div>
                 ) : (
                   <div className="flex flex-col gap-3">
+                    <div className="flex items-center flex-wrap gap-2 text-[12px]">
+                      <button onClick={pickDupeAllButRecommended} className="px-2 py-1 rounded border border-stone-300 hover:bg-stone-50 text-stone-700">{t("选中除推荐(★)外的全部", "Select all except recommended (★)")}</button>
+                      <button onClick={() => setDupePicked(new Set())} disabled={!dupePicked.size} className="px-2 py-1 rounded border border-stone-300 hover:bg-stone-50 text-stone-700 disabled:opacity-40">{t("取消选择", "Clear")}</button>
+                      <span className="text-stone-500">{t("勾选照片左上角的方框，可在此直接删除。", "Tick a photo's box (top-left) to delete it right here.")}</span>
+                    </div>
                     {dupeDialog.result.groups.map((group, gi) => (
                       <div key={gi} className="border border-stone-200 rounded p-2">
                         <div className="text-[12px] text-stone-600 mb-1.5">
@@ -25287,6 +25408,14 @@ function DMS({ storagePath, onChangeFolder }) {
                                     alt={meta?.name || docId}
                                     className={(gridThumbSize === "large" ? "w-32 h-32" : "w-16 h-16")
                                       + ` object-cover rounded border bg-stone-100 ${isRecommended ? "border-emerald-500 ring-1 ring-emerald-400" : "border-stone-200"}`}
+                                  />
+                                  <input
+                                    type="checkbox"
+                                    checked={dupePicked.has(docId)}
+                                    onChange={() => toggleDupePicked(docId)}
+                                    disabled={dupeDeleting}
+                                    className="absolute top-1 left-1 w-4 h-4 cursor-pointer accent-red-600"
+                                    title={t("选中以删除", "Select to delete")}
                                   />
                                   {isRecommended && (
                                     <div
@@ -25321,6 +25450,17 @@ function DMS({ storagePath, onChangeFolder }) {
                 disabled={dupeDialog.checking || dupeDialog.marking}
                 className="text-sm px-3 py-1.5 rounded border border-stone-300 hover:bg-stone-50 text-stone-700 disabled:opacity-40"
               >{t("关闭", "Close")}</button>
+              {dupeDialog.result?.groups.length > 0 && !dupeDialog.marked && (
+                <button
+                  onClick={deleteDupePicked}
+                  disabled={!dupePicked.size || dupeDeleting || dupeDialog.marking}
+                  className="text-sm px-3 py-1.5 rounded bg-red-600 hover:bg-red-700 text-white disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5"
+                >
+                  {dupeDeleting
+                    ? (<><Loader size={13} className="animate-spin" /> {t("删除中…", "Deleting…")}</>)
+                    : (<><Trash2 size={12} /> {t(`删除选中 (${dupePicked.size})`, `Delete selected (${dupePicked.size})`)}</>)}
+                </button>
+              )}
               {dupeDialog.result?.groups.length > 0 && !dupeDialog.marked && (
                 <button
                   onClick={markDupeGroups}
