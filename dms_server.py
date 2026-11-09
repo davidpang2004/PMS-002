@@ -2511,6 +2511,25 @@ def create_remote_token():
     return jsonify({"token": token})
 
 
+def _public_or_lan_base(use_tunnel=False):
+    """Return (base_url, lan_ip).  With use_tunnel, uses the cloudflared tunnel
+    (works from any network); otherwise (or if the tunnel fails) the LAN address."""
+    global _tunnel_base_url
+    if use_tunnel and _tunnel_start_fn is not None:
+        with _tunnel_start_lock:
+            try:
+                _tunnel_base_url = _tunnel_start_fn()
+            except Exception as _e:
+                print(f"[DMS] Tunnel check/start failed: {_e} -- falling back to LAN IP")
+                _tunnel_base_url = ""
+    if use_tunnel and _tunnel_base_url:
+        return _tunnel_base_url, ""
+    ip = _get_lan_ip()
+    host = request.host
+    port = host.split(":")[-1] if ":" in host else "8765"
+    return f"http://{ip}:{port}", ip
+
+
 @app.route("/api/phone-upload-link", methods=["POST"])
 def create_phone_upload_link():
     """Wi-Fi upload link (+ QR code) for sending files from a phone into one folder.
@@ -2525,13 +2544,7 @@ def create_phone_upload_link():
     node_id = (data.get("node_id") or "").strip()
     token = secrets.token_hex(16)
     _REMOTE_TOKENS[token] = {"node_id": node_id, "expiry": _time.time() + 7 * 86400}
-    if _tunnel_base_url:
-        base, ip = _tunnel_base_url, ""
-    else:
-        ip = _get_lan_ip()
-        host = request.host
-        port = host.split(":")[-1] if ":" in host else "8765"
-        base = f"http://{ip}:{port}"
+    base, ip = _public_or_lan_base(bool(data.get("tunnel")))
     url = f"{base}/mobile/r/{token}"
     qr = ""
     try:
@@ -2899,13 +2912,7 @@ def create_send_to_iphone_link():
     if not items:
         return jsonify({"error": "No photos or videos found in that folder."}), 400
     token = secrets.token_hex(16)
-    if _tunnel_base_url:
-        base, ip = _tunnel_base_url, ""
-    else:
-        ip = _get_lan_ip()
-        host = request.host
-        port = host.split(":")[-1] if ":" in host else "8765"
-        base = f"http://{ip}:{port}"
+    base, ip = _public_or_lan_base(bool(data.get("tunnel")))
     _SEND_TOKENS[token] = {"items": items, "base": base, "expiry": _time.time() + _SEND_TOKEN_TTL}
     url = f"{base}/send/{token}"
     qr = ""

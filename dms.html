@@ -425,6 +425,7 @@ const Upload = (p) => (
     <line x1="12" y1="3" x2="12" y2="15" />
   </I>
 );
+const Link2 = (p) => <I {...p}><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></I>;
 const Search = (p) => <I {...p}><circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" /></I>;
 const X = (p) => <I {...p}><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></I>;
 const Edit2 = (p) => (
@@ -517,6 +518,18 @@ const CheckSquare = (p) => (
   <I {...p}>
     <polyline points="9 11 12 14 22 4" />
     <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
+  </I>
+);
+const Eye = (p) => (
+  <I {...p}>
+    <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+    <circle cx="12" cy="12" r="3" />
+  </I>
+);
+const EyeOff = (p) => (
+  <I {...p}>
+    <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24" />
+    <line x1="1" y1="1" x2="23" y2="23" />
   </I>
 );
 const Square = (p) => <I {...p}><rect x="3" y="3" width="18" height="18" rx="2" ry="2" /></I>;
@@ -1790,7 +1803,8 @@ const locRadiusToMiles = (value, unit) => (unit === "km" ? value / LOC_KM_PER_MI
 // Folder layout for date-routed photo uploads. Kept in the browser (the server
 // only stores {enabled, radius, unit}); "ymd-loc" is the default.
 //   ym-loc  = Year/Month/Location     ymd = Year/Month/Day     ymd-loc = Year/Month/Day/Location
-const LOC_LAYOUTS = ["ym-loc", "ymd", "ymd-loc"];
+//   asis    = upload as they are (no Year/Month/... folders created)
+const LOC_LAYOUTS = ["ym-loc", "ymd", "ymd-loc", "asis"];
 const readLocLayout = () => {
   try {
     const v = localStorage.getItem("dms:photo-folder-layout");
@@ -2501,13 +2515,14 @@ const TreeNode = ({
   draggingId, dropInfo, onDragStart, onDragOver, onDragEnd, onDrop,
   onDocDrop,
   folderSelectMode, folderSelectedIds, onToggleFolderSelect,
+  showHiddenFolders = false,
 }) => {
   const { t } = useLang();
   const isExpanded = expandedIds.has(node.id);
   const isSelected = selectedId === node.id;
   const isRenaming = renamingId === node.id;
   const isAddingChild = addingChildToId === node.id;
-  const hasChildren = (node.children || []).length > 0;
+  const hasChildren = (node.children || []).some((c) => showHiddenFolders || !c.hidden);
   // Every document in this folder and all its subfolders (a doc linked twice counts once).
   const docCount = useMemo(() => new Set(collectAllDocIds(node)).size, [node]);
   const isLast = siblingIndex === siblingCount - 1;
@@ -2682,7 +2697,7 @@ const TreeNode = ({
           </>
         ) : (
           <span className={`truncate flex-1 ${isRecycleBin ? "italic text-stone-600" : ""}`} title={isRecycleBin ? t("已删除文件暂存于此 · 在此处删除则永久清除", "Deleted files are held here · deleting here erases them permanently") : t("双击重命名", "Double-click to rename")}>
-            {isRecycleBin ? t("已删除文件 (Not Show in Tree)", "Deleted files (not shown in tree)") : node.name}
+            {isRecycleBin ? t("已删除文件 (Not Show in Tree)", "Deleted files (not shown in tree)") : node.name}{node.hidden && <EyeOff size={11} className="inline ml-1.5 text-stone-500" title="Hidden" />}
             {isPhotoRoot && (
               <Camera size={11} className="inline ml-1.5 text-amber-600 shrink-0" title={t("照片根目录", "Photo root folder")} />
             )}
@@ -2785,7 +2800,7 @@ const TreeNode = ({
         </div>
       )}
 
-      {isExpanded && sortRecycleBinLast(node.children).map((child, i) => (
+      {isExpanded && sortRecycleBinLast(node.children).filter((c) => showHiddenFolders || !c.hidden).map((child, i, visKids) => (
         <TreeNode
           key={child.id}
           node={child}
@@ -2794,7 +2809,7 @@ const TreeNode = ({
           expandedIds={expandedIds}
           isRoot={false}
           siblingIndex={i}
-          siblingCount={sortRecycleBinLast(node.children).length}
+          siblingCount={visKids.length}
           parentLines={isRoot ? [] : [...currentParentLines, !isLast]}
           renamingId={renamingId}
           addingChildToId={addingChildToId}
@@ -2824,6 +2839,7 @@ const TreeNode = ({
           folderSelectMode={folderSelectMode}
           folderSelectedIds={folderSelectedIds}
           onToggleFolderSelect={onToggleFolderSelect}
+          showHiddenFolders={showHiddenFolders}
         />
       ))}
     </div>
@@ -2839,7 +2855,7 @@ const TreeNode = ({
 const LocationGroupingControls = ({ draft, setDraft, showToggle = true, hint = true, showLayout = true }) => {
   const { t } = useLang();
   const layout = showLayout ? (draft.layout || "ymd-loc") : "ym-loc";
-  const layoutHasLoc = layout !== "ymd";
+  const layoutHasLoc = layout !== "ymd" && layout !== "asis";
   const active = layoutHasLoc && (draft.enabled || !showToggle);
   const invalid = active && !locDraftValid(draft);
   return (
@@ -2855,6 +2871,7 @@ const LocationGroupingControls = ({ draft, setDraft, showToggle = true, hint = t
             <option value="ym-loc">{t("年/月/地点", "YYYY/MM/Location")}</option>
             <option value="ymd">{t("年/月/日", "YYYY/MM/DD")}</option>
             <option value="ymd-loc">{t("年/月/日/地点", "YYYY/MM/DD/Location")}</option>
+            <option value="asis">{t("按原样上传（不创建年/月等文件夹）", "Upload as they are (no YYYY/MM folders)")}</option>
           </select>
         </div>
       )}
@@ -6046,9 +6063,41 @@ const FolderScopePicker = ({ tree, scopeId, onChange, docCounts }) => {
  * UI: SEARCH PANEL
  * =============================================================================
  */
-const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree, scopeNodeId, onOpenAISettings }) => {
+const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree, scopeNodeId, onOpenAISettings, onDownloadDocs, onDeleteDocs, onLinkDocsToFolder }) => {
   const { t } = useLang();
   const [q, setQ] = useState("");
+  const [linkDlg, setLinkDlg] = useState(false);
+  const [viewMode, setViewMode] = useState(() => {
+    try { return localStorage.getItem("dms:search-view-mode") === "grid" ? "grid" : "list"; } catch { return "list"; }
+  });
+  const [thumbSize, setThumbSize] = useState(() => {
+    try {
+      const v = localStorage.getItem("dms:search-thumb-size");
+      if (v === "small" || v === "large" || v === "xlarge") return v;
+    } catch {}
+    return "small";
+  });
+  useEffect(() => { try { localStorage.setItem("dms:search-view-mode", viewMode); } catch {} }, [viewMode]);
+  useEffect(() => { try { localStorage.setItem("dms:search-thumb-size", thumbSize); } catch {} }, [thumbSize]);
+  const [linkMode, setLinkMode] = useState("existing");
+  const [linkTargetId, setLinkTargetId] = useState("");
+  const [linkParentId, setLinkParentId] = useState("");
+  const [linkNewName, setLinkNewName] = useState("");
+  const folderOptions = useMemo(() => {
+    const out = [];
+    const walk = (n, path) => {
+      for (const c of (n.children || [])) {
+        if (c.name === NOT_SHOW_FOLDER_NAME) continue;
+        const p = path ? path + " / " + c.name : c.name;
+        out.push({ id: c.id, label: p });
+        walk(c, p);
+      }
+    };
+    if (linkDlg && tree) walk(tree, "");
+    return out;
+  }, [linkDlg, tree]);
+  const [pickedIds, setPickedIds] = useState(() => new Set());
+  const [bulkBusy, setBulkBusy] = useState(false);
   const [showUnref, setShowUnref] = useState(false);
   // How multi-word keyword queries combine:
   // - "and": every word must appear somewhere in the document (default,
@@ -6433,17 +6482,143 @@ const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree,
           ))}
         </div>
       )}
+      {results.length > 0 && (() => {
+        const pickedInResults = results.filter((r) => pickedIds.has(r.id));
+        const allPicked = pickedInResults.length === results.length;
+        return (
+          <div className="flex items-center gap-2 flex-wrap text-[13px] text-stone-700">
+            <label className="flex items-center gap-1.5 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={allPicked}
+                onChange={() => setPickedIds(allPicked ? new Set() : new Set(results.map((r) => r.id)))}
+              />
+              {t("全选", "Select all")}
+            </label>
+            {pickedInResults.length > 0 && (
+              <>
+                <span className="tabular-nums">{t(`已选 ${pickedInResults.length} 项`, `${pickedInResults.length} selected`)}</span>
+                <button
+                  disabled={bulkBusy}
+                  onClick={() => onDownloadDocs && onDownloadDocs(pickedInResults.map((r) => r.id))}
+                  className="px-2 py-0.5 border border-stone-300 rounded bg-white hover:bg-stone-100 flex items-center gap-1"
+                ><Download size={12} /> {t("下载", "Download")}</button>
+                <button
+                  disabled={bulkBusy}
+                  onClick={async () => {
+                    setBulkBusy(true);
+                    try {
+                      const done = await onDeleteDocs(pickedInResults.map((r) => r.id));
+                      if (done) setPickedIds(new Set());
+                    } finally { setBulkBusy(false); }
+                  }}
+                  className="px-2 py-0.5 border border-red-300 text-red-700 rounded bg-white hover:bg-red-50 flex items-center gap-1"
+                ><Trash2 size={12} /> {t("删除", "Delete")}</button>
+                <button onClick={() => { setLinkDlg(true); setLinkMode("existing"); setLinkNewName(""); }} className="px-2 py-0.5 border border-sky-300 text-sky-800 rounded bg-white hover:bg-sky-50 flex items-center gap-1" title={t("把所选文档以链接方式放入某个文件夹", "Link the selected documents into a folder")}><Link2 size={12} /> {t("链接到文件夹…", "Link to folder…")}</button>
+                <button onClick={() => setPickedIds(new Set())} className="px-2 py-0.5 border border-stone-300 rounded bg-white hover:bg-stone-100">{t("清除所有选择", "Clean all selections")}</button>
+              </>
+            )}
+          </div>
+        );
+      })()}
+      {linkDlg && (
+        <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={() => !bulkBusy && setLinkDlg(false)}>
+          <div className="bg-white rounded-lg shadow-xl border border-stone-300 w-full max-w-md p-4 space-y-3 text-sm" onClick={(e) => e.stopPropagation()}>
+            <div className="font-semibold text-stone-800">{t(`把 ${pickedIds.size} 份文档链接到文件夹`, `Link ${pickedIds.size} document(s) to a folder`)}</div>
+            <div className="text-[12px] text-stone-600">{t("文档仍保留在原位置；链接的文档与原文档共用同一份描述，在新文件夹中编辑描述会同步修改原文档的描述。", "Documents stay in their original folders. Linked documents share the source document's description, so editing it in the target folder changes the source's description too.")}</div>
+            <div className="flex gap-3">
+              <label className="flex items-center gap-1 cursor-pointer"><input type="radio" checked={linkMode === "existing"} onChange={() => setLinkMode("existing")} /> {t("已有文件夹", "Existing folder")}</label>
+              <label className="flex items-center gap-1 cursor-pointer"><input type="radio" checked={linkMode === "new"} onChange={() => setLinkMode("new")} /> {t("新建文件夹", "New folder")}</label>
+            </div>
+            {linkMode === "existing" ? (
+              <select value={linkTargetId} onChange={(e) => setLinkTargetId(e.target.value)} className="w-full border border-stone-300 rounded px-2 py-1">
+                <option value="">{t("— 选择文件夹 —", "— Select a folder —")}</option>
+                {folderOptions.map((o) => <option key={o.id} value={o.id}>{o.label}</option>)}
+              </select>
+            ) : (
+              <div className="space-y-2">
+                <input value={linkNewName} onChange={(e) => setLinkNewName(e.target.value)} placeholder={t("新文件夹名称", "New folder name")} className="w-full border border-stone-300 rounded px-2 py-1" />
+                <select value={linkParentId} onChange={(e) => setLinkParentId(e.target.value)} className="w-full border border-stone-300 rounded px-2 py-1">
+                  <option value="">{t("位置：顶层", "Location: top level")}</option>
+                  {folderOptions.map((o) => <option key={o.id} value={o.id}>{o.label}</option>)}
+                </select>
+              </div>
+            )}
+            <div className="flex justify-end gap-2">
+              <button disabled={bulkBusy} onClick={() => setLinkDlg(false)} className="px-3 py-1 border border-stone-300 rounded hover:bg-stone-100">{t("取消", "Cancel")}</button>
+              <button
+                disabled={bulkBusy || (linkMode === "existing" ? !linkTargetId : !linkNewName.trim())}
+                onClick={async () => {
+                  setBulkBusy(true);
+                  try {
+                    const ids = results.filter((r) => pickedIds.has(r.id)).map((r) => r.id);
+                    await onLinkDocsToFolder(ids, linkMode === "existing" ? { nodeId: linkTargetId } : { newName: linkNewName.trim(), parentId: linkParentId || null });
+                    setLinkDlg(false);
+                  } finally { setBulkBusy(false); }
+                }}
+                className="px-3 py-1 rounded bg-sky-600 text-white hover:bg-sky-700 disabled:opacity-40"
+              >{t("链接", "Link")}</button>
+            </div>
+          </div>
+        </div>
+      )}
+      {results.length > 0 && (
+        <div className="flex items-center gap-1.5 text-[11px]">
+          <div className="flex items-center border border-stone-300 rounded overflow-hidden shrink-0">
+            <button onClick={() => setViewMode("list")} title={t("列表视图", "List view")}
+              className={"px-1.5 py-1 flex items-center " + (viewMode === "list" ? "bg-stone-700 text-white" : "bg-white text-stone-600 hover:bg-stone-100")}><ListView size={13} /></button>
+            <button onClick={() => setViewMode("grid")} title={t("图标视图（缩略图）", "Icon view (thumbnails)")}
+              className={"px-1.5 py-1 flex items-center border-l border-stone-300 " + (viewMode === "grid" ? "bg-stone-700 text-white" : "bg-white text-stone-600 hover:bg-stone-100")}><LayoutGrid size={13} /></button>
+          </div>
+          {viewMode === "grid" && (
+            <div className="flex items-center border border-stone-300 rounded overflow-hidden shrink-0" title={t("缩略图大小", "Thumbnail size")}>
+              {[["small", t("小图标", "Small")], ["large", t("大图标", "Large")], ["xlarge", t("超大图标", "Extra Large")]].map(([k, label], i) => (
+                <button key={k} onClick={() => setThumbSize(k)}
+                  className={"px-1.5 py-1 " + (i > 0 ? "border-l border-stone-300 " : "") + (thumbSize === k ? "bg-stone-700 text-white" : "bg-white text-stone-600 hover:bg-stone-100")}>{label}</button>
+              ))}
+            </div>
+          )}
+          {viewMode === "grid" && <span className="text-stone-500">{t("勾选框选择 · 双击打开", "Click to select · double-click to open")}</span>}
+        </div>
+      )}
+      {viewMode === "grid" ? (
+      <div
+        className="grid gap-2 max-h-[60vh] overflow-auto"
+        style={{ gridTemplateColumns: `repeat(auto-fill, minmax(${thumbSize === "xlarge" ? 340 : thumbSize === "large" ? 200 : 110}px, 1fr))` }}
+      >
+        {results.map((r) => (
+          <div key={r.id} onDoubleClick={() => onOpenDoc(r.id)}>
+            <DocumentGridTile
+              doc={r}
+              selectMode
+              selected={pickedIds.has(r.id)}
+              onToggleSelect={() => setPickedIds((prev) => { const n = new Set(prev); n.has(r.id) ? n.delete(r.id) : n.add(r.id); return n; })}
+              badgeSize={thumbSize === "small" ? "small" : "large"}
+            />
+          </div>
+        ))}
+      </div>
+      ) : (
       <div className="space-y-1 max-h-[60vh] overflow-auto">
         {results.map((r) => {
           const refs = refMap.get(r.id) || [];
           return (
             <div
               key={r.id}
-              className="border border-stone-200 rounded p-2 text-sm hover:bg-amber-50 hover:border-amber-300 cursor-pointer"
+              className={"border rounded p-2 text-sm hover:bg-amber-50 hover:border-amber-300 cursor-pointer flex items-start gap-2 " + (pickedIds.has(r.id) ? "border-amber-400 bg-amber-50" : "border-stone-200")}
               title={t("单击打开 · 双击跳转到节点", "Click to open · double-click to jump to node")}
               onClick={() => onOpenDoc(r.id)}
               onDoubleClick={(e) => { e.preventDefault(); refs[0] && onJumpToNode(refs[0]); }}
             >
+              <input
+                type="checkbox"
+                className="mt-1 shrink-0"
+                checked={pickedIds.has(r.id)}
+                onClick={(e) => e.stopPropagation()}
+                onDoubleClick={(e) => e.stopPropagation()}
+                onChange={() => setPickedIds((prev) => { const n = new Set(prev); n.has(r.id) ? n.delete(r.id) : n.add(r.id); return n; })}
+              />
+              <div className="min-w-0 flex-1">
               <div className="font-medium text-stone-800 truncate">{r.name}</div>
               <div className="font-mono text-[12px] text-stone-700 mt-0.5">{r.id}</div>
               {r.description && (
@@ -6473,10 +6648,12 @@ const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree,
                   })}
                 </div>
               )}
+              </div>
             </div>
           );
         })}
       </div>
+      )}
       </>
       )}
     </div>
@@ -8230,6 +8407,7 @@ const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onG
   const [link, setLink] = useState(null);
   const [linkErr, setLinkErr] = useState("");
   const [copied, setCopied] = useState(false);
+  const [anyNet, setAnyNet] = useState(false);     // false = same Wi-Fi link, true = internet tunnel (any network)
   const [sendLink, setSendLink] = useState(null);   // "send" tab: computer -> iPhone gallery link
   const [sendErr, setSendErr] = useState("");
   const [sendSub, setSendSub] = useState(true);     // include subfolders
@@ -8362,14 +8540,14 @@ const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onG
     setLink(null); setLinkErr(""); setCopied(false);
     (async () => {
       try {
-        const r = await fetch(API_BASE + "/api/phone-upload-link", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ node_id: destId }) });
+        const r = await fetch(API_BASE + "/api/phone-upload-link", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ node_id: destId, tunnel: anyNet }) });
         const j = await r.json();
         if (!r.ok) throw new Error(j.error || "Could not create the link");
         if (!dead) setLink(j);
       } catch (e) { if (!dead) setLinkErr(e.message || String(e)); }
     })();
     return () => { dead = true; };
-  }, [mode, destId]);
+  }, [mode, destId, anyNet]);
 
   // Send tab: a gallery link for the chosen folder's photos/videos.
   useEffect(() => {
@@ -8378,14 +8556,14 @@ const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onG
     setSendLink(null); setSendErr(""); setCopied(false);
     (async () => {
       try {
-        const r = await fetch(API_BASE + "/api/send-to-iphone-link", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ node_id: destId, recursive: sendSub, kind }) });
+        const r = await fetch(API_BASE + "/api/send-to-iphone-link", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ node_id: destId, recursive: sendSub, kind, tunnel: anyNet }) });
         const j = await r.json();
         if (!r.ok) throw new Error(j.error || "Could not create the link");
         if (!dead) setSendLink(j);
       } catch (e) { if (!dead) setSendErr(e.message || String(e)); }
     })();
     return () => { dead = true; };
-  }, [mode, destId, sendSub, kind]);
+  }, [mode, destId, sendSub, kind, anyNet]);
 
   const stateHelp = {
     no_device: t("请用数据线把 iPhone 连接到这台电脑，并解锁手机。", "Plug your iPhone into this computer with its USB cable and unlock the phone."),
@@ -8394,6 +8572,12 @@ const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onG
   };
   const btn = "px-3 py-1 text-sm border border-stone-300 rounded hover:bg-stone-50 disabled:opacity-50";
   const pct = prog.total ? Math.round((prog.done / prog.total) * 100) : 0;
+  const netSel = (
+    <div className="space-y-1">
+      <label className="flex items-start gap-1.5 text-[13px]"><input type="radio" className="mt-1" checked={!anyNet} onChange={() => setAnyNet(false)} /> <span>{t("同一 Wi-Fi（快，手机和电脑连同一个 Wi-Fi）", "Same Wi-Fi (fast — phone and computer on the same Wi-Fi)")}</span></label>
+      <label className="flex items-start gap-1.5 text-[13px]"><input type="radio" className="mt-1" checked={anyNet} onChange={() => setAnyNet(true)} /> <span>{t("任何网络（互联网隧道，手机可用蜂窝数据或其他 Wi-Fi；首次需约 15 秒）", "Any network (internet tunnel — phone can use cellular or other Wi-Fi; first time takes ~15 s)")}</span></label>
+    </div>
+  );
   const destBlock = (
               <div className="space-y-1.5">
                 <div className="font-bold text-stone-700">{t("保存到文件夹", "Save into folder")}</div>
@@ -8434,7 +8618,8 @@ const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onG
         <div className="px-4 py-3 overflow-auto space-y-3 text-sm">
           {mode === "send" ? (
             <>
-              <div className="text-[13px] text-stone-600">{t("把电脑上的照片和视频发到 iPhone：手机和电脑连同一个 Wi-Fi，然后选择要发送的文件夹：", "Send photos and videos from this computer to the iPhone: put the phone on the same Wi-Fi as this computer, then choose the folder to send:")}</div>
+              <div className="text-[13px] text-stone-600">{t("把电脑上的照片和视频发到 iPhone：选择手机的连接方式，然后选择要发送的文件夹：", "Send photos and videos from this computer to the iPhone: choose how the phone connects, then the folder to send:")}</div>
+              {netSel}
               <div className="space-y-1.5">
                 <div className="font-bold text-stone-700">{t("发送此文件夹中的照片", "Send photos from folder")}</div>
                 <select value={destId} onChange={(e) => setDestId(e.target.value)} className="w-full px-2 py-1 border border-stone-300 rounded bg-white">
@@ -8472,7 +8657,8 @@ const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onG
             </>
           ) : mode === "files" ? (
             <>
-              <div className="text-[13px] text-stone-600">{t("iPhone 的“文件”App 和 iCloud 云盘无法通过数据线读取，请用 Wi-Fi：手机和电脑连同一个 Wi-Fi，然后：", "The iPhone's Files app and iCloud Drive can't be read over the USB cable, so use Wi-Fi: put the phone on the same Wi-Fi as this computer, then:")}</div>
+              <div className="text-[13px] text-stone-600">{t("iPhone 的“文件”App 和 iCloud 云盘无法通过数据线读取，请用链接。选择手机的连接方式，然后：", "The iPhone's Files app and iCloud Drive can't be read over the USB cable, so use a link. Choose how the phone connects, then:")}</div>
+              {netSel}
               {destBlock}
               <div className="flex gap-3 items-start">
                 <div className="shrink-0 w-[150px] h-[150px] border border-stone-200 rounded flex items-center justify-center bg-white">
@@ -19719,6 +19905,24 @@ function DMS({ storagePath, onChangeFolder }) {
   const [folderSelectMode, setFolderSelectMode] = useState(false);
   const [folderSelectedIds, setFolderSelectedIds] = useState(new Set());
   const [folderBulkBusy, setFolderBulkBusy] = useState(false);
+  // Hidden folders carry node.hidden=true (saved with the tree). They vanish
+  // from the tree panel unless this toggle is on.
+  const [showHiddenFolders, setShowHiddenFolders] = useState(false);
+  const handleBulkSetHidden = async (hide) => {
+    if (!tree || !folderSelectedIds.size) return;
+    let newTree = tree;
+    for (const id of folderSelectedIds) {
+      if (id === tree.id) continue;
+      newTree = updateNodeInTree(newTree, id, (n) => {
+        const { hidden, ...rest } = n;
+        return hide ? { ...rest, hidden: true } : rest;
+      });
+    }
+    if (hide && !showHiddenFolders && folderSelectedIds.has(selectedId)) setSelectedId(tree.id);
+    await persistTree(newTree);
+    setFolderSelectedIds(new Set());
+    setFolderSelectMode(false);
+  };
   const toggleFolderSelect = (nodeId) => {
     setFolderSelectedIds((prev) => {
       const next = new Set(prev);
@@ -20228,7 +20432,7 @@ function DMS({ storagePath, onChangeFolder }) {
   // Resizable sidebar — width in pixels, persisted in localStorage.
   // Min/max prevent absurdly small or huge sidebars.
   const SIDEBAR_MIN = 220;
-  const SIDEBAR_MAX = 720;
+  const SIDEBAR_MAX = 4000; // effective cap is the window width minus room for the right pane (see onMove)
   const SIDEBAR_DEFAULT = 320;
   const [sidebarWidth, setSidebarWidth] = useState(() => {
     try {
@@ -20243,7 +20447,7 @@ function DMS({ storagePath, onChangeFolder }) {
   useEffect(() => {
     if (!resizing) return;
     const onMove = (e) => {
-      const w = Math.max(SIDEBAR_MIN, Math.min(SIDEBAR_MAX, e.clientX));
+      const w = Math.max(SIDEBAR_MIN, Math.min(SIDEBAR_MAX, window.innerWidth - 240, e.clientX));
       setSidebarWidth(w);
     };
     const onUp = () => {
@@ -20287,6 +20491,17 @@ function DMS({ storagePath, onChangeFolder }) {
   const ctxUploadInputRef = useRef(null);
   const ctxUploadTargetRef = useRef(null);
   const [folderPickerOpen, setFolderPickerOpen] = useState(false);
+  // Movable dialog: offset from its centred position, reset each time it opens.
+  const [folderDlgPos, setFolderDlgPos] = useState({ x: 0, y: 0 });
+  const [folderDlgDragOver, setFolderDlgDragOver] = useState(false);
+  const startFolderDlgDrag = (e) => {
+    if (e.button !== undefined && e.button !== 0) return;
+    const sx = e.clientX - folderDlgPos.x, sy = e.clientY - folderDlgPos.y;
+    const move = (ev) => setFolderDlgPos({ x: ev.clientX - sx, y: ev.clientY - sy });
+    const up = () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  };
   const [pendingFolderFiles, setPendingFolderFiles] = useState([]); // [{folderName, files}]
   // Which of the three placement modes the "Upload folder" dialog uses:
   // - "year-month" (default): every file across every picked folder and
@@ -21248,6 +21463,8 @@ function DMS({ storagePath, onChangeFolder }) {
     // the remembered setting (10 miles until the user changes it).
     const locCfg = normalizeLocSettings(locationGrouping || locSettingsRef.current);
     const locLayout = locCfg.layout;
+    // "Upload as they are": no Year/Month/... folders -- files go straight into the target folder.
+    if (locLayout === "asis" && routeMode === "year-month") routeMode = "current-folder";
     const locRadiusMi = locCfg.enabled && routeMode === "year-month" && locLayout !== "ymd"
       ? locRadiusToMiles(locCfg.radius, locCfg.unit) : 0;
     const newLocPoints = [];   // location folders created by this upload, to be named after it
@@ -21681,7 +21898,7 @@ function DMS({ storagePath, onChangeFolder }) {
   // uploads every file into its resolved folder — grouped by folder so
   // uploadFilesToNode's own tree/index merge runs once per distinct
   // folder rather than once per file.
-  const runMirroredUpload = async (mirroredTree, fileNodeId, files, extraText = "") => {
+  const runMirroredUpload = async (mirroredTree, fileNodeId, files, extraText = "", locCfg = null) => {
     if (!files.length) return;
     await persistTree(mirroredTree);
     const groups = new Map(); // nodeId -> File[]
@@ -21692,7 +21909,10 @@ function DMS({ storagePath, onChangeFolder }) {
     }
     for (const [nodeId, groupFiles] of groups) {
       await uploadFilesToNode(nodeId, groupFiles, {
-        skipDuplicates: true, routeMode: "current-folder", baseTreeOverride: mirroredTree, extraText,
+        skipDuplicates: true, baseTreeOverride: mirroredTree, extraText,
+        // locCfg (option 3 only): photos inside each recreated folder are filed
+        // into year/month/day/location subfolders by date taken; other files stay put.
+        ...(locCfg ? { routeMode: "year-month", locationGrouping: locCfg, photoBaseOverride: nodeId } : { routeMode: "current-folder" }),
       });
     }
   };
@@ -21703,7 +21923,7 @@ function DMS({ storagePath, onChangeFolder }) {
   // used here, since this upload is split across several per-folder calls
   // afterward and would otherwise show one dialog per folder instead of one
   // for the whole operation).
-  const uploadFilesMirroringSubfolders = async (baseNodeId, files, keepTopLevel = false, extraText = "") => {
+  const uploadFilesMirroringSubfolders = async (baseNodeId, files, keepTopLevel = false, extraText = "", locCfg = null) => {
     if (!files.length) return;
     if (!baseNodeId) {
       alert(t("请先在装配树中点击选择一个文件夹。", "Please click to select a folder in the assembly tree first."));
@@ -21722,11 +21942,11 @@ function DMS({ storagePath, onChangeFolder }) {
     const [mirroredTree, fileNodeId] = resolveMirroredTargets(tree, baseNodeId, files, keepTopLevel);
 
     if (duplicates.length > 0) {
-      setDupDialog({ duplicates, allFiles: files, targetNodeId: baseNodeId, mirror: { tree: mirroredTree, fileNodeId, extraText } });
+      setDupDialog({ duplicates, allFiles: files, targetNodeId: baseNodeId, mirror: { tree: mirroredTree, fileNodeId, extraText, locCfg } });
       return;
     }
 
-    await runMirroredUpload(mirroredTree, fileNodeId, files, extraText);
+    await runMirroredUpload(mirroredTree, fileNodeId, files, extraText, locCfg);
   };
 
   const confirmLocPrompt = async () => {
@@ -21781,7 +22001,7 @@ function DMS({ storagePath, onChangeFolder }) {
     setPendingFolderFiles([]);
     setFolderUploadMode("year-month");
     setFolderUploadExtraText("");
-    setFolderPickerOpen(true);
+    setFolderDlgPos({ x: 0, y: 0 }); setFolderPickerOpen(true);
   };
 
   // "Upload folder" — the picker input has `webkitdirectory`, so the browser
@@ -21804,6 +22024,38 @@ function DMS({ storagePath, onChangeFolder }) {
     });
   };
 
+  // Add several folders at once: group files by their top-level folder name.
+  // `depth` 0 = group by the picked/dropped folder itself; 1 = treat each
+  // immediate subfolder of the picked folder as its own folder.
+  const addFolderGroups = (allFiles, depth = 0) => {
+    const clean = allFiles.filter((f) => !isJunkUploadFileName(f.name));
+    const grouped = new Map();
+    for (const f of clean) {
+      const parts = (f.webkitRelativePath || f.name).split("/");
+      if (depth === 1 && parts.length < 3) continue; // loose files directly in the parent
+      const name = parts[depth];
+      if (!name) continue;
+      if (!grouped.has(name)) grouped.set(name, []);
+      grouped.get(name).push(f);
+    }
+    if (!grouped.size) { alert(t("所选文件夹中未找到文件。", "No files were found in the selected folder.")); return; }
+    setPendingFolderFiles((prev) => {
+      const have = new Set(prev.map((g) => g.folderName));
+      const additions = [...grouped.entries()].filter(([n]) => !have.has(n)).map(([folderName, files]) => ({ folderName, files }));
+      if (additions.length < grouped.size) alert(t("部分文件夹已添加，已跳过重复项。", "Some folders were already added and were skipped."));
+      return [...prev, ...additions];
+    });
+  };
+  const handleFolderDialogDrop = async (e) => {
+    e.preventDefault();
+    setFolderDlgDragOver(false);
+    const items = e.dataTransfer.items;
+    if (!items || !items.length) return;
+    const { files, hasDirectory } = await readDroppedItems(items);
+    if (!hasDirectory) { alert(t("请拖入文件夹（可一次拖入多个）。", "Please drop folders (several at once is fine).")); return; }
+    addFolderGroups(files, 0);
+  };
+
   const handleMultiFolderUpload = async () => {
     const allFiles = pendingFolderFiles.flatMap((f) => f.files);
     if (!allFiles.length) return;
@@ -21818,7 +22070,9 @@ function DMS({ storagePath, onChangeFolder }) {
         // Reproduce the picked folder(s) verbatim under the current node:
         // the source folder itself becomes a new child folder, with every
         // subfolder and file recreated at the same relative path.
-        await uploadFilesMirroringSubfolders(selectedId, allFiles, true, extraText);
+        const treeLocCfg = locDraftToSettings(locDraft);
+        await rememberLocSettings(treeLocCfg);
+        await uploadFilesMirroringSubfolders(selectedId, allFiles, true, extraText, treeLocCfg);
       } else if (mode === "mirror") {
         await uploadFilesMirroringSubfolders(selectedId, allFiles, false, extraText);
       } else {
@@ -21908,7 +22162,7 @@ function DMS({ storagePath, onChangeFolder }) {
         });
         setMirrorSubfolders(false);
         setKeepSourceTree(false);
-        setFolderPickerOpen(true);
+        setFolderDlgPos({ x: 0, y: 0 }); setFolderPickerOpen(true);
         return;
       }
       promptUpload(files, selectedId, "current-folder");
@@ -22586,6 +22840,23 @@ function DMS({ storagePath, onChangeFolder }) {
 
   const linkDocsToNode = (docIds, nodeId) => linkDocsToNodes(docIds, [nodeId]);
 
+  // Search > selection > "Link to folder": link docs into an existing folder,
+  // or create a new folder (under parentId, or the top level) and link into
+  // it. Links share the doc id, so the description is the source document's.
+  const linkDocsToFolderOrNew = async (docIds, target) => {
+    if (!docIds.length) return;
+    if (target.nodeId) { await linkDocsToNodes(docIds, [target.nodeId]); return; }
+    const parentId = target.parentId || tree.id;
+    const [withFolder, newId] = getOrCreateChild(tree, parentId, target.newName);
+    const node = findNode(withFolder, newId);
+    const existing = new Set((node.documents || []).map((d) => d.id));
+    const toAdd = docIds.filter((id) => !existing.has(id));
+    const finalTree = toAdd.length
+      ? updateNodeInTree(withFolder, newId, (n) => ({ ...n, documents: [...(n.documents || []), ...toAdd.map((id) => ({ id }))] }))
+      : withFolder;
+    if (finalTree !== tree) await persistTree(finalTree);
+  };
+
   const linkDocToNode = (docId, nodeId) => linkDocsToNode([docId], nodeId);
 
   // Drag-and-drop move: relinks a document (or, when several checkboxes are
@@ -23017,6 +23288,45 @@ function DMS({ storagePath, onChangeFolder }) {
   };
 
   // Per-node trash button now means "unlink from this node only"
+  // Bulk delete from Search results: docs in "Deleted files" are erased from
+  // disk; all others have every link removed and move to "Deleted files".
+  const deleteDocsBulk = async (ids) => {
+    if (!ids.length) return false;
+    const binNode = (tree.children || []).find((c) => c.name === NOT_SHOW_FOLDER);
+    const binRefs = new Set((binNode?.documents || []).map((d) => d.id));
+    const permIds = ids.filter((id) => binRefs.has(id));
+    const toBin = ids.filter((id) => !binRefs.has(id));
+    if (!confirm(t(
+      `确定删除选中的 ${ids.length} 份文档？\n\n` + (toBin.length ? `${toBin.length} 份将移除所有链接并移至"${NOT_SHOW_FOLDER}"（文件保留在磁盘上）。\n` : "") + (permIds.length ? `${permIds.length} 份已在"${NOT_SHOW_FOLDER}"中，将从磁盘永久删除，无法撤销。` : ""),
+      `Delete the selected ${ids.length} document(s)?\n\n` + (toBin.length ? `${toBin.length} will have all links removed and move to "${NOT_SHOW_FOLDER}" (files stay on disk).\n` : "") + (permIds.length ? `${permIds.length} already in "${NOT_SHOW_FOLDER}" will be permanently erased from disk. This cannot be undone.` : "")
+    ))) return false;
+    try {
+      let workingTree = tree;
+      let idx = docIndex;
+      if (toBin.length) {
+        const idSet = new Set(toBin);
+        workingTree = stripDocsFromAllNodes(workingTree, idSet);
+        let notShowId;
+        [workingTree, notShowId] = getOrCreateNotShowNode(workingTree);
+        workingTree = updateNodeInTree(workingTree, notShowId, (n) => ({
+          ...n, documents: [...(n.documents || []), ...toBin.map((id) => ({ id }))],
+        }));
+        idx = idx.map((e) => (idSet.has(e.id) ? { ...e, originalNodeId: notShowId } : e));
+        await StorageAdapter.saveDocumentIndex(idx);
+        await StorageAdapter.saveTree(workingTree);
+      }
+      for (const id of permIds) await StorageAdapter.deleteDocument(id);
+      const { tree: freshTree } = await StorageAdapter.getTree();
+      const freshIndex = await StorageAdapter.listDocumentIndex();
+      setTree(freshTree);
+      setDocIndex(freshIndex);
+      return true;
+    } catch (e) {
+      alert(t("删除失败：", "Delete failed: ") + (e.message || String(e)));
+      return false;
+    }
+  };
+
   const deleteDoc = async (docId) => {
     await unlinkDocFromNode(docId, selectedId);
   };
@@ -23271,7 +23581,7 @@ function DMS({ storagePath, onChangeFolder }) {
         {sidebarOpen && (
           <>
             <aside
-              style={{ width: `${sidebarWidth}px` }}
+              style={{ width: `${sidebarWidth}px`, maxWidth: "calc(100vw - 240px)" }}
               className="border-r border-stone-300 bg-white flex flex-col shrink-0"
             >
             <div className="flex border-b border-stone-200 text-sm">
@@ -23390,6 +23700,13 @@ function DMS({ storagePath, onChangeFolder }) {
                   >
                     <Sparkles size={11} /> {t("问 AI", "Ask AI")}
                   </button>
+                  <button
+                    onClick={() => setShowHiddenFolders((v) => !v)}
+                    className={`text-[13px] px-2 py-1 border rounded flex items-center gap-1 ${showHiddenFolders ? "border-amber-400 bg-amber-50 text-black" : "border-stone-300 hover:bg-stone-100 text-black"}`}
+                    title={t("显示或隐藏已被标记为隐藏的文件夹", "Show or conceal the folders marked as hidden")}
+                  >
+                    {showHiddenFolders ? <Eye size={11} /> : <EyeOff size={11} />} {showHiddenFolders ? t("隐藏中的文件夹：显示", "Hidden: shown") : t("隐藏中的文件夹：不显示", "Hidden: concealed")}
+                  </button>
                   {!folderSelectMode ? (
                     <button
                       onClick={() => { setFolderSelectMode(true); setFolderSelectedIds(new Set()); }}
@@ -23410,12 +23727,12 @@ function DMS({ storagePath, onChangeFolder }) {
                 </div>
                 {folderSelectMode ? (
                   <div className="flex items-center justify-between px-3 py-1.5 text-[12px] border-b border-stone-200 bg-amber-50/60">
-                    <span className="text-stone-700">
+                    <span className="text-black">
                       {t(`已选 ${folderSelectedIds.size} 个文件夹`, `${folderSelectedIds.size} folder(s) selected`)}
                     </span>
                     <div className="flex items-center gap-1.5">
                       {serviceDateScan?.running ? (
-                        <span className="text-[12px] text-stone-700 flex items-center gap-1">
+                        <span className="text-[12px] text-black flex items-center gap-1">
                           <Loader size={11} className="animate-spin" />
                           {t(`识别中… ${serviceDateScan.done} / ${serviceDateScan.total}`, `Detecting… ${serviceDateScan.done} / ${serviceDateScan.total}`)}
                         </span>
@@ -23423,16 +23740,40 @@ function DMS({ storagePath, onChangeFolder }) {
                         <button
                           onClick={runServiceDateScanForFolders}
                           disabled={folderSelectedIds.size === 0 || folderBulkBusy}
-                          className="text-[12px] px-2 py-1 border border-cyan-300 hover:bg-cyan-50 hover:border-cyan-400 text-cyan-700 rounded flex items-center gap-1 disabled:opacity-40"
+                          className="text-[12px] px-2 py-1 border border-cyan-300 hover:bg-cyan-50 hover:border-cyan-400 text-black rounded flex items-center gap-1 disabled:opacity-70"
                           title={t("对选中文件夹（含所有子文件夹）内的每份 PDF/图片，用 AI 识别其服务/检验日期（排除出生日期），供你核实后再写入", "For every PDF/image under the selected folders (including all subfolders), have AI detect the service/exam date (excluding date of birth), for you to review before anything is written")}
                         >
                           <Sparkles size={11} /> {t("AI 识别服务日期", "AI: Detect service date")}
                         </button>
                       )}
                       <button
+                        onClick={() => setFolderSelectedIds(new Set())}
+                        disabled={folderSelectedIds.size === 0 || folderBulkBusy}
+                        className="text-[12px] px-2 py-1 border border-stone-300 hover:bg-stone-100 text-black rounded flex items-center gap-1 disabled:opacity-70"
+                        title={t("取消所有勾选", "Untick all selected folders")}
+                      >
+                        <X size={11} /> {t("清除选择", "Clear")}
+                      </button>
+                      <button
+                        onClick={() => handleBulkSetHidden(true)}
+                        disabled={folderSelectedIds.size === 0 || folderBulkBusy}
+                        className="text-[12px] px-2 py-1 border border-stone-300 hover:bg-stone-100 text-black rounded flex items-center gap-1 disabled:opacity-70"
+                        title={t("在目录树中隐藏选中的文件夹（文件不受影响）", "Hide the selected folders from the tree (files are untouched)")}
+                      >
+                        <EyeOff size={11} /> {t("隐藏", "Hide")}
+                      </button>
+                      <button
+                        onClick={() => handleBulkSetHidden(false)}
+                        disabled={folderSelectedIds.size === 0 || folderBulkBusy}
+                        className="text-[12px] px-2 py-1 border border-stone-300 hover:bg-stone-100 text-black rounded flex items-center gap-1 disabled:opacity-70"
+                        title={t("取消隐藏选中的文件夹（需先开启“显示已隐藏”才能勾选它们）", "Unhide the selected folders (turn on 'Show hidden' to tick them)")}
+                      >
+                        <Eye size={11} /> {t("显示", "Show")}
+                      </button>
+                      <button
                         onClick={handleBulkDownloadFolders}
                         disabled={folderSelectedIds.size === 0 || folderBulkBusy}
-                        className="text-[12px] px-2 py-1 border border-stone-300 hover:bg-amber-50 hover:border-amber-400 text-stone-700 rounded flex items-center gap-1 disabled:opacity-40"
+                        className="text-[12px] px-2 py-1 border border-stone-300 hover:bg-amber-50 hover:border-amber-400 text-black rounded flex items-center gap-1 disabled:opacity-70"
                         title={t("将选中的文件夹打包为 .dms 文件下载", "Download the selected folders bundled as a .dms file")}
                       >
                         <Download size={11} /> {folderBulkBusy ? t("处理中…", "Working…") : t("下载", "Download")}
@@ -23440,7 +23781,7 @@ function DMS({ storagePath, onChangeFolder }) {
                       <button
                         onClick={handleBulkDeleteFolders}
                         disabled={folderSelectedIds.size === 0 || folderBulkBusy}
-                        className="text-[12px] px-2 py-1 border border-red-400 bg-red-50 hover:bg-red-100 text-red-700 rounded flex items-center gap-1 disabled:opacity-40"
+                        className="text-[12px] px-2 py-1 border border-red-400 bg-red-50 hover:bg-red-100 text-black rounded flex items-center gap-1 disabled:opacity-70"
                         title={t("永久删除选中的文件夹及其内容", "Permanently delete the selected folders and their contents")}
                       >
                         <Trash2 size={11} /> {folderBulkBusy ? t("处理中…", "Working…") : t("删除", "Delete")}
@@ -23448,7 +23789,7 @@ function DMS({ storagePath, onChangeFolder }) {
                     </div>
                   </div>
                 ) : (
-                  <div className="px-3 py-1.5 text-[12px] text-stone-700 border-b border-stone-100 bg-stone-50/50">
+                  <div className="px-3 py-1.5 text-[12px] text-black border-b border-stone-100 bg-stone-50/50">
                     {t("悬停节点显示快捷操作 · 双击重命名 · 右键打开菜单", "Hover a node for quick actions · double-click to rename · right-click to open the menu")}
                   </div>
                 )}
@@ -23490,6 +23831,7 @@ function DMS({ storagePath, onChangeFolder }) {
                       folderSelectMode={folderSelectMode}
                       folderSelectedIds={folderSelectedIds}
                       onToggleFolderSelect={toggleFolderSelect}
+                      showHiddenFolders={showHiddenFolders}
                     />
                   )}
                 </div>
@@ -23506,6 +23848,9 @@ function DMS({ storagePath, onChangeFolder }) {
                 tree={tree}
                 scopeNodeId={selectedId}
                 onOpenAISettings={() => setShowAISettings(true)}
+                onDownloadDocs={(ids) => { setDownloadSelectedIds(new Set(ids)); openDownloadDialog(); }}
+                onDeleteDocs={deleteDocsBulk}
+                onLinkDocsToFolder={linkDocsToFolderOrNew}
               />
             )}
 
@@ -24933,8 +25278,8 @@ function DMS({ storagePath, onChangeFolder }) {
 
       {folderPickerOpen && (
         <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center" onClick={(e) => { if (e.target === e.currentTarget) { setFolderPickerOpen(false); setPendingFolderFiles([]); setFolderUploadMode("year-month"); setFolderUploadExtraText(""); } }}>
-          <div className="bg-white rounded-lg shadow-xl p-6 w-96 flex flex-col gap-4">
-            <h3 className="font-semibold text-base text-stone-800">{t("上传多个文件夹", "Upload multiple folders")}</h3>
+          <div className="bg-white rounded-lg shadow-xl p-6 w-[768px] max-w-[95vw] max-h-[92vh] overflow-y-auto flex flex-col gap-4" style={{ transform: `translate(${folderDlgPos.x}px, ${folderDlgPos.y}px)` }}>
+            <h3 onPointerDown={startFolderDlgDrag} title={t("按住拖动窗口", "Drag to move")} className="font-semibold text-base text-stone-800 cursor-move select-none -mx-6 -mt-6 px-6 pt-6 pb-2" style={{ touchAction: "none" }}>{t("上传多个文件夹", "Upload multiple folders")}</h3>
             <div className="min-h-[80px] space-y-1.5">
               {pendingFolderFiles.length === 0 ? (
                 <div className="text-sm text-stone-600 text-center py-6">{t("尚未选择任何文件夹，请点击下方按钮添加。", "No folders selected yet — click the button below to add one.")}</div>
@@ -24948,10 +25293,18 @@ function DMS({ storagePath, onChangeFolder }) {
                 ))
               )}
             </div>
-            <label className="flex items-center justify-center gap-1.5 text-sm px-3 py-2 border border-dashed border-stone-400 rounded cursor-pointer text-stone-700 hover:bg-stone-50">
-              {t("+ 添加文件夹", "+ Add folder")}
-              <input ref={multiFolderInputRef} type="file" webkitdirectory="" multiple onChange={handleMultiFolderPickerChange} className="hidden" />
-            </label>
+            <div
+              onDragOver={(e) => { e.preventDefault(); setFolderDlgDragOver(true); }}
+              onDragLeave={() => setFolderDlgDragOver(false)}
+              onDrop={handleFolderDialogDrop}
+              className={`flex flex-col gap-1.5 rounded border border-dashed p-2 ${folderDlgDragOver ? "border-amber-500 bg-amber-50" : "border-stone-400"}`}
+            >
+              <div className="text-xs text-stone-600 text-center">{t("可从 Finder / 资源管理器一次选中多个文件夹，直接拖到这里", "Select several folders in Finder / Explorer and drag them here")}</div>
+              <label className="flex items-center justify-center gap-1.5 text-sm px-3 py-1.5 border border-stone-300 rounded cursor-pointer text-stone-700 hover:bg-stone-50">
+                {t("+ 添加文件夹", "+ Add folder")}
+                <input ref={multiFolderInputRef} type="file" webkitdirectory="" multiple onChange={handleMultiFolderPickerChange} className="hidden" />
+              </label>
+            </div>
             <label className="flex items-start gap-2 text-sm text-stone-700 border border-stone-200 rounded px-3 py-2 bg-stone-50 cursor-pointer">
               <input
                 type="radio"
@@ -24993,11 +25346,11 @@ function DMS({ storagePath, onChangeFolder }) {
               <span>
                 {t("在当前文件夹下重建所选文件夹（含子文件夹和文件）", "Recreate the picked folder under the current folder (with its subfolders and files)")}
                 <span className="block text-[12px] text-stone-600 mt-0.5">
-                  {t("所选文件夹本身会成为当前文件夹下的新子文件夹，其全部子文件夹按原样重建，文件也上传到对应的文件夹中；并在本地磁盘同步创建目录。", "The picked folder itself becomes a new subfolder of the current folder; every subfolder is recreated as-is and each file is uploaded into its matching folder. The directories are also created on the local drive.")}
+                  {t("所选文件夹本身会成为当前文件夹下的新子文件夹，其全部子文件夹按原样重建，文件也上传到对应的文件夹中；并在本地磁盘同步创建目录。各文件夹内的照片会再按下方所选的年/月文件夹归类。", "The picked folder itself becomes a new subfolder of the current folder; every subfolder is recreated as-is and each file is uploaded into its matching folder. The directories are also created on the local drive. Photos inside each folder are then sorted into the year/month folders chosen below.")}
                 </span>
               </span>
             </label>
-            {folderUploadMode === "year-month" && (
+            {(folderUploadMode === "year-month" || folderUploadMode === "keep-tree") && (
               <LocationGroupingControls draft={locDraft} setDraft={setLocDraft} />
             )}
             <FilenameTextField value={folderUploadExtraText} setValue={setFolderUploadExtraText} />
@@ -25005,7 +25358,7 @@ function DMS({ storagePath, onChangeFolder }) {
               <button onClick={() => { setFolderPickerOpen(false); setPendingFolderFiles([]); setFolderUploadMode("year-month"); setFolderUploadExtraText(""); }} className="text-sm px-3 py-1.5 rounded border border-stone-300 hover:bg-stone-50 text-stone-700">{t("取消", "Cancel")}</button>
               <button
                 onClick={handleMultiFolderUpload}
-                disabled={pendingFolderFiles.length === 0 || (folderUploadMode === "year-month" && !locDraftValid(locDraft))}
+                disabled={pendingFolderFiles.length === 0 || ((folderUploadMode === "year-month" || folderUploadMode === "keep-tree") && !locDraftValid(locDraft))}
                 className="text-sm px-3 py-1.5 rounded bg-amber-600 hover:bg-amber-700 text-white disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 {`${t("上传", "Upload")} ${pendingFolderFiles.length > 0 ? t(`(${pendingFolderFiles.flatMap((f) => f.files).length} 个文件)`, `(${pendingFolderFiles.flatMap((f) => f.files).length} files)`) : ""}`}
@@ -25497,7 +25850,7 @@ function DMS({ storagePath, onChangeFolder }) {
             const { allFiles, targetNodeId, mirror, extraText } = dupDialog;
             setDupDialog(null);
             const run = mirror
-              ? runMirroredUpload(mirror.tree, mirror.fileNodeId, allFiles, mirror.extraText)
+              ? runMirroredUpload(mirror.tree, mirror.fileNodeId, allFiles, mirror.extraText, mirror.locCfg)
               : uploadFilesToNode(targetNodeId, allFiles, { skipDuplicates: true, extraText });
             run.catch((err) => {
               console.error("[DMS] ✗ Upload error:", err);
@@ -25582,7 +25935,7 @@ function DMS({ storagePath, onChangeFolder }) {
             setDupDialog(null);
             const nonDups = allFiles.filter((f) => !duplicates.some((d) => d.file === f));
             if (mirror) {
-              runMirroredUpload(mirror.tree, mirror.fileNodeId, nonDups, mirror.extraText);
+              runMirroredUpload(mirror.tree, mirror.fileNodeId, nonDups, mirror.extraText, mirror.locCfg);
             } else {
               uploadFilesToNode(targetNodeId, nonDups, { skipDuplicates: true, extraText });
             }
