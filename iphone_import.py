@@ -203,6 +203,78 @@ def pull_file(udid: str, path: str, dest_dir: str) -> str:
     return _run(_pull(udid, _check_device_path(path), dest_dir))
 
 
+MUTATIONS = "/PhotoData/Mutations"     # where iOS keeps the edited rendering of a photo/video
+_VIDEO_EXTS = (".mov", ".mp4", ".m4v", ".3gp")
+
+
+async def _pull_edited(udid: str, path: str, dest_dir: str) -> dict | None:
+    """Copy the EDITED version of a DCIM file, if the phone has one.
+
+    An edit made in the Photos app (crop, filter, trim...) never touches the
+    original in DCIM; the result is stored separately as
+    /PhotoData/Mutations/DCIM/<folder>/<IMG_1234>/Adjustments/FullSizeRender.<ext>.
+    Returns {"path", "meta"} for the copied rendering (named like the original,
+    with the rendering's own extension), or None when there is no edit.
+
+    meta carries the ORIGINAL's date: an edited video's own timestamp is the
+    edit time, and a rendering can lack the EXIF date/GPS of its original.
+    """
+    folder, name = posixpath.split(path)
+    stem, ext = posixpath.splitext(name)
+    is_video = ext.lower() in _VIDEO_EXTS
+    adj = posixpath.join(MUTATIONS, folder.lstrip("/"), stem, "Adjustments")
+    async with _Session(udid) as afc:
+        try:
+            names = await afc.listdir(adj)
+        except Exception:
+            return None
+        render = ""
+        for n in names:
+            n_ext = posixpath.splitext(n)[1].lower()
+            # A Live Photo shares one folder for its still and its clip: only
+            # take a rendering of the same kind (photo/video) as this file.
+            if (n.lower().startswith("fullsizerender.") and n_ext in MEDIA_EXTS
+                    and n_ext not in SKIP_EXTS and (n_ext in _VIDEO_EXTS) == is_video):
+                render = n
+                break
+        if not render:
+            return None
+        edit_dir = Path(dest_dir) / "edited"
+        edit_dir.mkdir(exist_ok=True)
+        await afc.pull(posixpath.join(adj, render), str(edit_dir), progress_bar=False)
+        out = Path(dest_dir) / (stem + posixpath.splitext(render)[1].upper())
+        (edit_dir / render).replace(out)
+        meta: dict = {}
+        if is_video:
+            try:
+                mt = (await afc.stat(path)).get("st_mtime")
+                ts = mt.timestamp() if isinstance(mt, datetime) else float(mt or 0)
+                if ts > 1e12:
+                    ts /= 1e9
+                if ts:
+                    d = datetime.fromtimestamp(ts)
+                    meta.update(year=d.strftime("%Y"), month=d.strftime("%m"), day=d.strftime("%d"))
+            except Exception:
+                pass
+        else:
+            meta = photo_meta(str(out))
+            if "year" not in meta or "lat" not in meta:
+                try:
+                    orig_dir = Path(dest_dir) / "orig"
+                    orig_dir.mkdir(exist_ok=True)
+                    await afc.pull(path, str(orig_dir), progress_bar=False)
+                    for k, v in photo_meta(str(orig_dir / name)).items():
+                        meta.setdefault(k, v)
+                except Exception:
+                    pass
+        return {"path": str(out), "meta": meta}
+
+
+def pull_edited(udid: str, path: str, dest_dir: str) -> dict | None:
+    """Copy the edited version of one DCIM file into dest_dir, or None if unedited."""
+    return _run(_pull_edited(udid, _check_device_path(path), dest_dir))
+
+
 def photo_meta(local_path: str) -> dict:
     """EXIF capture date + GPS of a pulled photo, e.g. {"year","month","day","lat","lon"}.
 

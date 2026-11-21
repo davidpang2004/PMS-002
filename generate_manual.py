@@ -351,7 +351,7 @@ add_table(
 h2("2.3  Main Content Panel")
 para("When you click a folder in the Tree tab, the right panel shows:")
 bullet("Folder name, serial number (SN), description, and saved login credentials (if any) at the top.")
-bullet("Action buttons: Tag Faces, Link Existing Document, Merge Documents, Paste Screenshot, Upload Files, Upload (no year/month folders), Upload Folder.")
+bullet("Action buttons: Tag Faces, Link Existing Document, Merge Documents, Paste Screenshot, Upload Files, Upload Folder.")
 bullet("A card for each document in the folder, showing file name, size, type icon, upload date, and action icons (SN, link, send to phone, email, delete).")
 
 page_break()
@@ -471,19 +471,20 @@ h1("4  Working with Documents")
 
 h2("4.1  Uploading Files")
 numbered("Select the destination folder in the Tree tab.")
-numbered("Click Upload Files (default behaviour, see below), or Upload (no year/month folders).")
+numbered("Click Upload Files.")
 numbered("In the file picker, select one or more files and click Open.")
 numbered("A progress indicator appears at the top of the screen showing how many files are uploading.")
 numbered("When complete, the new document cards appear in the panel.")
-para("The difference between the two upload buttons:")
+para("Before uploading, a small window asks how to file them, using the same Folder structure box as Upload Folder (section 4.18):")
 add_table(
-    ["Button", "Behaviour"],
+    ["Folder structure", "Behaviour"],
     [
-        ["Upload Files", "If a file is recognized as a photo with a readable capture date (EXIF), DMS automatically creates \u201cYear/Month\u201d sub-folders under the current folder and files it there; non-photos, or files with no readable date, go straight into the current folder."],
-        ["Upload (no year/month folders)", "Every file goes straight into the currently selected folder, whether or not it's a photo - no automatic year/month sorting."],
+        ["YYYY/MM/Location, YYYY/MM/DD, YYYY/MM/DD/Location", "If a file is recognized as a photo with a readable capture date (EXIF), DMS creates the chosen year/month(/day/location) sub-folders under the current folder and files it there; non-photos, or files with no readable date, go straight into the current folder."],
+        ["Upload as they are (no YYYY/MM folders)", "Every file goes straight into the currently selected folder, whether or not it's a photo - no automatic year/month sorting."],
     ],
-    col_widths=[1.8, 4.2]
+    col_widths=[2.2, 3.8]
 )
+para("Your choice is remembered as the default for the next upload.")
 para("Supported file types:")
 add_table(
     ["Category", "Extensions"],
@@ -571,7 +572,7 @@ numbered("On success, a banner shows the code type and value detected (e.g. \u20
 numbered("The result is saved automatically as the document's \u201cBarcode\u201d parameter, viewable/editable in the metadata section below; if a photo has more than one barcode, they're saved in turn as Barcode, Barcode2, Barcode3, and so on.")
 figure("24_scan_barcode.png", "Figure 4-6  Scan Barcode: the success banner after a successful read")
 tip("The capture date and GPS location need no extra effort - DMS already pulls those from a photo's EXIF data on upload (see section 4.1); \u201cScan Barcode\u201d just adds the code's own content. Put together, a single photo can record when, where, and what code all at once.")
-note("This runs entirely offline (built on the open-source zbar library), sends nothing anywhere, and needs no AI key - but it does need a reasonably clean image: the code should be sharp, unobstructed, and have a clear quiet zone (blank margin) around it. QR codes shared as phone screenshots - especially ones with a logo overlaid in the middle, or a background that runs right up to the code's edge, like a WeChat \u201cscan to join group\u201d image - usually can't be read this way; typically only WeChat's own scanner or a phone camera can. That's a known limitation of the underlying library, not a bug.")
+note("This runs entirely offline (open-source zbar and OpenCV libraries), sends nothing anywhere, and needs no AI key. It also reads QR codes shared as phone screenshots - including ones with a logo in the middle, colored codes, or a background that runs right up to the code\u2019s edge, like a WeChat \u201cscan to join group\u201d image: if the first quick pass finds nothing, DMS automatically tries cleaned-up and straightened copies of the image. For best results the code should still be reasonably sharp and not cut off; a badly blurred or partly cropped code may still fail. WeChat codes (e.g. a group invite, weixin.qq.com/g/...) decode correctly, but the link only works when scanned inside WeChat itself - pasting it into a browser or scanning with the iPhone Camera won\u2019t join the group. DMS shows a reminder when it detects one: in WeChat use + \u2192 Scan \u2192 photo icon to pick the image, or long-press the image in a chat and choose \u201cScan QR Code in Image\u201d. WeChat group codes expire after 7 days.")
 
 h2("4.9  Ask AI About a Document, or One-Click Polish")
 para("Besides the folder-wide \u201cAsk AI\u201d described in chapter 18 (which reads several documents at once), opening a single document's viewer lets you ask questions about just that one document:")
@@ -827,11 +828,11 @@ bullet("GPS-derived location (if available).")
 bullet("Which folders reference this document.")
 note("Search is case-insensitive and partial-match - typing \u201cpump\u201d will find \u201cPump Assembly,\u201d \u201ccentrifugal pump,\u201d and so on.")
 para("When you type more than one word, the \u201cMulti-word match\u201d control next to the search box decides how they combine:")
-bullet("All words (AND) - the default. A document must contain every word you typed (in any order) to match.")
-bullet("Any word (OR) - a document matches if it contains at least one of the words.")
+bullet("Any word (OR) - the default. A document matches if it contains at least one of the words, and results are ranked by how many of the words they contain: documents containing every word come first, then those containing fewer. With more than one word typed, each result shows a small badge such as \u201c2/3\u201d (contains 2 of the 3 words; green when it contains all of them).")
+bullet("All words (AND) - a document must contain every word you typed (in any order) to match. Results are still ranked, with documents whose name contains the words and those mentioning them most often first.")
 bullet("Whole sentence - the entire contents of the search box is matched verbatim, as one exact phrase, instead of being split into separate words.")
-figure("38_search_match_modes.png", "Figure 7-1a  The Multi-word match control: All words (AND) / Any word (OR) / Whole sentence")
-tip("Switch to \u201cAny word (OR)\u201d when you're not sure which of several related terms a document uses (e.g. \u201cinvoice receipt bill\u201d); switch to \u201cWhole sentence\u201d when you want to find one specific phrase and AND/OR are turning up too many unrelated partial matches.")
+figure("38_search_match_modes.png", "Figure 7-1a  The Multi-word match control: Any word (OR) / All words (AND) / Whole sentence, with results ranked by number of matching words")
+tip("Keep the default \u201cAny word (OR)\u201d when you're not sure which of several related terms a document uses (e.g. \u201cinvoice receipt bill\u201d) - the best matches are at the top anyway; switch to \u201cAll words (AND)\u201d to hide partial matches; switch to \u201cWhole sentence\u201d when you want to find one specific phrase and AND/OR are turning up too many unrelated partial matches.")
 
 h2("7.2  Using Filters")
 add_table(
@@ -1210,7 +1211,7 @@ add_table(
         ],
         [
             "Scan Barcode says \u2018no barcode detected in the image\u2019",
-            "Make sure the barcode itself is sharp, unobstructed, and has a blank margin around it. QR codes shared as phone screenshots - especially ones with a logo in the middle or a background that runs to the code's edge, like a WeChat \u2018scan to join group\u2019 image - usually can't be read this way; see section 4.8."
+            "Make sure the barcode itself is sharp, unobstructed and not cut off at the edge of the picture. Screenshot QR codes with a logo or no blank margin are handled automatically (section 4.8); if one still fails, take a sharper, larger screenshot of just the code and try again."
         ],
         [
             "A \u2018Transcribe Recording\u2019 or \u2018AI Cleanup\u2019 button shows \u2018Configure AI (Gemini)\u2019 instead",
@@ -1253,7 +1254,7 @@ add_table(
     ["Task", "How"],
     [
         ["Create a new folder", "Select parent -> New Folder -> type name -> Enter"],
-        ["Upload documents", "Select folder -> Upload Files / Upload (no year/month folders) -> pick files"],
+        ["Upload documents", "Select folder -> Upload Files -> pick files -> choose Folder structure"],
         ["Paste a screenshot", "Select folder -> Ctrl+V / Cmd+V, or click Paste Screenshot"],
         ["View a document", "Click the document name"],
         ["Run OCR on a document", "Open viewer -> Extract Text (OCR) -> Save & Make Searchable"],

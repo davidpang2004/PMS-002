@@ -1357,6 +1357,16 @@ def main() -> None:
     except tk.TclError:
         pass  # not on macOS — ignore
 
+    # macOS: double-clicking DMS.app (or clicking its Dock icon) while it is
+    # already running doesn't start a second copy -- macOS just sends this
+    # "reopen" event to the running one. With the launcher window hidden, the
+    # app would otherwise do nothing visible, so bring the DMS page back.
+    try:
+        root.createcommand("::tk::mac::ReopenApplication",
+                           lambda *_: webbrowser.open(URL))
+    except tk.TclError:
+        pass  # not on macOS — ignore
+
     # Signal handlers: schedule _quit via the Tk event loop so it's thread-safe.
     # Fall back to direct os._exit if Tkinter is unresponsive.
     def _signal_quit(*_):

@@ -782,17 +782,39 @@ def render_pages_for_ai(file_path: Path, max_pages: int = 3,
     return images
 
 
-def barcode_scan_available() -> bool:
+def _zbar_decode():
+    """pyzbar's decode(), or None if pyzbar/the zbar shared library is missing."""
     try:
-        from pyzbar.pyzbar import decode  # noqa: F401
-        return True
-    except ImportError:
-        return False
+        from pyzbar.pyzbar import decode
+        return decode
     except Exception:
-        # pyzbar imports fine but fails to load the underlying zbar shared
-        # library (e.g. `brew install zbar` was never run) -- report
-        # unavailable rather than raising on the caller.
+        # ImportError, or pyzbar imports fine but can't load the zbar shared
+        # library (e.g. `brew install zbar` was never run).
+        return None
+
+
+def _zxing_read():
+    """zxing-cpp's read_barcodes(), or None if it isn't installed. Self-
+    contained wheel (no system library), reads 1D barcodes and QR codes."""
+    try:
+        import zxingcpp
+        return zxingcpp.read_barcodes
+    except Exception:
+        return None
+
+
+def _opencv_qr_available() -> bool:
+    try:
+        import cv2  # noqa: F401
+        return hasattr(cv2, "QRCodeDetector")
+    except Exception:
         return False
+
+
+def barcode_scan_available() -> bool:
+    # zxing-cpp / zbar read 1D barcodes + QR; OpenCV alone still reads QR codes.
+    return (_zxing_read() is not None or _zbar_decode() is not None
+            or _opencv_qr_available())
 
 
 def decode_barcodes(image_bytes: bytes) -> list[dict]:
@@ -804,51 +826,187 @@ def decode_barcodes(image_bytes: bytes) -> list[dict]:
     that function already covers a phone photo for AI vision extraction.
 
     Returns a deduplicated list of {"type": str, "data": str}, in the order
-    first seen. A phone photo can be tilted a few degrees and zbar handles
-    that fine, but a barcode shot at a hard 90°/180°/270° won't scan on the
-    first pass -- so if nothing is found upright, this retries rotated
-    copies of the image before giving up.
+    first seen. Strategy, stopping as soon as something decodes:
 
-    Returns [] if pyzbar/zbar isn't installed or nothing decodes.
+    1. zxing-cpp, then zbar, on the image as-is (fast; these two are the
+       engines for 1D barcodes -- zxing-cpp needs no system library, zbar
+       does, so on most users' machines zxing-cpp is the one that works).
+    2. QR codes shared as phone screenshots -- a logo in the middle, a
+       background running right up to the code (no white "quiet zone"),
+       colored modules, a dark page behind it, as in a WeChat "join group"
+       image -- usually defeat zbar. So retry with zxing-cpp and OpenCV's
+       QR detectors
+       (the ArUco-based one locates finder patterns far more robustly) and
+       with zbar again, on cleaned-up copies: grayscale with an artificial
+       white margin added, contrast-stretched, Otsu-binarized, inverted
+       (light-on-dark codes), and downscaled.
+    3. Hard 90/180/270 rotations (zbar handles small tilts itself).
+
+    Returns [] if no decoder is installed or nothing decodes.
     """
-    try:
-        from pyzbar.pyzbar import decode
-    except ImportError:
-        return []
-
-    from PIL import Image
+    from PIL import Image, ImageOps
 
     try:
         im = Image.open(io.BytesIO(image_bytes))
         im.load()
+        im = im.convert("RGB")
     except Exception:
         return []
 
+    zdecode = _zbar_decode()
+    zxread = _zxing_read()
     seen = set()
     results: list[dict] = []
 
-    def _collect(pil_img) -> bool:
-        found_new = False
+    def _add(kind: str, text: str) -> bool:
+        key = (kind, text)
+        if text and key not in seen:
+            seen.add(key)
+            results.append({"type": kind, "data": text})
+            return True
+        return False
+
+    def _zbar(pil_img) -> bool:
+        if zdecode is None:
+            return False
         try:
-            decoded = decode(pil_img)
+            decoded = zdecode(pil_img)
         except Exception:
             return False
+        found = False
         for d in decoded:
             try:
                 text = d.data.decode("utf-8")
             except UnicodeDecodeError:
                 text = d.data.decode("latin-1", errors="replace")
-            key = (d.type, text)
-            if key not in seen:
-                seen.add(key)
-                results.append({"type": d.type, "data": text})
-                found_new = True
-        return found_new
+            found = _add(d.type, text) or found
+        return found
 
-    if _collect(im):
+    def _zxing(pil_img) -> bool:
+        if zxread is None:
+            return False
+        try:
+            decoded = zxread(pil_img)
+        except Exception:
+            return False
+        found = False
+        for d in decoded:
+            # zxing names formats "QRCode"/"EAN13"/"Code128"; upper-case
+            # them to match zbar's "QRCODE"/"EAN13"/"CODE128".
+            fmt = getattr(d.format, "name", None) or str(d.format).split(".")[-1]
+            found = _add(fmt.upper().replace("-", ""), d.text) or found
+        return found
+
+    # -- 1. plain zxing-cpp / zbar ---------------------------------------
+    if _zxing(im) or _zbar(im):
         return results
+
+    # -- 2. hard QR codes: OpenCV + zbar on cleaned-up variants ------------
+    try:
+        import numpy as np
+        import cv2
+    except Exception:
+        np = cv2 = None
+
+    def _variants():
+        gray = ImageOps.grayscale(im)
+        # Very large screenshots slow the detectors down without helping.
+        if max(gray.size) > 2400:
+            r = 2400 / max(gray.size)
+            gray = gray.resize((int(gray.width * r), int(gray.height * r)), Image.LANCZOS)
+
+        def pad(g, fill=255):
+            return ImageOps.expand(g, int(max(g.size) * 0.12) + 8, fill=fill)
+
+        yield pad(gray)
+        yield pad(ImageOps.autocontrast(gray, cutoff=1))
+        if cv2 is not None:
+            _, th = cv2.threshold(np.array(gray), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            yield pad(Image.fromarray(th))
+        yield pad(ImageOps.invert(gray))
+        small = pad(gray)
+        for scale in (0.5, 0.3):
+            yield small.resize((max(1, int(small.width * scale)), max(1, int(small.height * scale))),
+                               Image.LANCZOS)
+
+    def _opencv(pil_img) -> bool:
+        if cv2 is None:
+            return False
+        arr = np.array(pil_img)
+        found = False
+        dets = []
+        if hasattr(cv2, "QRCodeDetectorAruco"):
+            dets.append(cv2.QRCodeDetectorAruco)
+        dets.append(cv2.QRCodeDetector)
+        for make in dets:
+            try:
+                ok, texts, _pts, _ = make().detectAndDecodeMulti(arr)
+            except Exception:
+                continue
+            for t in (texts or ()):
+                found = _add("QRCODE", t) or found
+            if found:
+                break
+        return found
+
+    def _region_crops():
+        """Straightened crops of square-ish light regions -- a QR code's
+        light modules merge into one bright square once small gaps are
+        closed. Cropping that square (a little oversized), rotating it
+        upright and giving it a real white margin rescues codes on a dark
+        background that are also tilted, which neither engine reads as-is."""
+        if cv2 is None:
+            return
+        g = np.array(ImageOps.grayscale(im))
+        if max(g.shape) > 2400:
+            r = 2400 / max(g.shape)
+            g = cv2.resize(g, None, fx=r, fy=r, interpolation=cv2.INTER_AREA)
+        H, W = g.shape
+        _, bright = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        k = max(3, min(H, W) // 60)
+        closed = cv2.morphologyEx(bright, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))
+        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        rects = []
+        for c in contours:
+            (cx, cy), (rw, rh), ang = cv2.minAreaRect(c)
+            if rw < 40 or rh < 40 or rw * rh < 0.004 * H * W:
+                continue
+            if not 0.75 <= rw / rh <= 1.33:
+                continue
+            # the rect must be mostly filled (a QR square, not a ring/frame)
+            if cv2.contourArea(c) < 0.5 * rw * rh:
+                continue
+            rects.append(((cx, cy), (rw, rh), ang))
+        rects.sort(key=lambda r: -r[1][0] * r[1][1])
+        for ((cx, cy), (rw, rh), ang), grow in [(r, f) for r in rects[:4] for f in (1.0, 1.06)]:
+            # 1.0 = exactly the light square (drops a dark surround that would
+            # otherwise touch the code); 1.06 = a little extra in case the
+            # outermost dark modules fell just outside it.
+            side = int(max(rw, rh) * grow)
+            M = cv2.getRotationMatrix2D((cx, cy), ang, 1.0)
+            M[0, 2] += side / 2 - cx
+            M[1, 2] += side / 2 - cy
+            crop = cv2.warpAffine(g, M, (side, side), flags=cv2.INTER_CUBIC, borderValue=255)
+            if side < 300:
+                crop = cv2.resize(crop, (300, 300), interpolation=cv2.INTER_CUBIC)
+            _, crop_bw = cv2.threshold(crop, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            for c in (crop_bw, crop):
+                ci = Image.fromarray(c)
+                yield ImageOps.expand(ci, int(ci.width * 0.12) + 8, fill=255)
+
+    if cv2 is not None and _opencv(im):
+        return results
+    for v in _variants():
+        if _zxing(v) or _opencv(v) or _zbar(v):
+            return results
+    for v in _region_crops():
+        if _zxing(v) or _opencv(v) or _zbar(v):
+            return results
+
+    # -- 3. hard rotations -----------------------------------------------
     for angle in (90, 180, 270):
-        if _collect(im.rotate(angle, expand=True)):
+        r = im.rotate(angle, expand=True)
+        if _zxing(r) or _zbar(r):
             break
     return results
 

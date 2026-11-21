@@ -83,7 +83,8 @@ def ensure_venv():
         [str(venv_python), "-m", "pip", "install", "--quiet", "--upgrade",
          "pip", "pyinstaller", "flask", "waitress", "pypdf", "reportlab", "Pillow",
          "pillow-heif", "PyMuPDF", "qrcode", "numpy", "cryptography", "google-genai",
-         "openpyxl", "pyzbar", "python-docx", "pymobiledevice3"],
+         "openpyxl", "pyzbar", "zxing-cpp", "opencv-python-headless", "python-docx",
+         "pymobiledevice3"],
         check=True,
     )
 
@@ -397,6 +398,18 @@ def build_pyinstaller_command() -> list[str]:
         print("  qrcode found — Mobile Upload QR codes will be available.")
     except ImportError:
         print("  qrcode not installed — Mobile Upload will show URL only (no QR code).")
+
+    # zxing-cpp is OPTIONAL but preferred for "Scan barcode": a self-contained
+    # wheel (no system library to install, unlike zbar), reads 1D barcodes
+    # and QR codes.
+    try:
+        import zxingcpp  # noqa: F401  # type: ignore
+        cmd.extend(["--collect-all", "zxingcpp"])
+        cmd.extend(["--hidden-import", "zxingcpp"])
+        print("  zxing-cpp found — barcode/QR scanning will work with no extra install.")
+    except ImportError:
+        print("  zxing-cpp not installed — barcode scanning falls back to zbar/OpenCV. "
+              "Run: pip install zxing-cpp")
 
     # pyzbar is OPTIONAL — it decodes barcodes/QR codes for the document
     # viewer's "Scan barcode" button. It also needs the zbar shared library

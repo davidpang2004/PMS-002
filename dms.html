@@ -937,6 +937,9 @@ const readPhotoDate = async (file) => {
 // -- those use unrelated metadata schemes this doesn't attempt to parse -- or
 // if the mvhd box can't be found/parsed.
 const readVideoDate = async (file) => {
+  // Import-from-iPhone attaches the original's date to an edited video (its own
+  // mvhd time is when it was edited, not when it was recorded).
+  if (file.__dmsMeta && file.__dmsMeta.year) return file.__dmsMeta;
   const fallback = () => {
     const d = new Date(file.lastModified);
     return {
@@ -4439,6 +4442,25 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
                   ? t("已存为文档参数（Barcode），可在下方“元数据”中查看/编辑", "Saved as the document's parameter (Barcode) — view/edit it under Metadata below")
                   : t("已识别，但未能保存到文档参数", "Decoded, but couldn't be saved to the document's parameters")}
               </div>
+              {(() => {
+                // WeChat codes (group invites weixin.qq.com/g/..., contact
+                // cards u.wechat.com/..., etc.) decode fine but the link only
+                // works when WeChat's own scanner reads the code -- pasting it
+                // into a browser, or the iPhone Camera, won't join the group.
+                const urls = barcodeResult.results.map((r) => r.data || "");
+                const isGroup = urls.some((u) => /^https?:\/\/(weixin|wx)\.qq\.com\/g\//i.test(u));
+                const isWeChat = isGroup || urls.some((u) => /^https?:\/\/((weixin|wx)\.qq\.com|u\.wechat\.com)\//i.test(u));
+                if (!isWeChat) return null;
+                return (
+                  <div className="mt-1.5 px-2 py-1.5 rounded bg-amber-50 border border-amber-200 text-[12px] text-amber-900 leading-snug">
+                    {isGroup
+                      ? t("这是微信群邀请二维码：链接只有在微信里扫码才有效——粘贴到浏览器、或用手机相机扫，都进不了群。加入方法：微信【+ → 扫一扫】，点右下角相册图标选这张图；或把图片发到任意聊天（如文件传输助手），长按选择“识别图中二维码”。注意：微信群二维码只有 7 天有效期，过期后需请群里的人重新分享。",
+                          "This is a WeChat group invite. The link only works when the code is scanned inside WeChat — pasting it into a browser, or scanning with the iPhone Camera, won't join the group. To join: in WeChat tap + → Scan, then the photo icon, and pick this image; or send the image to any chat (e.g. File Transfer), long-press it and choose “Scan QR Code in Image”. Note: WeChat group codes expire after 7 days — ask someone in the group for a fresh one if it's expired.")
+                      : t("这是微信二维码：链接只有在微信里扫码才有效，粘贴到浏览器或用手机相机扫可能无法正常打开。请在微信【+ → 扫一扫】中点相册图标选这张图，或在聊天中长按图片选择“识别图中二维码”。",
+                          "This is a WeChat code. The link only works when scanned inside WeChat — a browser or the iPhone Camera may not open it properly. In WeChat tap + → Scan, then the photo icon, and pick this image; or long-press the image in a chat and choose “Scan QR Code in Image”.")}
+                  </div>
+                );
+              })()}
             </div>
             <button onClick={() => setBarcodeResult(null)} className="ml-auto text-teal-600 hover:text-teal-800 shrink-0"><X size={13} /></button>
           </div>
@@ -6063,6 +6085,46 @@ const FolderScopePicker = ({ tree, scopeId, onChange, docCounts }) => {
  * UI: SEARCH PANEL
  * =============================================================================
  */
+// Everything a document's keyword search looks through, lower-cased.
+const docSearchHaystack = (entry) => [
+  entry.id,
+  entry.name || "",
+  entry.sn || "",
+  entry.ocrText || "",
+  stripDescriptionHtml(entry.description || "", ""),
+  entry.docDate || "",
+  entry.dueDate || "",
+  ...(entry.localKeyParams || []),
+  ...Object.values(entry.qcReview || {}),   // QC Review: Inspection/SN/Equipment/WO-PO, dates, observation, mitigation, result
+  ...Object.keys(entry.metadata || {}),
+  ...Object.values(entry.metadata || {}).map((v) => {
+    if (v && typeof v === "object") {
+      // composed strings plus each value/unit/description part
+      return Object.values(v).filter((x) => typeof x === "string").join(" ");
+    }
+    return String(v);
+  }),
+].join(" ").toLowerCase();
+
+// Keyword-search ranking shared by document and folder results. Returns
+// { matched, nameHit, hits } for a lower-cased haystack + name and the
+// query's words: how many *distinct* words were found (the main sort key --
+// an item matching 3 of 3 words outranks one matching 2 of 3), whether any
+// word is in the item's own name, and how many times the words occur in
+// total (capped per word so one long OCR text can't swamp everything).
+const scoreKeywordMatch = (haystack, name, words) => {
+  let matched = 0, hits = 0, nameHit = false;
+  for (const w of words) {
+    let n = 0, i = haystack.indexOf(w);
+    while (i !== -1 && n < 20) { n++; i = haystack.indexOf(w, i + w.length); }
+    if (n) { matched++; hits += n; }
+    if (name && name.includes(w)) nameHit = true;
+  }
+  return { matched, nameHit, hits };
+};
+const compareKeywordScore = (a, b) =>
+  (b.matched - a.matched) || ((b.nameHit ? 1 : 0) - (a.nameHit ? 1 : 0)) || (b.hits - a.hits);
+
 const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree, scopeNodeId, onOpenAISettings, onDownloadDocs, onDeleteDocs, onLinkDocsToFolder }) => {
   const { t } = useLang();
   const [q, setQ] = useState("");
@@ -6100,12 +6162,14 @@ const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree,
   const [bulkBusy, setBulkBusy] = useState(false);
   const [showUnref, setShowUnref] = useState(false);
   // How multi-word keyword queries combine:
-  // - "and": every word must appear somewhere in the document (default,
-  //   original behavior).
-  // - "or": any one of the words is enough.
+  // - "or": any one of the words is enough (default) -- results are ranked
+  //   by how many of the words each one contains, most first, so the
+  //   documents matching every word still come out on top.
+  // - "and": every word must appear somewhere in the document.
   // - "phrase": the whole query must appear verbatim, as typed (a sentence
   //   search) -- words are not split at all.
-  const [matchMode, setMatchMode] = useState("and");
+  // Both "or" and "and" results are sorted by scoreKeywordMatch.
+  const [matchMode, setMatchMode] = useState("or");
   // Folder to restrict search/AI Q&A to (null = whole project). Seeded from
   // whichever folder is currently open in the main tree, so opening Search
   // starts scoped to where you already are; the folder-tree picker below
@@ -6185,31 +6249,31 @@ const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree,
     if (scopeDocIdSet) pool = pool.filter((d) => scopeDocIdSet.has(d.id));
     if (showUnref) pool = pool.filter((d) => !(refMap.get(d.id)?.length));
     if (!trimmed) return pool;
-    return pool.filter((entry) => {
-      const haystack = [
-        entry.id,
-        entry.name || "",
-        entry.sn || "",
-        entry.ocrText || "",
-        stripDescriptionHtml(entry.description || "", ""),
-        entry.docDate || "",
-        entry.dueDate || "",
-        ...(entry.localKeyParams || []),
-        ...Object.values(entry.qcReview || {}),   // QC Review: Inspection/SN/Equipment/WO-PO, dates, observation, mitigation, result
-        ...Object.keys(entry.metadata || {}),
-        ...Object.values(entry.metadata || {}).map((v) => {
-          if (v && typeof v === "object") {
-            // composed strings plus each value/unit/description part
-            return Object.values(v).filter((x) => typeof x === "string").join(" ");
-          }
-          return String(v);
-        }),
-      ].join(" ").toLowerCase();
-      if (matchMode === "phrase") return haystack.includes(trimmed);
-      if (matchMode === "or") return words.some((w) => haystack.includes(w));
-      return words.every((w) => haystack.includes(w));
+    const scored = [];
+    pool.forEach((entry, order) => {
+      const haystack = docSearchHaystack(entry);
+      if (matchMode === "phrase") {
+        if (haystack.includes(trimmed)) scored.push({ entry, order, matched: 1, nameHit: false, hits: 0 });
+        return;
+      }
+      const sc = scoreKeywordMatch(haystack, (entry.name || "").toLowerCase(), words);
+      if (matchMode === "and" ? sc.matched === words.length : sc.matched > 0) scored.push({ entry, order, ...sc });
     });
+    if (matchMode !== "phrase") scored.sort((a, b) => compareKeywordScore(a, b) || (a.order - b.order));
+    return scored.map((x) => x.entry);
   }, [q, index, refMap, showUnref, scopeDocIdSet, matchMode]);
+
+  // How many of the query's words each result contains -- shown as a
+  // "2/3" badge when more than one word was typed.
+  const queryWords = useMemo(
+    () => (matchMode === "phrase" ? [] : q.trim().toLowerCase().split(/\s+/).filter(Boolean)),
+    [q, matchMode]
+  );
+  const matchCountFor = (entry) => {
+    if (queryWords.length < 2) return null;
+    const haystack = docSearchHaystack(entry);
+    return queryWords.filter((w) => haystack.includes(w)).length;
+  };
 
   // Folders (within the current scope, or the whole tree if unscoped) whose
   // own name matches the query -- shown as its own section above the
@@ -6232,7 +6296,7 @@ const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree,
     const trimmed = q.trim().toLowerCase();
     if (!trimmed) return [];
     const words = trimmed.split(/\s+/).filter(Boolean);
-    return scopeFolders.filter((node) => {
+    return scopeFolders.map((node, order) => {
       // QC Review folders are also findable by their review fields (AN/SN/PN/WON,
       // Date Reviewed, Reviewed By, Observation, Mitigation, Review Result).
       const name = [
@@ -6243,10 +6307,13 @@ const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree,
         stripDescriptionHtml(node.description || "", ""),
         ...getNodeLogins(node).map((l) => `${l.websiteUrl || ""} ${l.accountName || ""}`),
       ].join(" ").toLowerCase();
-      if (matchMode === "phrase") return name.includes(trimmed);
-      if (matchMode === "or") return words.some((w) => name.includes(w));
-      return words.every((w) => name.includes(w));
-    });
+      if (matchMode === "phrase") return name.includes(trimmed) ? { node, order, matched: 1, nameHit: false, hits: 0 } : null;
+      const sc = scoreKeywordMatch(name, (node.name || "").toLowerCase(), words);
+      const ok = matchMode === "and" ? sc.matched === words.length : sc.matched > 0;
+      return ok ? { node, order, ...sc } : null;
+    }).filter(Boolean)
+      .sort((a, b) => (matchMode === "phrase" ? 0 : compareKeywordScore(a, b)) || (a.order - b.order))
+      .map((x) => x.node);
   }, [q, scopeFolders, matchMode]);
 
   const unrefCount = useMemo(
@@ -6422,8 +6489,8 @@ const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree,
         <span className="text-stone-700">{t("多词匹配：", "Multi-word match:")}</span>
         <div className="flex rounded overflow-hidden border border-stone-300">
           {[
-            ["and", t("全部包含 (AND)", "All words (AND)")],
             ["or", t("任一包含 (OR)", "Any word (OR)")],
+            ["and", t("全部包含 (AND)", "All words (AND)")],
             ["phrase", t("整句匹配", "Whole sentence")],
           ].map(([mode, label]) => (
             <button
@@ -6433,10 +6500,10 @@ const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree,
                 ? t("将输入框中的全部文字作为一句话精确匹配", "Match the entire text in the box verbatim, as one phrase")
                 : mode === "and"
                 ? t("文档需同时包含所有词才算匹配", "A document must contain every word to match")
-                : t("文档包含任意一个词即算匹配", "A document matches if it contains any one word")}
+                : t("包含任意一个词即算匹配；包含词数最多的排在最前面", "Matches any one word; results containing the most words are listed first")}
               className={"px-2 py-1 " + (matchMode === mode
                 ? "bg-stone-700 text-white"
-                : "bg-white text-stone-700 hover:bg-stone-100") + (mode !== "and" ? " border-l border-stone-300" : "")}
+                : "bg-white text-stone-700 hover:bg-stone-100") + (mode !== "or" ? " border-l border-stone-300" : "")}
             >
               {label}
             </button>
@@ -6619,7 +6686,22 @@ const SearchPanel = ({ index, refMap, getPathFor, onOpenDoc, onJumpToNode, tree,
                 onChange={() => setPickedIds((prev) => { const n = new Set(prev); n.has(r.id) ? n.delete(r.id) : n.add(r.id); return n; })}
               />
               <div className="min-w-0 flex-1">
-              <div className="font-medium text-stone-800 truncate">{r.name}</div>
+              <div className="flex items-center gap-1.5 min-w-0">
+                <div className="font-medium text-stone-800 truncate">{r.name}</div>
+                {(() => {
+                  const m = matchCountFor(r);
+                  if (m == null) return null;
+                  const full = m === queryWords.length;
+                  return (
+                    <span
+                      className={"ml-auto shrink-0 text-[11px] tabular-nums px-1.5 rounded " + (full ? "bg-emerald-100 text-emerald-800" : "bg-stone-100 text-stone-700")}
+                      title={t(`包含 ${queryWords.length} 个关键词中的 ${m} 个`, `Contains ${m} of ${queryWords.length} keywords`)}
+                    >
+                      {m}/{queryWords.length}
+                    </span>
+                  );
+                })()}
+              </div>
               <div className="font-mono text-[12px] text-stone-700 mt-0.5">{r.id}</div>
               {r.description && (
                 <div className="text-[12px] text-stone-700 mt-0.5 line-clamp-2">{stripDescriptionHtml(r.description, t("[截图]", "[screenshot]"))}</div>
@@ -8408,6 +8490,12 @@ const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onG
   const [linkErr, setLinkErr] = useState("");
   const [copied, setCopied] = useState(false);
   const [anyNet, setAnyNet] = useState(false);     // false = same Wi-Fi link, true = internet tunnel (any network)
+  // Send the current link to a phone (text) or by email (with the QR attached).
+  const lsGet = (k) => { try { return localStorage.getItem(k) || ""; } catch (e) { return ""; } };
+  const [sharePhone, setSharePhone] = useState(() => lsGet("pms_last_phone"));
+  const [shareEmail, setShareEmail] = useState(() => lsGet("pms_last_email"));
+  const [shareBusy, setShareBusy] = useState("");   // "" | "phone" | "email"
+  const [shareMsg, setShareMsg] = useState(null);   // null | {ok, msg}
   const [sendLink, setSendLink] = useState(null);   // "send" tab: computer -> iPhone gallery link
   const [sendErr, setSendErr] = useState("");
   const [sendSub, setSendSub] = useState(true);     // include subfolders
@@ -8427,6 +8515,8 @@ const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onG
   const [kind, setKind] = useState("both");       // both | photos | videos
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
+  // Import the version edited in the iPhone's Photos app when there is one (remembered).
+  const [useEdited, setUseEdited] = useState(() => { try { return localStorage.getItem("dms:iphone-use-edited") === "1"; } catch (e) { return false; } });
   const [running, setRunning] = useState(false);
   const [prog, setProg] = useState({ done: 0, total: 0, name: "" });
   const [result, setResult] = useState(null);
@@ -8486,7 +8576,8 @@ const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onG
     setRunning(true); setResult(null);
     const todo = picked.slice().reverse();     // oldest first
     const doneSet = loadSeen();
-    let ok = 0, failed = 0, lastErr = "";
+    let ok = 0, failed = 0, skipped = 0, editedCount = 0, lastErr = "";
+    try { localStorage.setItem("dms:iphone-use-edited", useEdited ? "1" : "0"); } catch (e) {}
     const failNames = [];
     setProg({ done: 0, total: todo.length, name: "" });
     // Fetch in small batches so memory stays bounded even with long videos.
@@ -8505,10 +8596,13 @@ const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onG
       const it = todo[n];
       setProg({ done: n, total: todo.length, name: it.name });
       try {
-        const r = await fetch(API_BASE + "/api/iphone/file?udid=" + encodeURIComponent(udid) + "&path=" + encodeURIComponent(it.path));
+        const r = await fetch(API_BASE + "/api/iphone/file?udid=" + encodeURIComponent(udid) + "&path=" + encodeURIComponent(it.path) + (useEdited ? "&edited=1" : ""));
         if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || "copy failed");
         const blob = await r.blob();
-        const f = new window.File([blob], it.name, { lastModified: Math.round(it.mtime * 1000), type: blob.type });
+        // Set when the phone had an edited version: it can have another extension (PNG -> JPG).
+        let editedName = "";
+        try { editedName = decodeURIComponent(r.headers.get("X-Edited-Name") || ""); } catch (e) {}
+        const f = new window.File([blob], editedName || it.name, { lastModified: Math.round(it.mtime * 1000), type: blob.type });
         try {
           const meta = JSON.parse(r.headers.get("X-Photo-Meta") || "{}");
           if (meta.year) { f.__dmsMeta = { year: meta.year, month: meta.month, day: meta.day || "01", lat: meta.lat ?? null, lon: meta.lon ?? null }; }
@@ -8517,6 +8611,17 @@ const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onG
             f.__dmsMeta = { year: String(d.getFullYear()), month: String(d.getMonth() + 1).padStart(2, "0"), day: String(d.getDate()).padStart(2, "0"), lat: meta.lat, lon: meta.lon };
           }
         } catch (e) {}
+        // The date range above was matched against the phone's FILE date (all
+        // the file list knows). The folders are built from the capture date,
+        // so re-check that here and leave out anything taken outside the range
+        // (e.g. an old photo saved to the phone recently).
+        if (scope === "range" && (from || to)) {
+          let cd = null;
+          try { cd = await (it.video ? readVideoDate(f) : readPhotoDate(f)); } catch (e) {}
+          const cap = cd && cd.year ? `${cd.year}-${cd.month}-${cd.day || "01"}` : "";
+          if (cap && ((from && cap < from) || (to && cap > to))) { skipped++; continue; }
+        }
+        if (editedName) editedCount++;
         batch.push(f);
         batchKeys.push(itemKey(it)); batchBytes += it.size;
       } catch (e) {
@@ -8528,8 +8633,8 @@ const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onG
       if (batch.length >= 20 || batchBytes >= 150 * 1048576) await flush();
     }
     await flush();
-    setProg((p) => ({ ...p, done: ok + failed }));
-    setResult({ ok, failed, lastErr, failNames: failNames.slice(0, 8), cancelled: cancelRef.current });
+    setProg((p) => ({ ...p, done: ok + failed + skipped }));
+    setResult({ ok, failed, skipped, editedCount, lastErr, failNames: failNames.slice(0, 8), cancelled: cancelRef.current });
     setRunning(false);
   };
 
@@ -8537,7 +8642,7 @@ const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onG
   useEffect(() => {
     if (mode !== "files" || !destId) return;
     let dead = false;
-    setLink(null); setLinkErr(""); setCopied(false);
+    setLink(null); setLinkErr(""); setCopied(false); setShareMsg(null);
     (async () => {
       try {
         const r = await fetch(API_BASE + "/api/phone-upload-link", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ node_id: destId, tunnel: anyNet }) });
@@ -8553,7 +8658,7 @@ const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onG
   useEffect(() => {
     if (mode !== "send" || !destId) return;
     let dead = false;
-    setSendLink(null); setSendErr(""); setCopied(false);
+    setSendLink(null); setSendErr(""); setCopied(false); setShareMsg(null);
     (async () => {
       try {
         const r = await fetch(API_BASE + "/api/send-to-iphone-link", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ node_id: destId, recursive: sendSub, kind, tunnel: anyNet }) });
@@ -8564,6 +8669,40 @@ const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onG
     })();
     return () => { dead = true; };
   }, [mode, destId, sendSub, kind, anyNet]);
+
+  const shareLink = async (url, kind, via) => {
+    const val = (via === "phone" ? sharePhone : shareEmail).trim();
+    if (!val) { setShareMsg({ ok: false, msg: via === "phone" ? t("请输入手机号码。", "Enter a phone number.") : t("请输入邮箱地址。", "Enter an email address.") }); return; }
+    if (via === "email" && !val.includes("@")) { setShareMsg({ ok: false, msg: t("邮箱地址格式不正确。", "The email address format is invalid.") }); return; }
+    setShareBusy(via); setShareMsg(null);
+    try {
+      const r = await fetch(API_BASE + "/api/send-link", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url, kind, [via]: val }) });
+      const j = await r.json();
+      if (!r.ok || !j.ok) throw new Error(j.error || t("发送失败。", "Send failed."));
+      try { localStorage.setItem(via === "phone" ? "pms_last_phone" : "pms_last_email", val); } catch (e) {}
+      const msg = j.method === "messages" ? t("已通过「信息」发送到手机。", "Sent to the phone via Messages.")
+        : j.method === "phone_link" ? t("已在 Phone Link 中打开短信，请点发送。", "Opened in Phone Link — press Send there.")
+        : j.method === "url_only" ? t("此电脑无法自动发短信，请复制链接手动发送。", "This computer can't send texts automatically — copy the link and send it yourself.")
+        : j.method === "smtp" ? t("邮件已发送（附二维码）。", "Email sent (QR code attached).")
+        : t("已在 Mail 中打开新邮件（附二维码），请检查后发送。", "A new email (QR code attached) is open in Mail — review and send it.");
+      setShareMsg({ ok: j.method !== "url_only", msg });
+    } catch (e) { setShareMsg({ ok: false, msg: e.message || String(e) }); }
+    finally { setShareBusy(""); }
+  };
+  const shareBlock = (url, kind) => (
+    <div className="space-y-1.5 p-2 rounded border border-stone-200 bg-stone-50">
+      <div className="text-[12px] font-semibold text-stone-700">{t("或把链接发到手机：", "Or send the link to the phone:")}</div>
+      <div className="flex gap-1.5 items-center">
+        <input type="tel" value={sharePhone} onChange={(e) => setSharePhone(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") shareLink(url, kind, "phone"); }} placeholder={t("手机号码，如 +1 555 123 4567", "Phone number, e.g. +1 555 123 4567")} className="flex-1 min-w-0 px-2 py-1 border border-stone-300 rounded bg-white text-[13px]" />
+        <button onClick={() => shareLink(url, kind, "phone")} disabled={!!shareBusy} className="w-[118px] px-2 py-1 border border-stone-300 rounded bg-white hover:bg-stone-100 shrink-0 disabled:opacity-50 flex items-center justify-center gap-1">{shareBusy === "phone" ? <Loader size={12} className="animate-spin" /> : <Phone size={12} />} {t("发短信", "Text it")}</button>
+      </div>
+      <div className="flex gap-1.5 items-center">
+        <input type="email" value={shareEmail} onChange={(e) => setShareEmail(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") shareLink(url, kind, "email"); }} placeholder={t("邮箱地址", "Email address")} className="flex-1 min-w-0 px-2 py-1 border border-stone-300 rounded bg-white text-[13px]" />
+        <button onClick={() => shareLink(url, kind, "email")} disabled={!!shareBusy} className="w-[118px] px-2 py-1 border border-stone-300 rounded bg-white hover:bg-stone-100 shrink-0 disabled:opacity-50 flex items-center justify-center gap-1">{shareBusy === "email" ? <Loader size={12} className="animate-spin" /> : <Mail size={12} />} {t("发邮件", "Email it")}</button>
+      </div>
+      {shareMsg && <div className={"text-[12px] " + (shareMsg.ok ? "text-emerald-700" : "text-red-700")}>{shareMsg.msg}</div>}
+    </div>
+  );
 
   const stateHelp = {
     no_device: t("请用数据线把 iPhone 连接到这台电脑，并解锁手机。", "Plug your iPhone into this computer with its USB cable and unlock the phone."),
@@ -8651,6 +8790,7 @@ const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onG
                     <input readOnly value={sendLink.url} onFocus={(e) => e.target.select()} className="flex-1 min-w-0 px-2 py-1 border border-stone-300 rounded bg-stone-50 text-[12px]" />
                     <button onClick={() => { try { navigator.clipboard.writeText(sendLink.url); setCopied(true); } catch (e) {} }} className="px-2 py-1 border border-stone-300 rounded hover:bg-stone-50 shrink-0">{copied ? t("已复制", "Copied") : t("复制链接", "Copy link")}</button>
                   </div>
+                  {shareBlock(sendLink.url, "send")}
                 </>
               )}
               <div className="text-[12px] text-stone-500">{t("链接 24 小时内有效（重启 DMS 后失效），只能查看所选文件夹里的照片和视频。", "The link works for 24 hours (or until DMS restarts) and only exposes the photos and videos listed above. Over plain Wi-Fi links Safari can only save one photo at a time.")}</div>
@@ -8679,6 +8819,7 @@ const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onG
                   <button onClick={() => { try { navigator.clipboard.writeText(link.url); setCopied(true); } catch (e) {} }} className="px-2 py-1 border border-stone-300 rounded hover:bg-stone-50 shrink-0">{copied ? t("已复制", "Copied") : t("复制链接", "Copy link")}</button>
                 </div>
               )}
+              {link && shareBlock(link.url, "upload")}
               <div className="text-[12px] text-stone-500">{t("此链接 7 天内有效，只能把文件传到所选文件夹。上传后本窗口外的文件列表会自动刷新。", "The link works for 7 days and can only add files to the chosen folder. New files appear in DMS automatically.")}</div>
             </>
           ) : st.state !== "ready" ? (
@@ -8717,6 +8858,7 @@ const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onG
                     <label className="flex items-center gap-1.5"><input type="radio" checked={kind === "photos"} onChange={() => setKind("photos")} disabled={running} /> {t("仅照片", "Photos only")}</label>
                     <label className="flex items-center gap-1.5"><input type="radio" checked={kind === "videos"} onChange={() => setKind("videos")} disabled={running} /> {t("仅视频", "Videos only")}</label>
                   </div>
+                  <label className="flex items-center gap-1.5"><input type="checkbox" checked={useEdited} onChange={(e) => setUseEdited(e.target.checked)} disabled={running} /> {t("在 iPhone 上编辑过的照片/视频，导入编辑后的版本（否则导入原图）", "For photos/videos edited on the iPhone, import the edited version (otherwise the original)")}</label>
                   {kind !== "videos" && <LocationGroupingControls draft={locDraft} setDraft={setLocDraft} hint={false} />}
                   <div className="text-[13px] font-medium text-stone-800">{t(`将导入 ${picked.length} 项（约 ${mb(totalBytes)}）`, `${picked.length} item(s) will be imported (about ${mb(totalBytes)})`)}</div>
                   <div className="text-[12px] text-stone-500">{t("提示：如果开启了“优化 iPhone 储存空间”，部分原图只在 iCloud 里，无法通过数据线导入。", "Note: with “Optimize iPhone Storage” on, some originals live only in iCloud and can't be copied over the cable.")}</div>
@@ -8732,7 +8874,7 @@ const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onG
           )}
           {result && (
             <div className={"text-xs p-2 rounded border space-y-1 " + (result.failed ? "border-amber-300 bg-amber-50 text-amber-900" : "border-emerald-300 bg-emerald-50 text-emerald-900")}>
-              <div className="font-medium">{result.cancelled ? t("已停止。", "Stopped. ") : ""}{t(`完成：导入 ${result.ok} 项，失败 ${result.failed} 项。`, `Done: ${result.ok} imported, ${result.failed} failed.`)}</div>
+              <div className="font-medium">{result.cancelled ? t("已停止。", "Stopped. ") : ""}{t(`完成：导入 ${result.ok} 项，失败 ${result.failed} 项。`, `Done: ${result.ok} imported, ${result.failed} failed.`)}{result.skipped ? t(` 另有 ${result.skipped} 项因拍摄日期不在所选范围内而跳过。`, ` ${result.skipped} skipped: taken outside the selected dates.`) : ""}{result.editedCount ? t(` 其中 ${result.editedCount} 项为编辑后的版本。`, ` ${result.editedCount} were edited versions.`) : ""}</div>
               {result.lastErr && <div className="text-red-700 break-all">{t("原因：", "Reason: ")}{result.lastErr}</div>}
               {result.failNames.map((n) => <div key={n} className="break-all">{n}</div>)}
             </div>
@@ -21993,7 +22135,7 @@ function DMS({ storagePath, onChangeFolder }) {
     // Confirm first: filename text, plus (for photos) the location-grouping
     // radius pre-filled with the one used last time; upload from confirmLocPrompt.
     e.target.value = "";
-    promptUpload(files, selectedId, files.some(looksLikePhotoFile) ? "year-month" : "plain");
+    promptUpload(files, selectedId, "year-month");
   };
 
   const openMultiFolderDialog = () => {
@@ -22089,23 +22231,6 @@ function DMS({ storagePath, onChangeFolder }) {
     }
   };
 
-  // "Don't create year/month folders" — same file picker as handleUpload
-  // (all file types selectable), just skips photo date-based routing.
-  const handleCurrentFolderUpload = async (e) => {
-    const files = Array.from(e.target.files || []);
-    if (!files.length) {
-      e.target.value = "";
-      return;
-    }
-    if (!selectedNode) {
-      e.target.value = "";
-      alert(t("请先在装配树中点击选择一个文件夹。", "Please click to select a folder in the assembly tree first."));
-      return;
-    }
-    e.target.value = "";
-    promptUpload(files, selectedId, "current-folder");
-  };
-
   const handleTreeUpload = async (nodeId, e) => {
     console.log(`[DMS] handleTreeUpload triggered for node ${nodeId}, files=`, e.target.files);
     const files = Array.from(e.target.files || []);
@@ -22113,7 +22238,7 @@ function DMS({ storagePath, onChangeFolder }) {
     e.target.value = "";
     setSelectedId(nodeId);
     setExpandedIds((prev) => new Set([...prev, nodeId]));
-    promptUpload(files, nodeId, files.some(looksLikePhotoFile) ? "year-month" : "plain");
+    promptUpload(files, nodeId, "year-month");
   };
 
   const handlePanelDragOver = (e) => {
@@ -23438,6 +23563,15 @@ function DMS({ storagePath, onChangeFolder }) {
           <div>
             <div className="text-sm tracking-[0.2em] uppercase text-stone-700">{t("一个软件，管理所有文件", "One app to manage every file")}</div>
             <div className="text-lg font-semibold text-stone-900">{t("文件管理系统(DMS)", "Document Management System (DMS)")}</div>
+            <a
+              href="https://davidpang2004.github.io/PSM-Doc/"
+              target="_blank"
+              rel="noopener noreferrer"
+              title={t("在 GitHub 上打开用户手册", "Open the User Manual on GitHub")}
+              className="text-[12px] text-amber-700 hover:text-amber-900 hover:underline"
+            >
+              {t("用户手册", "User Manual")}
+            </a>
           </div>
         </div>
         <div className="flex items-center gap-3 text-[12px] text-stone-700">
@@ -24272,10 +24406,6 @@ function DMS({ storagePath, onChangeFolder }) {
                     <label className="text-sm px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white rounded cursor-pointer flex items-center gap-1.5">
                       <Upload size={12} /> {t("上传文件", "Upload file")}
                       <input type="file" multiple onChange={handleUpload} className="hidden" />
-                    </label>
-                    <label className="text-sm px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white rounded cursor-pointer flex items-center gap-1.5">
-                      <Upload size={12} /> {t("不生成年月夹", "Don't create year/month folders")}
-                      <input type="file" multiple onChange={handleCurrentFolderUpload} className="hidden" />
                     </label>
                     <button onClick={openMultiFolderDialog} className="text-sm px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white rounded cursor-pointer flex items-center gap-1.5">
                       <Upload size={12} /> {t("上传文件夹", "Upload folder")}
@@ -25115,6 +25245,9 @@ function DMS({ storagePath, onChangeFolder }) {
                 rows={5}
                 className="w-full text-sm px-3 py-2 border border-stone-300 rounded focus:outline-none focus:border-fuchsia-500"
               />
+              <div className="mt-2">
+                <VoiceMicButton onFinalTranscript={(chunk) => setDescDialog((d) => d ? ({ ...d, text: appendWithSpace(d.text, chunk) }) : d)} />
+              </div>
             </div>
             <div className="px-5 py-3 border-t border-stone-200 flex items-center justify-end gap-2 shrink-0">
               <button
@@ -25379,7 +25512,9 @@ function DMS({ storagePath, onChangeFolder }) {
             {locPrompt.mode === "year-month" && (
               <>
                 <div className="text-sm text-stone-700">
-                  {t("照片会按拍摄日期放入 年/月 文件夹。", "Photos are filed into year/month folders by the date taken.")}
+                  {(locDraft.layout || "ymd-loc") === "asis"
+                    ? t("文件直接放入当前文件夹，不创建年/月文件夹。", "Files go straight into the current folder; no year/month folders are created.")
+                    : t("文件会按日期放入下面所选的年/月文件夹（照片按拍摄日期）。", "Files are filed into the year/month folders chosen below by date (photos by the date taken).")}
                 </div>
                 <LocationGroupingControls draft={locDraft} setDraft={setLocDraft} />
               </>

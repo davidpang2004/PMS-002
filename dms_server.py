@@ -2354,6 +2354,7 @@ input[type=file]::file-selector-button{
       <option value="ymd-loc" selected>YYYY / MM / DD / Location</option>
       <option value="ym-loc">YYYY / MM / Location</option>
       <option value="ymd">YYYY / MM / DD</option>
+      <option value="none">No folders — put files straight into this folder</option>
     </select>
 
     <span class="lbl">📁 Choose files from library</span>
@@ -2370,7 +2371,7 @@ input[type=file]::file-selector-button{
   </form>
 
   <div id="banner">__BANNER__</div>
-  <p style="margin-top:16px;font-size:10px;color:#ccc;text-align:center">v8</p>
+  <p style="margin-top:16px;font-size:10px;color:#ccc;text-align:center">v9</p>
 </div>
 <script>
 async function init(){
@@ -3171,8 +3172,9 @@ def mobile_upload():
     new_location_node_ids: list[str] = []
     # Folder structure picked on the phone's upload page (default Y/M/D/Location).
     layout = (request.form.get("layout") or "ymd-loc").strip()
-    if layout not in ("ym-loc", "ymd", "ymd-loc"):
+    if layout not in ("ym-loc", "ymd", "ymd-loc", "none"):
         layout = "ymd-loc"
+    no_folders = layout == "none"
     use_day = layout in ("ymd", "ymd-loc")
     use_loc = layout in ("ym-loc", "ymd-loc") and loc_settings["enabled"]
 
@@ -3205,7 +3207,7 @@ def mobile_upload():
             if gps_lat is not None:
                 _reverse_geocode_and_patch(doc_id, gps_lat, gps_lon)
 
-        if is_photo and _valid_photo_year_month(photo_year, photo_month):
+        if is_photo and not no_folders and _valid_photo_year_month(photo_year, photo_month):
             # Auto-route into Year/Month subfolders under the upload base —
             # the explicitly selected folder if one was picked (the common
             # case for "Send to Phone" / Remote Upload links, which are tied
@@ -4259,9 +4261,19 @@ def get_iphone_file():
     path = (request.args.get("path") or "").strip()
     if not udid or not path:
         return jsonify({"error": "Missing 'udid' or 'path'"}), 400
+    # edited=1: prefer the version edited in the Photos app, when there is one.
+    want_edited = (request.args.get("edited") or "") == "1"
     tmp = tempfile.mkdtemp(prefix="dms-iphone-")
+    edited = None
     try:
-        local = iphone_import.pull_file(udid, path, tmp)
+        if want_edited:
+            try:
+                edited = iphone_import.pull_edited(udid, path, tmp)
+            except ValueError:
+                raise
+            except Exception as e:
+                print(f"[DMS] iPhone: edited version unavailable for {path!r}: {e}")
+        local = edited["path"] if edited else iphone_import.pull_file(udid, path, tmp)
     except ValueError as e:
         shutil.rmtree(tmp, ignore_errors=True)
         return jsonify({"error": str(e)}), 400
@@ -4269,7 +4281,11 @@ def get_iphone_file():
         shutil.rmtree(tmp, ignore_errors=True)
         return jsonify({"error": iphone_import._classify(e)[1]}), 500
     resp = send_file(local, as_attachment=True, download_name=Path(local).name)
-    if Path(local).suffix.lower() not in (".mov", ".mp4", ".m4v", ".3gp"):
+    if edited:
+        import json as _json
+        resp.headers["X-Edited-Name"] = _url_quote(Path(local).name)
+        resp.headers["X-Photo-Meta"] = _json.dumps(edited["meta"])
+    elif Path(local).suffix.lower() not in (".mov", ".mp4", ".m4v", ".3gp"):
         # Capture date + GPS read here (the browser can't read them from HEIC);
         # the dialog hands them to the normal upload so location folders work.
         import json as _json
@@ -4903,6 +4919,76 @@ def download_token(token: str):
     return send_file(file_path, mimetype=mime, download_name=download_name, as_attachment=False)
 
 
+def _text_to_phone(normalised: str, message: str):
+    """Text *message* to the phone number *normalised* ("+..." form).
+
+    Mac: sends through the Messages app (iMessage/SMS via the linked iPhone).
+    Windows: opens Phone Link with the text pre-filled.  Other: nothing sent.
+    Returns (ok, method, error_message); method is "messages", "phone_link"
+    or "url_only" (nothing could be sent automatically).
+    """
+    import subprocess
+    if sys.platform == "darwin":
+        digits_suffix = normalised.lstrip("+")
+        safe_msg = message.replace("\\", "\\\\").replace('"', '\\"')
+        script = f"""
+tell application "Messages"
+    set _msg to "{safe_msg}"
+    set _digits to "{digits_suffix}"
+    set _norm to "{normalised}"
+    set _sent to false
+    repeat with c in chats
+        try
+            repeat with p in (participants of c)
+                set h to handle of p
+                if h ends with _digits or h is _norm then
+                    send _msg to c
+                    set _sent to true
+                    exit repeat
+                end if
+            end repeat
+        end try
+        if _sent then exit repeat
+    end repeat
+    if not _sent then
+        repeat with svc in services
+            set sType to service type of svc as string
+            if sType is in {{"iMessage", "SMS", "RCS"}} then
+                try
+                    send _msg to buddy _norm of svc
+                    set _sent to true
+                    exit repeat
+                end try
+            end if
+        end repeat
+    end if
+    if not _sent then
+        error "No Messages conversation found for " & _norm
+    end if
+end tell
+"""
+        result = subprocess.run(["osascript", "-e", script],
+                                capture_output=True, text=True, timeout=15)
+        if result.returncode == 0:
+            return True, "messages", ""
+        return False, "", (result.stderr.strip() or
+                           "Messages app could not send. Is your iPhone linked to this Mac via Messages?")
+    if sys.platform == "win32":
+        import urllib.parse as _urlparse
+        # sms: URI — Phone Link handles this and pre-fills the compose window.
+        sms_uri = f"sms:{normalised}?body={_urlparse.quote(message)}"
+        try:
+            subprocess.Popen(
+                ["powershell", "-WindowStyle", "Hidden", "-Command",
+                 f"Start-Process '{sms_uri}'"],
+                creationflags=0x08000000,  # CREATE_NO_WINDOW
+            )
+            return True, "phone_link", ""
+        except Exception:
+            return True, "url_only", ""
+    return True, "url_only", ""
+
+
 @app.route("/api/send-to-phone", methods=["POST"])
 def send_to_phone():
     """Send a document download link to a phone via Messages (Mac) or Phone Link (Windows)."""
@@ -4950,75 +5036,11 @@ def send_to_phone():
     message = f"文件：{doc_name}\n下载：{download_url}"
     normalised = phone if phone.startswith("+") else "+" + phone
 
-    # ---- Mac: send via Messages.app (AppleScript) --------------------------
-    if sys.platform == "darwin":
-        digits_suffix = normalised.lstrip("+")
-        safe_msg = message.replace("\\", "\\\\").replace('"', '\\"')
-        script = f"""
-tell application "Messages"
-    set _msg to "{safe_msg}"
-    set _digits to "{digits_suffix}"
-    set _norm to "{normalised}"
-    set _sent to false
-    repeat with c in chats
-        try
-            repeat with p in (participants of c)
-                set h to handle of p
-                if h ends with _digits or h is _norm then
-                    send _msg to c
-                    set _sent to true
-                    exit repeat
-                end if
-            end repeat
-        end try
-        if _sent then exit repeat
-    end repeat
-    if not _sent then
-        repeat with svc in services
-            set sType to service type of svc as string
-            if sType is in {{"iMessage", "SMS", "RCS"}} then
-                try
-                    send _msg to buddy _norm of svc
-                    set _sent to true
-                    exit repeat
-                end try
-            end if
-        end repeat
-    end if
-    if not _sent then
-        error "No Messages conversation found for " & _norm
-    end if
-end tell
-"""
-        result = subprocess.run(["osascript", "-e", script],
-                                capture_output=True, text=True, timeout=15)
-        if result.returncode == 0:
-            return jsonify({"ok": True, "url": download_url, "method": "messages",
-                            "local_ip": local_ip, "port": port, "is_tunnel": is_tunnel})
-        return jsonify({"error": result.stderr.strip() or
-                        "Messages app could not send. Is your iPhone linked to this Mac via Messages?"}), 500
-
-    # ---- Windows: open Phone Link via sms: URI -----------------------------
-    elif sys.platform == "win32":
-        import urllib.parse as _urlparse
-        # Build sms: URI — Phone Link handles this and pre-fills the compose window.
-        sms_uri = f"sms:{normalised}?body={_urlparse.quote(message)}"
-        try:
-            subprocess.Popen(
-                ["powershell", "-WindowStyle", "Hidden", "-Command",
-                 f"Start-Process '{sms_uri}'"],
-                creationflags=0x08000000,  # CREATE_NO_WINDOW
-            )
-            return jsonify({"ok": True, "url": download_url, "method": "phone_link",
-                            "local_ip": local_ip, "port": port, "is_tunnel": is_tunnel})
-        except Exception as e:
-            return jsonify({"ok": True, "url": download_url, "method": "url_only",
-                            "local_ip": local_ip, "port": port, "is_tunnel": is_tunnel})
-
-    # ---- Other (Linux etc.): return URL only --------------------------------
-    else:
-        return jsonify({"ok": True, "url": download_url, "method": "url_only",
-                        "local_ip": local_ip, "port": port, "is_tunnel": is_tunnel})
+    ok, method, err = _text_to_phone(normalised, message)
+    if not ok:
+        return jsonify({"error": err}), 500
+    return jsonify({"ok": True, "url": download_url, "method": method,
+                    "local_ip": local_ip, "port": port, "is_tunnel": is_tunnel})
 
 
 def _email_esc(s: str) -> str:
@@ -5246,6 +5268,95 @@ def send_email():
         return jsonify({
             "error": "邮件未配置。请在项目菜单的邮件设置中配置 SMTP 服务器。"
         }), 400
+
+
+@app.route("/api/send-link", methods=["POST"])
+def send_link():
+    """Send an iPhone upload/download link (from the Upload/Download from
+    iPhone dialog) to a phone by text, or by email with the QR code attached.
+
+    Body JSON: {"url": "...", "phone": "+1..."} or {"url": "...", "email": "a@b"},
+               optional "kind": "upload" | "send"
+    """
+    data = request.get_json(force=True) or {}
+    url   = (data.get("url")   or "").strip()
+    phone = (data.get("phone") or "").strip()
+    email = (data.get("email") or "").strip()
+    kind  = (data.get("kind")  or "upload").strip()
+    # Only links this server minted for the phone pages may be sent.
+    if not re.match(r"^https?://[^\s/]+/(mobile/r|send)/[0-9A-Za-z_-]+/?$", url):
+        return jsonify({"error": "Invalid link"}), 400
+    if kind == "send":
+        subject = "DMS: photos to save on your iPhone"
+        text = f"DMS photos for your iPhone — open this link on the phone:\n{url}"
+    else:
+        subject = "DMS: upload files from your iPhone"
+        text = f"DMS upload link — open this on your iPhone to send files to the computer:\n{url}"
+
+    if phone:
+        digits = re.sub(r"[^\d+]", "", phone)
+        if len(digits.lstrip("+")) < 7:
+            return jsonify({"error": "Invalid phone number"}), 400
+        normalised = digits if digits.startswith("+") else "+" + digits
+        ok, method, err = _text_to_phone(normalised, text)
+        if not ok:
+            return jsonify({"error": err}), 500
+        return jsonify({"ok": True, "method": method})
+
+    if email:
+        if "@" not in email or any(c in email for c in "\r\n\"<>"):
+            return jsonify({"error": "Invalid email address"}), 400
+        # Attach the QR code so it can be scanned straight off another screen.
+        qr_path = None
+        try:
+            import qrcode
+            qr_dir = Path(tempfile.mkdtemp(prefix="dms-qr-"))
+            qr_path = qr_dir / "DMS-QR.png"
+            qrcode.make(url, box_size=8, border=2).save(str(qr_path))
+        except Exception:
+            qr_path = None
+        body = text + "\n\n(The attached QR code opens the same link.)" if qr_path else text
+        cfg = load_config()
+        smtp_configured = ((cfg.get("email_smtp_host") or "").strip() and
+                           (cfg.get("email_smtp_user") or "").strip())
+        if smtp_configured and qr_path:
+            return _send_via_smtp(email, subject, body, qr_path, "DMS-QR.png", cfg)
+        if smtp_configured:
+            return _send_text_via_smtp(email, subject, body, cfg)
+        if sys.platform == "darwin" and qr_path:
+            return _send_via_applescript(email, subject, body, qr_path)
+        return jsonify({"error": "邮件未配置。请在项目菜单的邮件设置中配置 SMTP 服务器。 / Email isn't set up — configure SMTP in Email settings."}), 400
+
+    return jsonify({"error": "phone or email is required"}), 400
+
+
+def _send_text_via_smtp(to_email, subject, body, cfg):
+    """Plain-text email (no attachment) via the saved SMTP settings."""
+    import smtplib
+    from email.mime.text import MIMEText
+    smtp_user = (cfg.get("email_smtp_user") or "").strip()
+    smtp_pass = (cfg.get("email_smtp_pass") or "").strip()
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["From"] = (cfg.get("email_from") or "").strip() or smtp_user
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    host = (cfg.get("email_smtp_host") or "").strip()
+    port = int(cfg.get("email_smtp_port") or 587)
+    try:
+        if cfg.get("email_ssl"):
+            with smtplib.SMTP_SSL(host, port, timeout=30) as srv:
+                if smtp_user and smtp_pass:
+                    _smtp_login(srv, smtp_user, smtp_pass)
+                srv.send_message(msg)
+        else:
+            with smtplib.SMTP(host, port, timeout=30) as srv:
+                srv.ehlo(); srv.starttls(); srv.ehlo()
+                if smtp_user and smtp_pass:
+                    _smtp_login(srv, smtp_user, smtp_pass)
+                srv.send_message(msg)
+        return jsonify({"ok": True, "method": "smtp"})
+    except Exception as exc:
+        return jsonify({"error": f"SMTP 错误：{exc}"}), 500
 
 
 @app.route("/api/download-smtp-guide", methods=["GET"])
@@ -7686,8 +7797,7 @@ def post_doc_scan_barcode(doc_id):
     if not pdf_extraction.barcode_scan_available():
         return jsonify({
             "error": ("未安装条码识别库。请在运行此程序的 Python 中执行：\n"
-                      "    brew install zbar\n"
-                      "    pip3 install pyzbar\n"
+                      "    pip3 install zxing-cpp\n"
                       "然后重启服务器。")
         }), 500
 
