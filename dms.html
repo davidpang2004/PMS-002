@@ -8486,6 +8486,55 @@ const HeicToJpgDialog = ({ onClose }) => {
  * import can bring over only what's new.
  * =============================================================================
  */
+// "Link won't open on the phone?" help for the same-Wi-Fi phone links (the
+// Upload/Download from iPhone QR codes and "Send to phone"). The browser runs
+// on the same computer as the DMS server, so navigator.platform tells us
+// whether to show the macOS or the Windows firewall steps.
+const PhoneLinkHelp = ({ ip, anyNetHint = false }) => {
+  const { t } = useLang();
+  const [open, setOpen] = useState(false);
+  const plat = typeof navigator !== "undefined" ? (navigator.platform || "") : "";
+  const isWin = /Win/i.test(plat);
+  const pc = isWin ? t("这台电脑", "this PC") : t("这台 Mac", "this Mac");
+  const H = ({ children }) => <div className="font-medium text-stone-800">{children}</div>;
+  const S = ({ children }) => <div className="pl-2">{children}</div>;
+  return (
+    <div className="text-[12px]">
+      <button onClick={() => setOpen(!open)} className="text-amber-700 underline">
+        {open ? t("收起", "Collapse") : t("手机打不开链接？查看解决方法 ▾", "Link won't open on the phone? See troubleshooting ▾")}
+      </button>
+      {open && (
+        <div className="mt-1 text-stone-700 bg-amber-50 border border-amber-200 rounded p-2 space-y-1.5 leading-relaxed">
+          <div className="font-semibold text-amber-800">{t("「找不到服务器」/「无法连接」的常见原因：", "Common reasons for “server not found” / “can't connect”:")}</div>
+          <H>{t("① 手机未连 Wi-Fi（最常见）", "① The phone isn't on the same Wi-Fi (most common)")}</H>
+          <S>{t(`→ 打开手机「设置」→「Wi-Fi」，确认已连接，且与${pc}在同一网络，而不是在用蜂窝数据。`, `→ On the phone open Settings → Wi-Fi and confirm it's connected to the same network as ${pc}, not using cellular data.`)}</S>
+          {isWin ? (<>
+            <H>{t("② 被 Windows 防火墙拦截", "② Blocked by Windows Firewall")}</H>
+            <S>{t("→ 第一次运行 DMS 时如果弹出「允许 DMS 在这些网络上通信？」，请点「允许访问」，并勾选「专用网络」。", "→ If Windows asked “Allow DMS to communicate on these networks?” the first time DMS ran, click Allow access with Private networks ticked.")}</S>
+            <S>{t("→ 当时点了取消？开始菜单搜索「允许应用通过 Windows 防火墙」→「更改设置」→ 找到 DMS，勾选「专用」→ 确定。列表里没有就点「允许其他应用…」，选中 DMS.exe 添加。", "→ Clicked Cancel back then? Start menu → search “Allow an app through Windows Firewall” → Change settings → find DMS and tick Private → OK. Not listed? Click “Allow another app…” and add DMS.exe.")}</S>
+            <H>{t("③ Wi-Fi 被设成了「公用网络」", "③ The Wi-Fi is set to “Public network”")}</H>
+            <S>{t("→ 设置 → 网络和 Internet → WLAN → 点当前的 Wi-Fi → 网络配置文件类型选「专用网络」。公用网络下 Windows 默认拦截手机的连接。", "→ Settings → Network & internet → Wi-Fi → click your network → Network profile type: Private. On a Public network Windows blocks the phone by default.")}</S>
+            <H>{t("④ VPN 或虚拟网卡，IP 地址不对", "④ A VPN or virtual network adapter gave the wrong IP address")}</H>
+            <S>{t("→ 链接里的 IP", "→ Is the IP in the link")} {ip ? <span className="font-mono font-bold">{ip}</span> : null} {t("应是 192.168.x.x 或 10.x.x.x（家里的局域网）。如果不是，请先断开 VPN；装了 Hyper-V、WSL、VirtualBox、VMware 的电脑也可能选错网卡，可改用「任何网络」或 USB。", "a home-network address like 192.168.x.x or 10.x.x.x? If not, disconnect any VPN first. PCs with Hyper-V, WSL, VirtualBox or VMware can also pick the wrong adapter — use “Any network” or USB instead.")}</S>
+          </>) : (<>
+            <H>{t("② 被 macOS 防火墙拦截", "② Blocked by the macOS firewall")}</H>
+            <S>{t("→ 系统设置 → 网络 → 防火墙 → 选项…，找到 DMS，设为「允许传入连接」。若没有则点 + 添加。", "→ System Settings → Network → Firewall → Options…, find DMS and set it to “Allow incoming connections”. If it's not listed, click + to add it.")}</S>
+            <H>{t("③ Mac 连接了 VPN，IP 地址不对", "③ The Mac is on a VPN, giving the wrong IP address")}</H>
+            <S>{t("→ 链接里的 IP", "→ Is the IP in the link")} {ip ? <span className="font-mono font-bold">{ip}</span> : null} {t("应是 192.168.x.x 或 10.x.x.x（局域网）。若是 VPN 的 IP，请先断开 VPN。", "a local address like 192.168.x.x or 10.x.x.x? If it's a VPN address, disconnect the VPN first.")}</S>
+          </>)}
+          <H>{t(`${isWin ? "⑤" : "④"} 路由器开启了 AP 隔离`, `${isWin ? "⑤" : "④"} The router has AP/client isolation turned on`)}</H>
+          <S>{t("→ 常见于公司、酒店和访客 Wi-Fi。登录路由器管理页，关闭「AP 隔离」/「客户端隔离」，或换一个 Wi-Fi。", "→ Common on office, hotel and guest Wi-Fi. Turn off “AP isolation” / “client isolation” in the router's admin page, or use another Wi-Fi.")}</S>
+          <div className="pt-1 text-amber-700 font-medium">
+            {anyNetHint
+              ? t("都试过还是不行？在上方选「任何网络」，通过互联网连接，不受以上限制。", "Still stuck? Choose “Any network” above — it connects over the internet and avoids all of these.")
+              : t("都试过还是不行？改用 USB 数据线连接 iPhone，不受 Wi-Fi 限制。", "Still stuck? Connect the iPhone with a USB cable instead — it isn't affected by Wi-Fi.")}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
 const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onGetLoc, onClose }) => {
   const { t } = useLang();
   // Destination folder: pick any existing folder, or create a new one first.
@@ -8720,7 +8769,10 @@ const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onG
   );
 
   const stateHelp = {
-    no_device: t("请用数据线把 iPhone 连接到这台电脑，并解锁手机。", "Plug your iPhone into this computer with its USB cable and unlock the phone."),
+    no_device: t("请用数据线把 iPhone 连接到这台电脑，并解锁手机。", "Plug your iPhone into this computer with its USB cable and unlock the phone.")
+      + (typeof navigator !== "undefined" && /Win/i.test(navigator.platform || "")
+        ? t("Windows 电脑还需要先从 Microsoft Store 安装苹果的「Apple 设备」App（或 iTunes），电脑才能识别 iPhone。", " On Windows, first install Apple's “Apple Devices” app (or iTunes) from the Microsoft Store so the PC can recognise the iPhone.")
+        : ""),
     not_trusted: t("请在 iPhone 上点“信任”（如需要，输入手机密码）。", "On your iPhone, tap “Trust” (enter its passcode if asked)."),
     locked: t("请先解锁 iPhone，然后稍候。", "Unlock your iPhone, then wait a moment."),
   };
@@ -8806,6 +8858,7 @@ const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onG
                     <button onClick={() => { try { navigator.clipboard.writeText(sendLink.url); setCopied(true); } catch (e) {} }} className="px-2 py-1 border border-stone-300 rounded hover:bg-stone-50 shrink-0">{copied ? t("已复制", "Copied") : t("复制链接", "Copy link")}</button>
                   </div>
                   {shareBlock(sendLink.url, "send")}
+                  {!anyNet && <PhoneLinkHelp ip={(sendLink.url.match(/\/\/([^:/]+)/) || [])[1]} anyNetHint />}
                 </>
               )}
               <div className="text-[12px] text-stone-500">{t("链接 24 小时内有效（重启 DMS 后失效），只能查看所选文件夹里的照片和视频。", "The link works for 24 hours (or until DMS restarts) and only exposes the photos and videos listed above. Over plain Wi-Fi links Safari can only save one photo at a time.")}</div>
@@ -8835,6 +8888,7 @@ const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onG
                 </div>
               )}
               {link && shareBlock(link.url, "upload")}
+              {link && !anyNet && <PhoneLinkHelp ip={(link.url.match(/\/\/([^:/]+)/) || [])[1]} anyNetHint />}
               <div className="text-[12px] text-stone-500">{t("此链接 7 天内有效，只能把文件传到所选文件夹。上传后本窗口外的文件列表会自动刷新。", "The link works for 7 days and can only add files to the chosen folder. New files appear in DMS automatically.")}</div>
             </>
           ) : st.state !== "ready" ? (
@@ -12131,7 +12185,6 @@ const SendToPhoneDialog = ({ doc, onClose }) => {
   const [status, setStatus] = useState(null); // null | { ok, msg, url, method, local_ip, port, is_tunnel }
   const [busy, setBusy] = useState(false);
   const [urlCopied, setUrlCopied] = useState(false);
-  const [showFirewallHelp, setShowFirewallHelp] = useState(false);
 
   const send = async () => {
     const p = phone.trim();
@@ -12227,29 +12280,16 @@ const SendToPhoneDialog = ({ doc, onClose }) => {
                 <div className="text-[12px] text-green-700">
                   {t("链接使用本地 IP", "The link uses the local IP")} <span className="font-mono font-bold">{status.local_ip}:{status.port}</span>{t("，需满足：", " — this requires:")}
                 </div>
-                <div className="text-[12px] text-green-700">{t("① 手机与此 Mac 连接在", "① The phone is connected to ")}<strong>{t("同一 Wi-Fi", "the same Wi-Fi")}</strong>{t(" ", " as this Mac")}</div>
-                <div className="text-[12px] text-green-700">{t("② macOS 防火墙已允许 DMS.app 接受连接", "② The macOS firewall allows DMS.app to accept connections")}</div>
-                <button
-                  onClick={() => setShowFirewallHelp(!showFirewallHelp)}
-                  className="text-[12px] text-amber-700 underline mt-0.5"
-                >
-                  {showFirewallHelp ? t("收起", "Collapse") : t("链接打不开？查看解决方法 ▾", "Link won't open? See troubleshooting ▾")}
-                </button>
-                {showFirewallHelp && (
-                  <div className="mt-1 text-[12px] text-stone-700 bg-amber-50 border border-amber-200 rounded p-2 space-y-1.5 leading-relaxed">
-                    <div className="font-semibold text-amber-800">{t("「找不到服务器」的常见原因：", "Common reasons for “server not found”:")}</div>
-                    <div className="font-medium text-stone-800">{t("① 手机未连 Wi-Fi（最常见）", "① Phone isn't connected to Wi-Fi (most common)")}</div>
-                    <div className="pl-2">{t("→ 打开手机「设置」→「Wi-Fi」，确认已连接且", "→ Open the phone's Settings → Wi-Fi, and confirm it's connected and ")}<strong>{t("与此 Mac 在同一网络", "on the same network as this Mac")}</strong>{t("，而非使用蜂窝数据。", ", not using cellular data.")}</div>
-                    <div className="font-medium text-stone-800">{t("② macOS 防火墙拦截", "② Blocked by the macOS firewall")}</div>
-                    <div className="pl-2">{t("→ 系统设置 → 网络 → 防火墙 → 选项…", "→ System Settings → Network → Firewall → Options…")}</div>
-                    <div className="pl-2">{t("→ 找到", "→ Find")} <strong>DMS</strong>{t("，设为「允许传入连接」。若没有则点 + 添加。", ", and set it to “Allow incoming connections”. If it's not listed, click + to add it.")}</div>
-                    <div className="font-medium text-stone-800">{t("③ Mac 连接了 VPN，IP 地址不对", "③ The Mac is connected to a VPN, giving the wrong IP address")}</div>
-                    <div className="pl-2">{t("→ 上方显示的 IP 是否是", "→ Is the IP shown above")} <strong>192.168.x.x</strong> {t("或", "or")} <strong>10.x.x.x</strong>{t("（局域网）？若是 VPN IP，请先断开 VPN。", " (local network)? If it's a VPN IP, disconnect the VPN first.")}</div>
-                    <div className="font-medium text-stone-800">{t("④ 路由器开启了 AP 隔离", "④ The router has AP/client isolation enabled")}</div>
-                    <div className="pl-2">{t("→ 登录路由器管理页，关闭「AP 隔离」/「客户端隔离」。", "→ Log into the router's admin page and turn off “AP isolation” / “client isolation”.")}</div>
-                    <div className="pt-1 text-amber-700 font-medium">{t("以上都试过还是不行？改用 USB 数据线连接 iPhone，不受 Wi-Fi 限制。", "Still not working after trying all of these? Connect the iPhone with a USB cable instead — it is unaffected by Wi-Fi restrictions.")}</div>
-                  </div>
-                )}
+                {(() => {
+                  const win = /Win/i.test((typeof navigator !== "undefined" && navigator.platform) || "");
+                  return (<>
+                    <div className="text-[12px] text-green-700">{t(`① 手机与${win ? "这台电脑" : "此 Mac"}连接在`, "① The phone is connected to ")}<strong>{t("同一 Wi-Fi", "the same Wi-Fi")}</strong>{t(" ", win ? " as this PC" : " as this Mac")}</div>
+                    <div className="text-[12px] text-green-700">{win
+                      ? t("② Windows 防火墙已允许 DMS 在「专用网络」上通信", "② Windows Firewall allows DMS on Private networks")
+                      : t("② macOS 防火墙已允许 DMS.app 接受连接", "② The macOS firewall allows DMS.app to accept connections")}</div>
+                  </>);
+                })()}
+                <PhoneLinkHelp ip={status.local_ip} />
               </div>
             )}
           </div>
