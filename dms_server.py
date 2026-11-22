@@ -4919,6 +4919,31 @@ def download_token(token: str):
     return send_file(file_path, mimetype=mime, download_name=download_name, as_attachment=False)
 
 
+def _windows_sms_is_phone_link() -> bool:
+    """True if Windows' handler for sms: links is Microsoft Phone Link
+    (package Microsoft.YourPhone). Reads the user's choice for the sms:
+    protocol from the registry and the handler's app id."""
+    try:
+        import winreg
+    except ImportError:
+        return False
+    def _val(root, path, name):
+        try:
+            with winreg.OpenKey(root, path) as k:
+                return str(winreg.QueryValueEx(k, name)[0] or "")
+        except OSError:
+            return ""
+    progid = _val(winreg.HKEY_CURRENT_USER,
+                  r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\sms\UserChoice",
+                  "ProgId")
+    if not progid:
+        return False
+    info = " ".join([progid,
+                     _val(winreg.HKEY_CLASSES_ROOT, progid + r"\Application", "AppUserModelID"),
+                     _val(winreg.HKEY_CLASSES_ROOT, progid + r"\Application", "ApplicationName")]).lower()
+    return "yourphone" in info or "phone link" in info
+
+
 def _text_to_phone(normalised: str, message: str):
     """Text *message* to the phone number *normalised* ("+..." form).
 
@@ -4975,7 +5000,13 @@ end tell
                            "Messages app could not send. Is your iPhone linked to this Mac via Messages?")
     if sys.platform == "win32":
         import urllib.parse as _urlparse
-        # sms: URI — Phone Link handles this and pre-fills the compose window.
+        # Windows can't send a text by itself. An sms: link only pre-fills a
+        # message in whatever app owns sms: -- fine when that's Microsoft
+        # Phone Link (linked to the user's phone), but on many PCs Chrome or
+        # another browser owns it and nothing is ever sent. Only hand off to
+        # Phone Link; otherwise say honestly that nothing could be sent.
+        if not _windows_sms_is_phone_link():
+            return True, "url_only", ""
         sms_uri = f"sms:{normalised}?body={_urlparse.quote(message)}"
         try:
             subprocess.Popen(

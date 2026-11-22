@@ -716,6 +716,11 @@ bullet("Windows network type: the Wi-Fi must be a Private network - Settings -> 
 bullet("Wrong address: the IP in the link should look like 192.168.x.x or 10.x.x.x. A VPN - or, on Windows, Hyper-V, WSL, VirtualBox or VMware - can make DMS pick the wrong one; disconnect the VPN or use Any network.")
 bullet("Office, hotel and guest Wi-Fi often block devices from reaching each other (\u201cAP / client isolation\u201d). Use Any network, or the USB cable for photos.")
 tip("Any network avoids all of the above, because the phone reaches DMS through the internet instead of directly over the Wi-Fi.")
+h3("Sending the link by text or email")
+para("Under the QR code you can also send the link: type a phone number and click Text it, or an email address and click Email it (the email includes the QR code).")
+bullet("Mac: Text it sends the message itself through the Messages app (your iPhone must be linked to the Mac in Messages). Email it uses your email (SMTP) settings, or the Mail app if those aren't set up.")
+bullet("Windows: Windows can't send a text by itself. Text it only works with Microsoft Phone Link (Windows 11) paired with your phone and chosen as the default app for SMS (Settings -> Apps -> Default apps -> search \u201cSMS\u201d -> Phone Link); it opens the message ready to go and you click Send. Otherwise DMS says so and sends nothing. Email it needs the email (SMTP) settings in the Project menu.")
+tip("If the phone is right next to you, just scan the QR code - it's the quickest.")
 page_break()
 
 # ══════════════════════════════════════════════════════════════════════════════

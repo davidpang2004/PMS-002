@@ -8746,7 +8746,7 @@ const IphoneImportDialog = ({ tree, defaultNodeId, onImport, onCreateFolder, onG
       try { localStorage.setItem(via === "phone" ? "pms_last_phone" : "pms_last_email", val); } catch (e) {}
       const msg = j.method === "messages" ? t("已通过「信息」发送到手机。", "Sent to the phone via Messages.")
         : j.method === "phone_link" ? t("已在 Phone Link 中打开短信，请点发送。", "Opened in Phone Link — press Send there.")
-        : j.method === "url_only" ? t("此电脑无法自动发短信，请复制链接手动发送。", "This computer can't send texts automatically — copy the link and send it yourself.")
+        : j.method === "url_only" ? t("Windows 电脑不能直接发短信（需要已连接手机的微软「手机连接 / Phone Link」）。请改用「发邮件」，或直接用手机扫描上方二维码。", "Windows can't send a text by itself (it needs Microsoft Phone Link connected to your phone). Use Email it instead, or just scan the QR code above with the phone.")
         : j.method === "smtp" ? t("邮件已发送（附二维码）。", "Email sent (QR code attached).")
         : t("已在 Mail 中打开新邮件（附二维码），请检查后发送。", "A new email (QR code attached) is open in Mail — review and send it.");
       setShareMsg({ ok: j.method !== "url_only", msg });
