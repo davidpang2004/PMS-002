@@ -7074,7 +7074,8 @@ def translate_pdf_page(doc_id):
         return jsonify({"error": "Unknown provider"}), 400
 
     language = (data.get("language") or "").strip()[:80] or "Simplified Chinese (简体中文)"
-    key = (doc_id, page, provider, language)
+    source_language = (data.get("source_language") or "").strip()[:80]
+    key = (doc_id, page, provider, language, source_language)
     hit = _translate_cache.get(key)
     if hit:
         return jsonify({"ok": True, "page": page, "provider": provider, "cached": True, **hit})
@@ -7108,10 +7109,11 @@ def translate_pdf_page(doc_id):
     try:
         import ai_extraction
         if provider == "google":
-            result = ai_extraction.translate_free(text, language)
+            result = ai_extraction.translate_free(text, language, source_language)
         else:
             result = ai_extraction.translate_to_chinese(
-                text, api_key, provider=provider, language=language)
+                text, api_key, provider=provider, language=language,
+                source_language=source_language)
     except ai_extraction.AIExtractionError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:
@@ -7255,7 +7257,8 @@ def _layout_translation_text(path, lay):
     return jsonify({"ok": True, "size": len(pdf)})
 
 
-def _translate_texts(texts: list, provider: str, api_key: str, language: str) -> list:
+def _translate_texts(texts: list, provider: str, api_key: str, language: str,
+                     source_language: str = "") -> list:
     """Translate many short strings (table cells etc.), returning a list of
     the same length. Strings are sent in batches (one per line / numbered) and
     any the service garbles or drops are redone one at a time."""
@@ -7265,8 +7268,9 @@ def _translate_texts(texts: list, provider: str, api_key: str, language: str) ->
     def one(t):
         try:
             if provider == "google":
-                return ai_extraction.translate_free(t, language)["text"]
-            return ai_extraction.translate_to_chinese(t, api_key, provider=provider, language=language)["text"]
+                return ai_extraction.translate_free(t, language, source_language)["text"]
+            return ai_extraction.translate_to_chinese(t, api_key, provider=provider, language=language,
+                                                      source_language=source_language)["text"]
         except Exception:
             return ""
 
@@ -7286,14 +7290,15 @@ def _translate_texts(texts: list, provider: str, api_key: str, language: str) ->
     for b in todo:
         try:
             if provider == "google":
-                res = ai_extraction.translate_free("\n".join(texts[i] for i in b), language)["text"].split("\n")
+                res = ai_extraction.translate_free("\n".join(texts[i] for i in b), language, source_language)["text"].split("\n")
                 if len(res) == len(b):
                     for i, r in zip(b, res):
                         out[i] = r.strip()
                     continue
             else:
                 body = "\n".join(f"{n + 1}|{texts[i]}" for n, i in enumerate(b))
-                res = ai_extraction.translate_to_chinese(body, api_key, provider=provider, language=language)["text"]
+                res = ai_extraction.translate_to_chinese(body, api_key, provider=provider, language=language,
+                                                        source_language=source_language)["text"]
                 got = {}
                 for ln in res.split("\n"):
                     m = re.match(r"^\s*(\d+)\s*[|｜]\s*(.*)$", ln)
@@ -7322,7 +7327,7 @@ def save_pdf_translation_layout(doc_id):
     Saved as a new PDF named like save-translation's, in the original's folder.
 
     Body: { "provider": "google"|"gemini"|"deepseek", "language": str,
-    "node_id": str|null, "name": str }.  Returns the same shape as
+    "source_language": str ("" = auto-detect), "node_id": str|null, "name": str }.  Returns the same shape as
     save-translation plus { units, blank_pages }.
     """
     import layout_translate
@@ -7334,6 +7339,7 @@ def save_pdf_translation_layout(doc_id):
     if provider not in ("gemini", "deepseek", "google"):
         return jsonify({"error": "Unknown provider"}), 400
     language = (data.get("language") or "").strip()[:80] or "Simplified Chinese (简体中文)"
+    source_language = (data.get("source_language") or "").strip()[:80]
     api_key = ""
     if provider != "google":
         enc = load_config().get(_ai_key_field(provider), "")
@@ -7350,7 +7356,7 @@ def save_pdf_translation_layout(doc_id):
     target_cjk = bool(re.search(r"Chinese|Japanese|Korean|Cantonese", language))
     try:
         units, blank = layout_translate.build_translated_units(
-            matches[0], lambda texts: _translate_texts(texts, provider, api_key, language), target_cjk)
+            matches[0], lambda texts: _translate_texts(texts, provider, api_key, language, source_language), target_cjk)
         n_units = sum(1 for us in units.values() for u in us if u.get("text"))
         if not n_units:
             return jsonify({"error": "此 PDF 没有可定位的文字（可能是扫描件）。请改用「保存为 PDF」。 / "

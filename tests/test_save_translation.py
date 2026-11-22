@@ -184,3 +184,87 @@ class LayoutTranslationTests(unittest.TestCase):
         out = pymupdf.open(next(self.root.rglob("Orders Chinese*.pdf")))
         self.assertIn("甲状腺功能", out[0].get_text())
         self.assertNotIn("[[", out[0].get_text())
+
+
+class SourceLanguageTests(unittest.TestCase):
+    """The From-language picked in the Translate pane reaches the translators."""
+    setUp = SaveTranslationTests.setUp
+
+    def test_free_translator_sends_source_code(self):
+        import json, io, urllib.request, ai_extraction
+        seen = []
+
+        class R(io.BytesIO):
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        def fake(req, timeout=0):
+            seen.append(req.data.decode())
+            return R(json.dumps([[["hola", "hi"]]]).encode())
+        orig = urllib.request.urlopen
+        urllib.request.urlopen = fake
+        try:
+            ai_extraction.translate_free("hi", "Spanish", "English")
+            ai_extraction.translate_free("hi", "Spanish", "")
+            ai_extraction.translate_free("hi", "Spanish", "Traditional Chinese (繁體中文)")
+        finally:
+            urllib.request.urlopen = orig
+        self.assertIn("sl=en", seen[0]); self.assertIn("tl=es", seen[0])
+        self.assertIn("sl=auto", seen[1])
+        self.assertIn("sl=zh-TW", seen[2])
+
+    def test_ai_prompt_names_source(self):
+        import ai_extraction
+        got = []
+        orig = ai_extraction._deepseek_chat
+        ai_extraction._deepseek_chat = lambda msgs, key, timeout=0: got.append(msgs[0]["content"]) or "ok"
+        try:
+            ai_extraction.translate_to_chinese("x", "k", provider="deepseek", language="German", source_language="Japanese")
+            ai_extraction.translate_to_chinese("x", "k", provider="deepseek", language="German")
+        finally:
+            ai_extraction._deepseek_chat = orig
+        self.assertIn("from Japanese into German", got[0])
+        self.assertIn("PDF, into German.", got[1])
+
+    def test_layout_route_passes_source_language(self):
+        tree = {"id": "root", "name": "Root", "children": [], "documents": []}
+        dms_server.write_index({"tree": tree, "docIndex": []})
+        dd = dms_server.get_docs_dir(); dd.mkdir(parents=True, exist_ok=True)
+        helper = LayoutTranslationRouteHelper()
+        helper.make(dd / dms_server._doc_filename("S2", "Orders.pdf"))
+        seen = []
+        orig = dms_server._translate_texts
+        dms_server._translate_texts = lambda texts, p, k, lang, src="": seen.append((lang, src)) or ["x" for _ in texts]
+        try:
+            r = self.client.post("/api/docs/S2/save-translation-layout", json={
+                "provider": "google", "name": "Orders.pdf", "language": "French",
+                "source_language": "English"})
+        finally:
+            dms_server._translate_texts = orig
+        self.assertEqual(r.status_code, 200, r.get_json())
+        self.assertEqual(r.get_json()["name"], "Orders French.pdf")
+        self.assertTrue(seen and seen[0] == ("French", "English"))
+
+
+class LayoutTranslationRouteHelper:
+    def make(self, path):
+        import io, pymupdf
+        st = pymupdf.Story(html="<p>Hello world, this is a test document.</p>")
+        buf = io.BytesIO(); w = pymupdf.DocumentWriter(buf)
+        d = w.begin_page(pymupdf.paper_rect("letter"))
+        st.place(pymupdf.Rect(40, 40, 572, 752)); st.draw(d); w.end_page(); w.close()
+        Path(path).write_bytes(buf.getvalue())
+
+
+class LayoutTranslationSizeTests(unittest.TestCase):
+    """Each insert_htmlbox embedded a full CJK font copy -> 100s of MB files."""
+    setUp = SaveTranslationTests.setUp
+
+    def test_cjk_layout_translation_stays_small(self):
+        import pymupdf, layout_translate as L
+        src = Path(self.tmp.name) / "t.pdf"
+        LayoutTranslationTests._table_pdf(None, src)
+        units, _ = L.build_translated_units(src, lambda ts: ["血红蛋白测试" for _ in ts], True)
+        pdf = L.render(src, units, dms_server._translation_markup_to_html)
+        self.assertLess(len(pdf), 2_000_000, f"{len(pdf)/1e6:.1f} MB")
+        self.assertIn("血红蛋白测试", pymupdf.open("pdf", pdf)[0].get_text())

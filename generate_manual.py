@@ -528,6 +528,7 @@ numbered("Check the document(s) you want and click Add Link.")
 numbered("The document now appears in both the original folder and the new folder.")
 tip("The Link Existing Document dialog has been upgraded: drag its title bar to move the window and drag the divider between the two columns to resize them; the folder tree on the left has Expand all / Collapse all buttons, so you can open folders and tick the documents to link; on the right, Target folders can be ticked, or you can simply drag a document onto a target folder; and a Delete button permanently deletes the selected documents from disk (this cannot be undone - use with care).")
 tip("A faster way: drag a document card onto the target folder in the left-hand tree. Dropping it normally MOVES the document (it leaves its old folder and goes into the target). Hold Alt (Option on a Mac) while dropping to LINK it instead - the document stays in its original folder and also appears in the target, exactly like the steps above without opening the picker. While Alt/Option is held, the target folder highlights blue to show it will be a link, not a move.")
+tip("After a drop, which folder stays open is up to you: the After drop button in the Tree tab toolbar switches between \u201cgo to target\u201d (open the folder you dropped into - the default) and \u201cstay in source\u201d (keep the folder you dragged from open, handy when sorting many documents out of one folder). It applies to moving or linking documents and to dropping files from Finder/Explorer onto a folder, and DMS remembers your choice.")
 
 h2("4.5  Viewing a Document")
 numbered("Click the document name or thumbnail to open the Document Viewer.")
@@ -640,16 +641,16 @@ numbered("Import the resulting JPGs into DMS with Upload Files / Upload Folder."
 note("Conversion keeps the date taken, GPS and other photo info, and rotates the picture upright. This is a standalone tool for files on disk; it does not alter documents already in DMS. The same converter is available on the command line: python3 heic_to_jpg.py <folder>.")
 
 h2("4.16  PDF Translation, Find Text, and Edit Metadata")
-h3("Translate (side-by-side)")
-para("Open a PDF and click Translate in the viewer's top toolbar. The right half of the window shows the translation beside the original PDF on the left; the two scroll in sync, so the translation always lines up with the page you're reading.")
-bullet("Translation happens page by page, and only for the pages near what's on screen, so a large file doesn't take forever. If a page fails, click Retry; pages with no text are marked \u201cNo translatable text on this page\u201d.")
-bullet("The top dropdown picks the target language (Chinese by default, with other major languages available); the dropdown on the right picks Gemini or DeepSeek; the - and + buttons change the translation's font size; click the x at top right to close the translation.")
-bullet("The dropdown on the right now offers three engines: Fast (free) - the default, no AI key needed - plus Gemini and DeepSeek. Gemini and DeepSeek need the matching AI key configured first (section 6.4). For scanned files with no text layer, run OCR first (chapter 5).")
-bullet("If Gemini reports \u201cAPI quota exceeded\u201d, the free quota (usually a daily limit) has run out: retry later, enable billing on the Google project, use another API key, or switch to Fast (free) / DeepSeek.")
-h3("Save the translation as a PDF")
-para("The translation bar has two save buttons. Both translate the WHOLE document and create a new PDF in the same folder as the original, named \u201coriginal name + language\u201d (e.g. \u201cxxx Chinese.pdf\u201d):")
-bullet("Save as PDF - lays the translated text out page by page as a plain-text PDF. Simple and fast.")
-bullet("Save with layout - puts each translation back where the original text was, keeping tables, columns and other layout (needs a PDF with selectable text; may take a minute or two).")
+h3("Translate a PDF")
+para("Open a PDF and click Translate in the viewer's top toolbar. The original stays on the left; the right half shows a short setup panel:")
+bullet("From - the document's language. Leave it on Auto-detect, or pick it yourself for a more reliable result. The \u21c4 button swaps From and To.")
+bullet("To - the language to translate into (Simplified Chinese by default; Traditional Chinese, English and about 50 other languages are available). Any pair works, e.g. Japanese \u2192 English or Chinese \u2192 Spanish.")
+bullet("Engine - Google Translate (free and fast, no key needed), or AI translation with Gemini or DeepSeek, which reads the text in context and is usually more accurate. The AI engines need the matching AI key configured first (section 6.4); if it is missing, the panel says so and offers an Open AI settings link.")
+bullet("Your From / To / Engine choices are remembered for the next document.")
+para("Click Start translation. DMS translates the WHOLE document, keeping the original tables, columns and layout, and saves it automatically as a new PDF in the same folder as the original, named \u201coriginal name + language\u201d (e.g. \u201cxxx Chinese.pdf\u201d). When it finishes, the viewer switches to Original | Translation so you can compare them straight away. A long document may take a minute or two.")
+bullet("Scanned PDFs (no selectable text) are handled automatically: DMS recognises the text page by page and saves a plain-text translation instead, one page per original page.")
+bullet("If this document already has a translation in the chosen language, the panel says so and offers Open (show the existing one) or Translate again (make a new copy).")
+bullet("If Gemini reports \u201cAPI quota exceeded\u201d, the free quota (usually a daily limit) has run out: retry later, enable billing on the Google project, use another API key, or switch to Google Translate / DeepSeek.")
 h3("Original | Translation (saved translations)")
 para("Once a translation is saved, the original and the translated PDF are paired. Open either one and an Original | Translation button appears in the viewer's toolbar: click it to see the original on the left and the saved translation on the right, scrolling in sync. Click it again to leave.")
 h3("Editing a translation (voice input and colours)")
@@ -1163,7 +1164,7 @@ add_table(
         ],
         [
             "Gemini says \u201cAPI quota exceeded\u201d (RESOURCE_EXHAUSTED / 429)",
-            "The free Gemini tier has daily (or per-minute) limits, and the message says roughly when it resets. Retry later, enable billing on the Google project, use another API key, or switch to DeepSeek (section 6.4); for translation you can use Fast (free)."
+            "The free Gemini tier has daily (or per-minute) limits, and the message says roughly when it resets. Retry later, enable billing on the Google project, use another API key, or switch to DeepSeek (section 6.4); for translation you can use Google Translate."
         ],
         [
             "The browser does not open automatically",

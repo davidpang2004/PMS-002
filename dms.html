@@ -3276,7 +3276,7 @@ const VoiceMicButton = ({ onFinalTranscript, title, className = "" }) => {
  * UI: DOCUMENT VIEWER
  * =============================================================================
  */
-const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyParameter, onSaveLocalParams, onSaveParams, onSaveDescription, onSaveTextAsDoc, onPasteDescriptionImage, onSaveTranslationPdf, pairedDoc, onUpdateMeta, derivedDocs = [], onOpenAISettings, nodeId, onPrevDoc, onNextDoc, qcNode, onSaveQcReview, onQcReport }) => {
+const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyParameter, onSaveLocalParams, onSaveParams, onSaveDescription, onSaveTextAsDoc, onPasteDescriptionImage, onSaveTranslationPdf, pairedDoc: pairedDocProp, translations = [], onUpdateMeta, derivedDocs = [], onOpenAISettings, nodeId, onPrevDoc, onNextDoc, qcNode, onSaveQcReview, onQcReport }) => {
   const { t } = useLang();
   const isImage = doc?.mime?.startsWith("image/");
   const isPdf = doc?.mime === "application/pdf";
@@ -3308,6 +3308,14 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
   const [panelMode, setPanelMode] = useState(null);
   const [translateOn, setTranslateOn] = useState(false);
   const [pairOn, setPairOn] = useState(false);
+  // Which saved translation the Original | Translation view shows: the newest
+  // by default, or one picked from the Translate pane ("Open" an existing one).
+  const [pairPickId, setPairPickId] = useState(null);
+  useEffect(() => { setPairPickId(null); }, [doc?.id]);
+  const pairPick = pairPickId && translations.find((e) => e.id === pairPickId);
+  const pairedDoc = pairPick
+    ? { id: pairPick.id, name: pairPick.name, role: "translation", dataUrl: API_BASE + "/api/docs/" + pairPick.id }
+    : pairedDocProp;
   const [copied, setCopied] = useState(false);
   const [saved, setSaved] = useState(false);
 
@@ -4311,13 +4319,13 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
             {isPdf && (
               <button
                 onClick={() => { setTranslateOn((v) => !v); setPairOn(false); }}
-                title={t("在右侧显示中文翻译，左右同步滚动", "Show a Chinese translation on the right, scrolling in sync with the PDF")}
+                title={t("翻译此 PDF（选择语言和翻译引擎，保持版式并自动保存）", "Translate this PDF (choose languages and engine; keeps the layout and saves automatically)")}
                 className={"text-sm px-3 py-1.5 rounded flex items-center gap-1.5 border " +
                   (translateOn
                     ? "border-emerald-400 text-emerald-800 bg-emerald-100"
                     : "border-emerald-300 text-emerald-800 bg-emerald-50 hover:bg-emerald-100")}
               >
-                {t("中文翻译", "Translate")}
+                {t("翻译", "Translate")}
               </button>
             )}
             {isPdf && (
@@ -4510,13 +4518,20 @@ const DocumentViewer = ({ doc, onClose, onSaveOcr, keyParameters = [], onAddKeyP
                 onClose={() => setPairOn(false)} />
             ) : isPdf && translateOn ? (
               <PdfTranslateSplit key={doc.id} docId={doc.id} url={doc.dataUrl} onClose={() => setTranslateOn(false)}
-                onSaveTranslation={onSaveTranslationPdf ? (pages, lang, sizes) => onSaveTranslationPdf(doc, nodeId, pages, lang, sizes) : undefined}
-                onSaveTranslationLayout={onSaveTranslationPdf ? async (lang, provider) => {
-                  const name = await onSaveTranslationPdf(doc, nodeId, null, lang, null, { provider });
-                  // show the new layout translation next to the original right away
-                  setPairOn(true); setTranslateOn(false);
+                onSaveTranslation={onSaveTranslationPdf ? async (pages, lang, sizes, source) => {
+                  const name = await onSaveTranslationPdf(doc, nodeId, pages, lang, sizes, null, source);
+                  setPairPickId(null); setPairOn(true); setTranslateOn(false);
                   return name;
-                } : undefined} />
+                } : undefined}
+                onSaveTranslationLayout={onSaveTranslationPdf ? async (lang, provider, source) => {
+                  const name = await onSaveTranslationPdf(doc, nodeId, null, lang, null, { provider }, source);
+                  // show the new layout translation next to the original right away
+                  setPairPickId(null); setPairOn(true); setTranslateOn(false);
+                  return name;
+                } : undefined}
+                onOpenAISettings={onOpenAISettings}
+                existingTranslations={translations}
+                onOpenExisting={(id) => { setPairPickId(id); setPairOn(true); setTranslateOn(false); }} />
             ) : isPdf && currentSearchMatch ? (
               // Chrome's native PDF iframe can't highlight text, so while a
               // search match is active show the pdf.js viewer, which marks it in red.
@@ -13173,315 +13188,172 @@ const TRANSLATE_LANGUAGES = [
   ].map(([name, label]) => ({ name, label: name === label ? name : `${label} (${name.replace(/ \(.*\)/, "")})` })),
 ];
 
-// Side-by-side "original | Chinese translation" view for a PDF. The left pane
-// is the pdf.js viewer; the right pane lists one translated block per page
-// (translated lazily, only the pages near what's on screen). Scrolling either
-// pane scrolls the other to the same page and the same fraction through it,
-// so the Chinese always lines up with the English being read.
-const PdfTranslateSplit = ({ docId, url, onClose, onSaveTranslation, onSaveTranslationLayout }) => {
+// One-step translation for a PDF. The left pane shows the original; the right
+// pane picks From / To languages and the engine (free Google Translate, or an
+// AI -- Gemini / DeepSeek -- for more accurate wording). "Start" translates
+// the whole PDF server-side keeping its layout (tables, columns), saves it as
+// "<name> <Language>.pdf" beside the original, and the viewer then switches
+// to Original | Translation. A scanned PDF (no text layer) automatically falls
+// back to the per-page OCR + plain-text translation.
+const TRANSLATE_PREFS_KEY = "dms-translate-prefs";
+const PdfTranslateSplit = ({ docId, url, onClose, onSaveTranslation, onSaveTranslationLayout, onOpenAISettings, existingTranslations = [], onOpenExisting }) => {
   const { t } = useLang();
-  const [saveState, setSaveState] = useState(null); // null | {busy, msg, error}
+  const prefs = (() => {
+    try { return JSON.parse(localStorage.getItem(TRANSLATE_PREFS_KEY) || "{}") || {}; } catch { return {}; }
+  })();
+  const valid = (n) => TRANSLATE_LANGUAGES.some((l) => l.name === n);
   const [viewer, setViewer] = useState(null);
-  const [provider, setProvider] = useState("google");
-  const [language, setLanguage] = useState(TRANSLATE_LANGUAGES[0].name);
-  const [fontPct, setFontPct] = useState(100);
-  const [trans, setTrans] = useState({});      // page -> {status, text, error}
-  const [heights, setHeights] = useState([]);
-  const [curPage, setCurPage] = useState(1);
-  const rightRef = useRef(null);
-  const transRef = useRef({});
-  const lockRef = useRef({ owner: null, until: 0 });
-  const curPageRef = useRef(1);
-  const chainRef = useRef(Promise.resolve());
-  const providerRef = useRef("google");
-  const languageRef = useRef(TRANSLATE_LANGUAGES[0].name);
-  const pageCount = viewer?.doc?.numPages || 0;
-
-  const setPageState = (p, v) => {
-    transRef.current = { ...transRef.current, [p]: v };
-    setTrans(transRef.current);
-  };
-
-  const loadPage = (p) => {
-    const cur = transRef.current[p];
-    if (cur && cur.status !== "error") return;
-    if (cur && cur.status === "loading") return;
-    setPageState(p, { status: "loading" });
-    const prov = providerRef.current;
-    const lang = languageRef.current;
-    const stale = () => providerRef.current !== prov || languageRef.current !== lang;
-    chainRef.current = chainRef.current.then(async () => {
-      if (stale()) return;
-      // Dropped from the queue if the user has scrolled far away meanwhile.
-      if (Math.abs(p - curPageRef.current) > 3) { setPageState(p, undefined); return; }
-      try {
-        let text = "";
-        try {
-          const page = await viewer.doc.getPage(p);
-          const tc = await page.getTextContent();
-          text = tc.items.map((it) => (it.str || "") + (it.hasEOL ? "\n" : "")).join("");
-        } catch {}
-        const res = await fetch(`${API_BASE}/api/docs/${docId}/translate-page`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ page: p, text, provider: prov, language: lang }),
-        });
-        const data = await res.json().catch(() => ({}));
-        if (stale()) return;
-        if (res.status === 422) { setPageState(p, { status: "empty" }); return; }
-        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-        setPageState(p, { status: "done", text: data.text });
-      } catch (e) {
-        if (!stale()) setPageState(p, { status: "error", error: e.message || String(e) });
-      }
-    });
-  };
-
-  const ensureNear = (page) => {
-    if (!viewer) return;
-    for (let p = Math.max(1, page - 1); p <= Math.min(pageCount, page + 2); p++) loadPage(p);
-  };
+  const [source, setSource] = useState(valid(prefs.source) ? prefs.source : "");   // "" = auto-detect
+  const [language, setLanguage] = useState(valid(prefs.language) ? prefs.language : TRANSLATE_LANGUAGES[0].name);
+  const [provider, setProvider] = useState(["google", "gemini", "deepseek"].includes(prefs.provider) ? prefs.provider : "google");
+  const [state, setState] = useState(null); // null | {busy, msg} | {error, needKey}
+  const [confirmAgain, setConfirmAgain] = useState(false);
 
   useEffect(() => {
-    providerRef.current = provider;
-    languageRef.current = language;
-    transRef.current = {};
-    setTrans({});
-    chainRef.current = Promise.resolve();
-    ensureNear(curPageRef.current);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [provider, language, viewer]);
+    try { localStorage.setItem(TRANSLATE_PREFS_KEY, JSON.stringify({ source, language, provider })); } catch {}
+    setConfirmAgain(false);
+  }, [source, language, provider]);
 
-  // Left pane page geometry (so each right-hand block starts out the same
-  // height as the page it translates), current page, and scroll syncing.
-  useEffect(() => {
-    if (!viewer) return;
-    const { pdfViewer, eventBus, container } = viewer;
-    const measure = () => {
-      const hs = [];
-      for (let i = 0; i < pdfViewer.pagesCount; i++) {
-        const pv = pdfViewer.getPageView(i);
-        hs.push(pv?.div ? pv.div.offsetHeight : 0);
-      }
-      setHeights((prev) => (prev.length === hs.length && prev.every((h, i) => h === hs[i]) ? prev : hs));
-    };
-    const onPage = (e) => {
-      curPageRef.current = e.pageNumber;
-      setCurPage(e.pageNumber);
-      ensureNear(e.pageNumber);
-    };
-    measure();
-    eventBus.on("pagesinit", measure);
-    eventBus.on("scalechanging", measure);
-    eventBus.on("pagerendered", measure);
-    eventBus.on("pagechanging", onPage);
-    const ro = new ResizeObserver(measure);
-    ro.observe(container);
+  const existing = existingTranslations.filter((e) => e.language === language).pop();
+  const busy = !!state?.busy;
 
-    const onLeftScroll = () => {
-      const lk = lockRef.current, now = Date.now();
-      if (lk.owner === "right" && now < lk.until) return;
-      const right = rightRef.current;
-      if (!right) return;
-      const n = pdfViewer.pagesCount;
-      const s = container.scrollTop;
-      let i = 0;
-      for (let k = 0; k < n; k++) {
-        const d = pdfViewer.getPageView(k)?.div;
-        if (d && d.offsetTop <= s + 1) i = k; else break;
-      }
-      const d = pdfViewer.getPageView(i)?.div;
-      const blk = right.querySelector(`[data-page="${i + 1}"]`);
-      if (!d || !blk) return;
-      const frac = Math.max(0, Math.min(1, (s - d.offsetTop) / Math.max(1, d.offsetHeight)));
-      lockRef.current = { owner: "left", until: now + 120 };
-      right.scrollTop = blk.offsetTop + frac * blk.offsetHeight;
-    };
-    container.addEventListener("scroll", onLeftScroll, { passive: true });
-    return () => {
-      container.removeEventListener("scroll", onLeftScroll);
-      ro.disconnect();
-      try {
-        eventBus.off("pagesinit", measure);
-        eventBus.off("scalechanging", measure);
-        eventBus.off("pagerendered", measure);
-        eventBus.off("pagechanging", onPage);
-      } catch {}
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [viewer]);
-
-  const onRightScroll = () => {
-    const lk = lockRef.current, now = Date.now();
-    if (lk.owner === "left" && now < lk.until) return;
-    const right = rightRef.current;
-    if (!right || !viewer) return;
-    const { pdfViewer, container } = viewer;
-    const s = right.scrollTop;
-    const blocks = right.querySelectorAll("[data-page]");
-    let blk = blocks[0];
-    for (const b of blocks) { if (b.offsetTop <= s + 1) blk = b; else break; }
-    if (!blk) return;
-    const i = Number(blk.dataset.page) - 1;
-    const d = pdfViewer.getPageView(i)?.div;
-    if (!d) return;
-    const frac = Math.max(0, Math.min(1, (s - blk.offsetTop) / Math.max(1, blk.offsetHeight)));
-    lockRef.current = { owner: "right", until: now + 120 };
-    container.scrollTop = d.offsetTop + frac * d.offsetHeight;
-  };
-
-  // Translate every page not yet done (in order, one at a time), then hand the
-  // whole translation to the app to be saved as "<name> Chinese.pdf" beside
-  // the original. Reuses the server's per-page cache, so pages already
-  // translated while reading cost nothing.
-  const saveAsPdf = async () => {
-    if (!viewer || !onSaveTranslation || saveState?.busy) return;
-    const prov = providerRef.current, lang = languageRef.current;
+  // Scanned-PDF fallback: translate page by page (the server OCRs pages that
+  // have no text layer) and save the flowing text, one page per source page.
+  const translatePlain = async () => {
+    const pageCount = viewer?.doc?.numPages || 0;
+    if (!viewer || !pageCount) throw new Error(t("文档尚未加载完成，请稍后再试。", "The document hasn't finished loading -- try again in a moment."));
     const out = {};
+    for (let p = 1; p <= pageCount; p++) {
+      setState({ busy: true, msg: t(`扫描件：识别并翻译第 ${p} / ${pageCount} 页…`, `Scanned PDF: reading & translating page ${p} / ${pageCount}…`) });
+      let text = "";
+      try {
+        const page = await viewer.doc.getPage(p);
+        const tc = await page.getTextContent();
+        text = tc.items.map((it) => (it.str || "") + (it.hasEOL ? "\n" : "")).join("");
+      } catch {}
+      const res = await fetch(`${API_BASE}/api/docs/${docId}/translate-page`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ page: p, text, provider, language, source_language: source }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.status === 422) continue;
+      if (!res.ok) throw new Error(`${t("第", "Page")} ${p}: ${data.error || "HTTP " + res.status}`);
+      out[p] = data.text;
+    }
+    if (!Object.keys(out).length) throw new Error(t("此 PDF 没有可翻译的文字。", "No translatable text was found in this PDF."));
+    setState({ busy: true, msg: t("保存中…", "Saving…") });
+    const sizes = [];
+    for (let p = 1; p <= pageCount; p++) {
+      try {
+        const vp = (await viewer.doc.getPage(p)).getViewport({ scale: 1 });
+        sizes.push([vp.width, vp.height]);
+      } catch { sizes.push(null); }
+    }
+    await onSaveTranslation(out, language, sizes, source);
+  };
+
+  const start = async () => {
+    if (busy || !onSaveTranslationLayout) return;
+    if (existing && !confirmAgain) { setConfirmAgain(true); return; }
+    setConfirmAgain(false);
+    setState({ busy: true, msg: t("正在按原版式翻译并保存（可能需要一两分钟）…", "Translating with the original layout and saving (may take a minute or two)…") });
     try {
-      for (let p = 1; p <= pageCount; p++) {
-        setSaveState({ busy: true, msg: t(`翻译第 ${p} / ${pageCount} 页…`, `Translating page ${p} / ${pageCount}…`) });
-        const have = transRef.current[p];
-        if (have?.status === "done") { out[p] = have.text; continue; }
-        if (have?.status === "empty") continue;
-        let text = "";
-        try {
-          const page = await viewer.doc.getPage(p);
-          const tc = await page.getTextContent();
-          text = tc.items.map((it) => (it.str || "") + (it.hasEOL ? "\n" : "")).join("");
-        } catch {}
-        const res = await fetch(`${API_BASE}/api/docs/${docId}/translate-page`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ page: p, text, provider: prov, language: lang }),
-        });
-        const data = await res.json().catch(() => ({}));
-        if (res.status === 422) continue;
-        if (!res.ok) throw new Error(`${t("第", "Page")} ${p}: ${data.error || "HTTP " + res.status}`);
-        out[p] = data.text;
-        setPageState(p, { status: "done", text: data.text });
+      try {
+        await onSaveTranslationLayout(language, provider, source);
+      } catch (e) {
+        if (e && e.status === 422 && onSaveTranslation) await translatePlain();
+        else throw e;
       }
-      if (!Object.keys(out).length) throw new Error(t("没有可保存的译文。", "Nothing to save."));
-      setSaveState({ busy: true, msg: t("保存中…", "Saving…") });
-      const sizes = [];
-      for (let p = 1; p <= pageCount; p++) {
-        try {
-          const vp = (await viewer.doc.getPage(p)).getViewport({ scale: 1 });
-          sizes.push([vp.width, vp.height]);
-        } catch { sizes.push(null); }
-      }
-      const name = await onSaveTranslation(out, lang, sizes);
-      setSaveState({ msg: t(`已保存：${name}`, `Saved: ${name}`) });
+      // the viewer switches to Original | Translation on success
     } catch (e) {
-      setSaveState({ error: e.message || String(e) });
+      const msg = e?.message || String(e);
+      setState({ error: msg, needKey: /API Key/i.test(msg) });
     }
   };
 
-  // Translate every text block of the ORIGINAL pages and paint it back in the
-  // same place, so tables keep their rows/columns. Done server-side.
-  const saveWithLayout = async () => {
-    if (!onSaveTranslationLayout || saveState?.busy) return;
-    setSaveState({ busy: true, msg: t("正在按原版式翻译（可能需要一两分钟）…", "Translating with the original layout (may take a minute or two)…") });
-    try {
-      const name = await onSaveTranslationLayout(languageRef.current, providerRef.current);
-      setSaveState({ msg: t(`已保存：${name}`, `Saved: ${name}`) });
-    } catch (e) {
-      setSaveState({ error: e.message || String(e) });
-    }
-  };
-
-  const pages = [];
-  for (let p = 1; p <= pageCount; p++) pages.push(p);
+  const engines = [
+    { v: "google", title: t("Google 翻译", "Google Translate"), sub: t("免费、快速", "free, fast") },
+    { v: "gemini", title: t("AI · Gemini", "AI · Gemini"), sub: t("更准确，需 API Key", "more accurate, needs API key") },
+    { v: "deepseek", title: t("AI · DeepSeek", "AI · DeepSeek"), sub: t("更准确，需 API Key", "more accurate, needs API key") },
+  ];
+  const selCls = "w-full px-2 py-1.5 border border-stone-300 rounded bg-white text-stone-900 disabled:opacity-60";
 
   return (
     <div className="w-full h-full flex bg-white">
       <div className="w-1/2 min-w-0 h-full border-r border-stone-300">
         <PdfViewerPanel url={url} onViewerReady={setViewer} />
       </div>
-      <div className="w-1/2 min-w-0 h-full flex flex-col">
-        <div className="flex items-center gap-2 px-2 py-1 border-b border-stone-200 bg-emerald-50 text-sm shrink-0">
-          <select
-            value={language}
-            onChange={(e) => setLanguage(e.target.value)}
-            className="px-1 py-0.5 border border-stone-300 rounded bg-white font-bold text-emerald-800 max-w-[11rem]"
-            title={t("翻译成哪种语言", "Language to translate into")}
-          >
-            {TRANSLATE_LANGUAGES.map((l) => <option key={l.name} value={l.name}>{l.label}</option>)}
-          </select>
-          <span className="text-stone-600 whitespace-nowrap">{t(`第 ${curPage} / ${pageCount || "—"} 页`, `Page ${curPage} / ${pageCount || "—"}`)}</span>
-          <div className="w-px h-4 bg-stone-300" />
-          <button onClick={() => setFontPct((f) => Math.max(50, f - 10))} className="w-6 h-6 leading-none border border-stone-300 rounded hover:bg-white" title={t("缩小文字", "Smaller text")}>−</button>
-          <span className="text-stone-700 w-10 text-center">{fontPct}%</span>
-          <button onClick={() => setFontPct((f) => Math.min(300, f + 10))} className="w-6 h-6 leading-none border border-stone-300 rounded hover:bg-white" title={t("放大文字", "Larger text")}>+</button>
-          {onSaveTranslation && (
-            <button
-              onClick={saveAsPdf}
-              disabled={!viewer || !!saveState?.busy}
-              className="ml-auto px-2 py-0.5 border border-emerald-700 rounded bg-white text-emerald-800 font-bold hover:bg-emerald-100 disabled:opacity-50 whitespace-nowrap"
-              title={t("把整份译文保存为同一文件夹里的新 PDF（原文件名 + Chinese）", "Save the full translation as a new PDF in the same folder (original name + Chinese)")}
-            >
-              {t("保存为 PDF", "Save as PDF")}
-            </button>
-          )}
-          {onSaveTranslationLayout && (
-            <button
-              onClick={saveWithLayout}
-              disabled={!!saveState?.busy}
-              className="px-2 py-0.5 border border-emerald-700 rounded bg-emerald-700 text-white font-bold hover:bg-emerald-800 disabled:opacity-50 whitespace-nowrap"
-              title={t("保持原文的表格/版式：把译文放回原来的位置，保存为新 PDF（适用于有文字层的 PDF）", "Keep the original layout (tables, columns): put each translated text back where it was and save as a new PDF (needs a PDF with selectable text)")}
-            >
-              {t("保存为 PDF（保持版式）", "Save with layout")}
-            </button>
-          )}
-          <select
-            value={provider}
-            onChange={(e) => setProvider(e.target.value)}
-            className={(onSaveTranslation ? "" : "ml-auto ") + "px-1 py-0.5 border border-stone-300 rounded bg-white"}
-            title={t("翻译所用的 AI", "AI used for translating")}
-          >
-            <option value="google">{t("快速翻译（免费）", "Fast (free)")}</option>
-            <option value="gemini">Gemini</option>
-            <option value="deepseek">DeepSeek</option>
-          </select>
-          <button onClick={onClose} className="p-1 text-stone-600 hover:text-stone-800" title={t("关闭翻译", "Close translation")}>
+      <div className="w-1/2 min-w-0 h-full flex flex-col bg-stone-50">
+        <div className="flex items-center gap-2 px-3 py-1.5 border-b border-stone-200 bg-emerald-50 text-sm shrink-0">
+          <span className="font-bold text-emerald-800">{t("翻译此 PDF", "Translate this PDF")}</span>
+          <button onClick={onClose} className="ml-auto p-1 text-stone-600 hover:text-stone-800" title={t("关闭翻译", "Close translation")}>
             <X size={13} />
           </button>
         </div>
-        {saveState && (saveState.msg || saveState.error) && (
-          <div className={"px-2 py-1 text-xs shrink-0 border-b " + (saveState.error ? "bg-red-50 text-red-700 border-red-200" : "bg-emerald-50 text-emerald-800 border-emerald-200")}>
-            {saveState.error || saveState.msg}
-          </div>
-        )}
-        <div ref={rightRef} onScroll={onRightScroll} className="relative flex-1 min-h-0 overflow-auto bg-stone-100">
-          {!viewer && (
-            <div className="p-4 text-sm text-stone-600">{t("加载文档中…", "Loading document…")}</div>
-          )}
-          {pages.map((p) => {
-            const st = trans[p];
-            return (
-              <div key={p} data-page={p} className="box-border border-b border-stone-300 bg-white px-4 py-3"
-                style={{ minHeight: heights[p - 1] || 200 }}>
-                <div className="text-xs font-bold text-stone-500 mb-1">{t(`第 ${p} 页`, `Page ${p}`)}</div>
-                {(!st || st.status === "loading") && (
-                  <div className="text-sm text-stone-500 flex items-center gap-1.5">
-                    <Loader size={12} className="animate-spin" /> {t("翻译中…", "Translating…")}
-                  </div>
+        <div className="flex-1 min-h-0 overflow-auto p-4">
+          <div className="max-w-md mx-auto flex flex-col gap-4 text-sm">
+            <div className="flex items-end gap-2">
+              <label className="flex-1 min-w-0">
+                <div className="text-xs font-bold text-stone-600 mb-1">{t("原文语言", "From")}</div>
+                <select value={source} onChange={(e) => setSource(e.target.value)} disabled={busy} className={selCls}>
+                  <option value="">{t("自动检测", "Auto-detect")}</option>
+                  {TRANSLATE_LANGUAGES.map((l) => <option key={l.name} value={l.name}>{l.label}</option>)}
+                </select>
+              </label>
+              <button
+                onClick={() => { const s = source; setSource(language); setLanguage(s); }}
+                disabled={busy || !source}
+                className="mb-0.5 px-2 py-1.5 border border-stone-300 rounded bg-white text-stone-700 hover:bg-stone-100 disabled:opacity-40"
+                title={t("交换原文/译文语言", "Swap From and To")}
+              >⇄</button>
+              <label className="flex-1 min-w-0">
+                <div className="text-xs font-bold text-stone-600 mb-1">{t("翻译成", "To")}</div>
+                <select value={language} onChange={(e) => setLanguage(e.target.value)} disabled={busy} className={selCls + " font-bold text-emerald-800"}>
+                  {TRANSLATE_LANGUAGES.map((l) => <option key={l.name} value={l.name}>{l.label}</option>)}
+                </select>
+              </label>
+            </div>
+            <div>
+              <div className="text-xs font-bold text-stone-600 mb-1">{t("翻译引擎", "Engine")}</div>
+              <div className="grid grid-cols-3 gap-2">
+                {engines.map((en) => (
+                  <button key={en.v} onClick={() => setProvider(en.v)} disabled={busy}
+                    className={"px-2 py-2 rounded border text-left disabled:opacity-60 " + (provider === en.v
+                      ? "border-emerald-600 bg-emerald-50 ring-1 ring-emerald-600"
+                      : "border-stone-300 bg-white hover:bg-stone-100")}>
+                    <div className="font-bold text-stone-900">{en.title}</div>
+                    <div className="text-xs text-stone-600">{en.sub}</div>
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="text-xs text-stone-600">
+              {t("译文会保持原文的表格和版式，自动保存为同一文件夹里的新 PDF，并与原文并排显示。扫描件会自动改用文字识别后翻译。",
+                 "The translation keeps the original tables and layout, is saved automatically as a new PDF in the same folder, and opens side by side with the original. Scanned PDFs automatically use text recognition instead.")}
+            </div>
+            {existing && confirmAgain && !busy && (
+              <div className="p-2 rounded border border-amber-300 bg-amber-50 text-amber-900 flex flex-wrap items-center gap-2">
+                <span className="flex-1 min-w-0">{t(`已有该语言的译文：${existing.name}`, `Already translated into this language: ${existing.name}`)}</span>
+                {onOpenExisting && (
+                  <button onClick={() => onOpenExisting(existing.id)} className="px-2 py-0.5 rounded border border-emerald-700 bg-white text-emerald-800 font-bold hover:bg-emerald-100">{t("打开", "Open")}</button>
                 )}
-                {st?.status === "done" && (
-                  <div className="leading-relaxed text-stone-900 whitespace-pre-wrap break-words" style={{ fontSize: `${15 * fontPct / 100}px` }}>{st.text}</div>
-                )}
-                {st?.status === "empty" && (
-                  <div className="text-sm text-stone-500">{t("（此页没有可翻译的文字）", "(No translatable text on this page)")}</div>
-                )}
-                {st?.status === "error" && (
-                  <div className="text-sm text-red-600">
-                    {st.error}{" "}
-                    <button onClick={() => loadPage(p)} className="underline text-amber-700">{t("重试", "Retry")}</button>
-                  </div>
+                <button onClick={start} className="px-2 py-0.5 rounded border border-amber-600 bg-white text-amber-800 font-bold hover:bg-amber-100">{t("重新翻译", "Translate again")}</button>
+              </div>
+            )}
+            <button onClick={start} disabled={busy || (existing && confirmAgain)}
+              className="px-3 py-2 rounded bg-emerald-700 text-white font-bold hover:bg-emerald-800 disabled:opacity-50 flex items-center justify-center gap-2">
+              {busy ? <><Loader size={14} className="animate-spin" /> {t("翻译中…", "Translating…")}</> : t("开始翻译", "Start translation")}
+            </button>
+            {state && (state.msg || state.error) && (
+              <div className={"p-2 rounded border text-xs " + (state.error ? "bg-red-50 text-red-700 border-red-200" : "bg-emerald-50 text-emerald-800 border-emerald-200")}>
+                {state.error || state.msg}
+                {state.needKey && onOpenAISettings && (
+                  <button onClick={onOpenAISettings} className="ml-2 underline font-bold text-purple-700">{t("打开 AI 设置", "Open AI settings")}</button>
                 )}
               </div>
-            );
-          })}
+            )}
+          </div>
         </div>
       </div>
     </div>
@@ -20050,6 +19922,14 @@ function DMS({ storagePath, onChangeFolder }) {
   // Hidden folders carry node.hidden=true (saved with the tree). They vanish
   // from the tree panel unless this toggle is on.
   const [showHiddenFolders, setShowHiddenFolders] = useState(false);
+  // After a drag-and-drop onto a folder in the tree (moving/linking a
+  // document, or dropping files from Finder/Explorer), which folder becomes
+  // the current one: "target" = the folder dropped onto (the original
+  // behaviour), "source" = stay in the folder you dragged from.
+  const [dropStayIn, setDropStayIn] = useState(() => {
+    try { return localStorage.getItem("dms:drop-stay-in") === "source" ? "source" : "target"; } catch { return "target"; }
+  });
+  useEffect(() => { try { localStorage.setItem("dms:drop-stay-in", dropStayIn); } catch {} }, [dropStayIn]);
   const handleBulkSetHidden = async (hide) => {
     if (!tree || !folderSelectedIds.size) return;
     let newTree = tree;
@@ -21328,11 +21208,13 @@ function DMS({ storagePath, onChangeFolder }) {
     const sourceNodeId = draggingDocSourceNodeIdRef.current;
     handleDocDragEnd();
     if (!docId || !sourceNodeId || sourceNodeId === targetNodeId) return;
+    const goToTarget = dropStayIn !== "source";
     if (link) {
       await linkDocsToNode(Array.isArray(docId) ? docId : [docId], targetNodeId);
+      if (goToTarget) setSelectedId(targetNodeId);
       return;
     }
-    await moveDocToNode(docId, sourceNodeId, targetNodeId);
+    await moveDocToNode(docId, sourceNodeId, targetNodeId, { select: goToTarget });
   };
 
   const updateNodeMeta = async (updates) => {
@@ -22521,7 +22403,7 @@ function DMS({ storagePath, onChangeFolder }) {
   // Save a PDF's translation (from the side-by-side pane) as a new PDF named
   // "<original> Chinese.pdf" in the same folder as the original, then register
   // it in the tree/index like any other new document. Returns its name.
-  const handleSaveTranslationPdf = async (srcDoc, paneNodeId, pages, language, sizes, layoutOpts) => {
+  const handleSaveTranslationPdf = async (srcDoc, paneNodeId, pages, language, sizes, layoutOpts, sourceLanguage = "") => {
     const srcEntry = docIndex.find((d) => d.id === srcDoc.id);
     // The original's own folder: the one being browsed if it holds the doc,
     // else the doc's recorded home folder.
@@ -22534,11 +22416,15 @@ function DMS({ storagePath, onChangeFolder }) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(layoutOpts
-        ? { provider: layoutOpts.provider, language, node_id: nodeId, name: (srcEntry && srcEntry.name) || srcDoc.name }
-        : { pages, language, sizes, node_id: nodeId, name: (srcEntry && srcEntry.name) || srcDoc.name }),
+        ? { provider: layoutOpts.provider, language, source_language: sourceLanguage, node_id: nodeId, name: (srcEntry && srcEntry.name) || srcDoc.name }
+        : { pages, language, source_language: sourceLanguage, sizes, node_id: nodeId, name: (srcEntry && srcEntry.name) || srcDoc.name }),
     });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    if (!res.ok || !data.ok) {
+      const err = new Error(data.error || `HTTP ${res.status}`);
+      err.status = res.status;   // 422 = no text layer -> the pane falls back to OCR
+      throw err;
+    }
     const newTree = updateNodeInTree(tree, nodeId, (n) => ({
       ...n,
       documents: [...(n.documents || []), { id: data.doc_id }],
@@ -22555,6 +22441,7 @@ function DMS({ storagePath, onChangeFolder }) {
         metadata: {},
         translationOf: srcDoc.id,
         translationLanguage: language,
+        ...(sourceLanguage ? { translationSourceLanguage: sourceLanguage } : {}),
       },
     ];
     await persistTree(newTree);
@@ -22993,7 +22880,7 @@ function DMS({ storagePath, onChangeFolder }) {
   // moves its whole directory. `docIdOrIds` accepts a single id (the common
   // case) or an array, so both call shapes share one atomic tree/index save
   // instead of looping a single-doc move and racing multiple saves.
-  const moveDocToNode = async (docIdOrIds, fromNodeId, toNodeId) => {
+  const moveDocToNode = async (docIdOrIds, fromNodeId, toNodeId, { select = true } = {}) => {
     const docIds = Array.isArray(docIdOrIds) ? docIdOrIds : [docIdOrIds];
     if (docIds.length === 0 || !fromNodeId || !toNodeId || fromNodeId === toNodeId) return;
     const fromNode = findNode(tree, fromNodeId);
@@ -23021,7 +22908,7 @@ function DMS({ storagePath, onChangeFolder }) {
     );
     await persistIndex(newIndex);
     await persistTree(newTree);
-    setSelectedId(toNodeId);
+    if (select) setSelectedId(toNodeId);
   };
 
   // Update a document's metadata as seen from a specific folder (`nodeId`).
@@ -23841,6 +23728,14 @@ function DMS({ storagePath, onChangeFolder }) {
                   >
                     {showHiddenFolders ? <Eye size={11} /> : <EyeOff size={11} />} {showHiddenFolders ? t("隐藏中的文件夹：显示", "Hidden: shown") : t("隐藏中的文件夹：不显示", "Hidden: concealed")}
                   </button>
+                  <button
+                    onClick={() => setDropStayIn((v) => (v === "source" ? "target" : "source"))}
+                    className="text-[13px] px-2 py-1 border border-stone-300 hover:bg-stone-100 text-black rounded flex items-center gap-1"
+                    title={t("把文档或文件拖放到文件夹后，当前文件夹停在哪里：放入的文件夹，或拖出的原文件夹。单击切换。",
+                             "After dragging a document or file onto a folder, which folder stays open: the folder you dropped into, or the folder you dragged from. Click to switch.")}
+                  >
+                    <Folder size={11} /> {dropStayIn === "source" ? t("拖放后：停在原文件夹", "After drop: stay in source") : t("拖放后：转到目标文件夹", "After drop: go to target")}
+                  </button>
                   {!folderSelectMode ? (
                     <button
                       onClick={() => { setFolderSelectMode(true); setFolderSelectedIds(new Set()); }}
@@ -23951,8 +23846,10 @@ function DMS({ storagePath, onChangeFolder }) {
                       onContextMenu={(x, y, nodeId) => setContextMenu({ x, y, nodeId })}
                       onUploadToNode={handleTreeUpload}
                       onFileDrop={(nodeId, files) => {
-                        setSelectedId(nodeId);
-                        setExpandedIds((prev) => new Set([...prev, nodeId]));
+                        if (dropStayIn !== "source") {
+                          setSelectedId(nodeId);
+                          setExpandedIds((prev) => new Set([...prev, nodeId]));
+                        }
                         promptUpload(Array.from(files), nodeId, "current-folder");
                       }}
                       draggingId={draggingId}
@@ -24948,6 +24845,8 @@ function DMS({ storagePath, onChangeFolder }) {
         onSaveTextAsDoc={handleSaveTextAsDoc}
         onPasteDescriptionImage={handlePasteDescriptionImage}
         onSaveTranslationPdf={handleSaveTranslationPdf}
+        translations={viewerDoc ? docIndex.filter((d) => d.translationOf === viewerDoc.id)
+          .map((d) => ({ id: d.id, name: d.name, language: d.translationLanguage })) : []}
         pairedDoc={(() => {
           if (!viewerDoc) return null;
           const me = docIndex.find((d) => d.id === viewerDoc.id);

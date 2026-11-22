@@ -198,7 +198,15 @@ def render(src_path, pages_units: dict, markup_to_html) -> bytes:
                     page.insert_htmlbox(pymupdf.Rect(box.x0, box.y0, min(page.rect.x1 - 4, box.x1 + box.width * 0.5),
                                                      min(page.rect.y1 - 4, box.y1 + box.height * 2)),
                                         body, css=css, scale_low=0.3)
-        out = doc.tobytes(garbage=3, deflate=True)
+        # Every insert_htmlbox() embeds its own full copy of the fallback
+        # (CJK) font -- hundreds of MB for one page of a table. garbage=4
+        # merges the identical copies and subset_fonts() keeps only the glyphs
+        # used: a 558 MB translation became 0.25 MB.
+        try:
+            doc.subset_fonts()
+        except Exception:
+            pass
+        out = doc.tobytes(garbage=4, deflate=True)
     finally:
         doc.close()
     return out
@@ -213,7 +221,7 @@ def embed_layout(pdf_bytes: bytes, source_id: str, pages_units: dict) -> bytes:
     doc = pymupdf.open("pdf", pdf_bytes)
     try:
         doc.embfile_add(EMBED_NAME, json.dumps(payload, ensure_ascii=False).encode("utf-8"))
-        return doc.tobytes(garbage=3, deflate=True)
+        return doc.tobytes(garbage=4, deflate=True)
     finally:
         doc.close()
 

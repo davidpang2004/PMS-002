@@ -627,8 +627,14 @@ def answer_question_about_document(question: str, doc_name: str, doc_text: str,
     return {"answer": answer, "model": model_used}
 
 
+def _is_auto_lang(source_language) -> bool:
+    s = (source_language or "").strip().lower()
+    return not s or s.startswith("auto")
+
+
 def translate_to_chinese(text: str, api_key: str, provider: str = "gemini",
-                         language: str = "Simplified Chinese (简体中文)") -> dict:
+                         language: str = "Simplified Chinese (简体中文)",
+                         source_language: str = "") -> dict:
     """Translate one page's worth of text into `language` (default Simplified
     Chinese; the name is historical), keeping the original's line/paragraph structure so the result
     reads alongside the source page. Returns {"text": str, "model": str}."""
@@ -639,9 +645,10 @@ def translate_to_chinese(text: str, api_key: str, provider: str = "gemini",
         label = "DeepSeek" if provider == "deepseek" else "Gemini"
         raise AIExtractionError(f"未配置 {label} API Key，请先在设置中添加。")
 
+    src = "" if _is_auto_lang(source_language) else f"from {source_language.strip()} "
     prompt = (
         "Translate the following text, extracted from ONE page of a PDF, "
-        f"into {language}.\n\n"
+        f"{src}into {language}.\n\n"
         "Rules:\n"
         "- Translate faithfully and completely; do not summarize, add or omit anything.\n"
         "- Keep the paragraph/line structure, headings, bullet lists and table "
@@ -708,7 +715,8 @@ _FREE_LANG_CODES = {
 }
 
 
-def translate_free(text: str, language: str = "Simplified Chinese (简体中文)") -> dict:
+def translate_free(text: str, language: str = "Simplified Chinese (简体中文)",
+                   source_language: str = "") -> dict:
     """Translate with Google Translate's free web endpoint -- no API key, no
     extra package, and much faster than an LLM, but needs internet access and
     is literal (no document-aware phrasing). Text is sent in line-aligned
@@ -722,6 +730,9 @@ def translate_free(text: str, language: str = "Simplified Chinese (简体中文)
         raise AIExtractionError("此页没有可翻译的文字。")
     name = re.sub(r"\s*\(.*\)", "", language or "").strip()
     code = _FREE_LANG_CODES.get(name, "zh-CN")
+    sl = "auto"
+    if not _is_auto_lang(source_language):
+        sl = _FREE_LANG_CODES.get(re.sub(r"\s*\(.*\)", "", source_language).strip(), "auto")
 
     chunks, cur = [], ""
     for line in text.split("\n"):
@@ -739,7 +750,7 @@ def translate_free(text: str, language: str = "Simplified Chinese (简体中文)
     out = []
     for ch in chunks:
         body = urllib.parse.urlencode(
-            {"client": "gtx", "sl": "auto", "tl": code, "dt": "t", "q": ch}).encode()
+            {"client": "gtx", "sl": sl, "tl": code, "dt": "t", "q": ch}).encode()
         req = urllib.request.Request(
             "https://translate.googleapis.com/translate_a/single", body,
             {"User-Agent": "Mozilla/5.0"})
