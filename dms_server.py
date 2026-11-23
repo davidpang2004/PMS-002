@@ -410,18 +410,39 @@ def _get_lan_ip() -> str:
         except Exception:
             pass
     elif sys.platform.startswith("win"):
+        # Prefer the adapter that carries the default route (the real Wi-Fi /
+        # Ethernet), skipping ones a phone on the same Wi-Fi can't reach:
+        # VPN tunnels (they often take over the default route), Hyper-V /
+        # emulator virtual switches (often a manual 169.254.x.x with a low
+        # metric), and link-local addresses.  Built-in Windows VPN (PPP)
+        # connections have no NetAdapter object, so "no adapter" counts as VPN.
+        # Falls back to any non-VPN adapter when there's no default route.
+        ps = r"""
+$skip = 'VPN|WireGuard|Wintun|TAP-Windows|OpenVPN|Tailscale|ZeroTier|AnyConnect|Cisco|Forti|GlobalProtect|PANGP|Juniper|Pulse Secure|Ivanti|NordLynx|Hamachi|SonicWall|Check Point|Zscaler|WAN Miniport|Hyper-V|vEthernet|VirtualBox|VMware|Loopback'
+function Ok($i) {
+  $a = Get-NetAdapter -InterfaceIndex $i -IncludeHidden -ErrorAction SilentlyContinue
+  if (-not $a) { return $false }
+  return -not (($a.InterfaceDescription + ' ' + $a.Name) -match $skip)
+}
+function Ip($i) {
+  (Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex $i -ErrorAction SilentlyContinue |
+    Where-Object { $_.IPAddress -notmatch '^(127|169\.254)\.' } | Select-Object -First 1).IPAddress
+}
+$routes = Get-NetRoute -DestinationPrefix 0.0.0.0/0 -ErrorAction SilentlyContinue |
+  Sort-Object { $_.RouteMetric + $_.InterfaceMetric }
+foreach ($r in $routes) { if (Ok $r.ifIndex) { $ip = Ip $r.ifIndex; if ($ip) { $ip; exit } } }
+$all = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+  Where-Object { $_.IPAddress -notmatch '^(127|169\.254)\.' } | Sort-Object InterfaceMetric
+foreach ($x in $all) { if (Ok $x.InterfaceIndex) { $x.IPAddress; exit } }
+"""
         try:
             out = _sp.check_output(
-                ["powershell", "-Command",
-                 "(Get-NetIPAddress -AddressFamily IPv4 | "
-                 "Where-Object { $_.IPAddress -notmatch '^127\\.' -and "
-                 "$_.PrefixOrigin -ne 'WellKnown' } | "
-                 "Sort-Object InterfaceMetric | "
-                 "Select-Object -First 1).IPAddress"],
+                ["powershell", "-NoProfile", "-Command", ps],
                 text=True, stderr=_sp.DEVNULL,
+                creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
             ).strip()
             if out:
-                return out
+                return out.splitlines()[0].strip()
         except Exception:
             pass
     # Fallback: route-based detection (may return VPN IP)
@@ -2529,6 +2550,119 @@ def _public_or_lan_base(use_tunnel=False):
     host = request.host
     port = host.split(":")[-1] if ":" in host else "8765"
     return f"http://{ip}:{port}", ip
+
+
+# ── Windows Firewall check / one-click fix ─────────────────────────────────
+# If the user dismisses Windows' "Allow DMS on these networks?" prompt on first
+# run, Windows saves an inbound Block rule for DMS.exe and phones on the same
+# Wi-Fi can't connect (the internet tunnel still works, since cloudflared
+# reaches DMS over localhost).  These endpoints let the phone dialogs detect
+# that and fix it behind a UAC prompt.
+
+def _is_local_browser_request() -> bool:
+    """True only for the DMS window on this PC — not a phone on the LAN, and not
+    a tunnel visitor (cloudflared connects from localhost but adds CF headers)."""
+    if request.remote_addr not in ("127.0.0.1", "::1"):
+        return False
+    return not (request.headers.get("Cf-Connecting-Ip") or request.headers.get("X-Forwarded-For"))
+
+
+def _ps_quote(s: str) -> str:
+    return "'" + s.replace("'", "''") + "'"
+
+
+def _firewall_status() -> dict:
+    """Inbound firewall state for this exe on the network the phone would use.
+
+    Response: {applicable, ok, state: "ok"|"blocked"|"missing"|"unknown",
+               category: "Private"|"Public"|"DomainAuthenticated"|""}
+    Block rules win over Allow rules in Windows Firewall, so any enabled Block
+    rule covering the current profile means "blocked".
+    """
+    if not sys.platform.startswith("win"):
+        return {"applicable": False, "ok": True, "state": "ok", "category": ""}
+    ps = r"""
+$prog = __PROG__
+$r = Get-NetRoute -DestinationPrefix 0.0.0.0/0 -ErrorAction SilentlyContinue |
+  Sort-Object { $_.RouteMetric + $_.InterfaceMetric } | Select-Object -First 1
+$cat = ''
+if ($r) { $cat = [string](Get-NetConnectionProfile -InterfaceIndex $r.ifIndex -ErrorAction SilentlyContinue).NetworkCategory }
+$pname = @{ 'Private'='Private'; 'Public'='Public'; 'DomainAuthenticated'='Domain' }[$cat]
+if (-not $pname) { $pname = 'Private' }
+$bit = @{ 'Domain'=1; 'Private'=2; 'Public'=4 }[$pname]
+$fwOn = (Get-NetFirewallProfile -Name $pname).Enabled -ne $false
+$allow = $false; $block = $false
+if ($fwOn) {
+  Get-NetFirewallApplicationFilter | Where-Object { $_.Program -eq $prog } | ForEach-Object {
+    $rule = $_ | Get-NetFirewallRule
+    if ($rule.Enabled -eq 'True' -and $rule.Direction -eq 'Inbound') {
+      $p = [int]$rule.Profile
+      if ($p -eq 0 -or ($p -band $bit)) {
+        if ($rule.Action -eq 'Block') { $block = $true } elseif ($rule.Action -eq 'Allow') { $allow = $true }
+      }
+    }
+  }
+}
+$state = if (-not $fwOn) { 'ok' } elseif ($block) { 'blocked' } elseif ($allow) { 'ok' } else { 'missing' }
+@{ state = $state; category = $cat } | ConvertTo-Json -Compress
+""".replace("__PROG__", _ps_quote(sys.executable))
+    try:
+        out = subprocess.check_output(
+            ["powershell", "-NoProfile", "-Command", ps],
+            text=True, stderr=subprocess.DEVNULL, timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        ).strip()
+        info = json.loads(out.splitlines()[-1])
+        state = info.get("state") or "unknown"
+        return {"applicable": True, "ok": state == "ok", "state": state,
+                "category": info.get("category") or ""}
+    except Exception as e:
+        print(f"[DMS] Firewall check failed: {e}")
+        return {"applicable": True, "ok": True, "state": "unknown", "category": ""}
+
+
+@app.route("/api/firewall-status", methods=["GET"])
+def get_firewall_status():
+    if not _is_local_browser_request():
+        return jsonify({"error": "Only available on this computer"}), 403
+    return jsonify(_firewall_status())
+
+
+@app.route("/api/firewall-fix", methods=["POST"])
+def post_firewall_fix():
+    """Remove Block rules for this exe and add an Allow rule for Private and
+    Domain networks.  Runs elevated, so Windows shows a UAC prompt on this PC.
+    Public networks are deliberately left alone — the dialog asks the user to
+    switch their Wi-Fi to Private instead.
+    Response: firewall status (as /api/firewall-status) + {cancelled}"""
+    if not _is_local_browser_request():
+        return jsonify({"error": "Only available on this computer"}), 403
+    if not sys.platform.startswith("win"):
+        return jsonify({"error": "Windows only"}), 400
+    prog = _ps_quote(sys.executable)
+    inner = f"""
+Get-NetFirewallApplicationFilter | Where-Object {{ $_.Program -eq {prog} }} | Get-NetFirewallRule |
+  Where-Object {{ $_.Direction -eq 'Inbound' -and $_.Action -eq 'Block' }} | Remove-NetFirewallRule
+New-NetFirewallRule -DisplayName 'DMS (phone access)' -Direction Inbound -Program {prog} -Action Allow -Profile Private,Domain | Out-Null
+"""
+    enc = base64.b64encode(inner.encode("utf-16-le")).decode("ascii")
+    outer = ("try { Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden "
+             f"-ArgumentList '-NoProfile -EncodedCommand {enc}' -ErrorAction Stop; 'done' }} "
+             "catch { 'cancelled' }")
+    cancelled = False
+    try:
+        out = subprocess.check_output(
+            ["powershell", "-NoProfile", "-Command", outer],
+            text=True, stderr=subprocess.DEVNULL, timeout=300,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        ).strip()
+        cancelled = "cancelled" in out
+    except Exception as e:
+        print(f"[DMS] Firewall fix failed: {e}")
+        cancelled = True
+    result = _firewall_status()
+    result["cancelled"] = cancelled
+    return jsonify(result)
 
 
 @app.route("/api/phone-upload-link", methods=["POST"])
@@ -5106,15 +5240,58 @@ def _send_via_applescript(to_email, subject, body, file_path):
     return jsonify({"error": err}), 500
 
 
+def _clean_smtp_host(value):
+    """Normalise a typed SMTP host: full-width -> ASCII, drop whitespace and
+    invisible characters (IME / voice input / copy-paste), strip any scheme,
+    path or trailing ':port'. Hidden characters otherwise cause
+    '[Errno 11001] getaddrinfo failed'."""
+    import re
+    import unicodedata
+    s = unicodedata.normalize("NFKC", str(value or ""))
+    s = "".join(ch for ch in s if not ch.isspace() and unicodedata.category(ch)[0] != "C")
+    s = re.sub(r"^[a-zA-Z]+://", "", s)
+    s = s.split("/")[0].split(":")[0].strip(".").lower()
+    return s
+
+
+def _smtp_from_header(from_value, smtp_user):
+    """Return a valid From header. A bare display name such as 'David Pang'
+    becomes 'David Pang <user@example.com>'."""
+    from email.utils import formataddr
+    f = (from_value or "").strip()
+    if not f:
+        return smtp_user
+    if "@" in f:
+        return f
+    return formataddr((f, smtp_user))
+
+
 def _smtp_login(srv, user, password):
     """Log in with AUTH PLAIN only. smtplib.login() retries with AUTH LOGIN after a
     535, and Gmail/Yahoo drop the connection on that, hiding the real rejection."""
     import smtplib
+    # Google/Yahoo show app passwords as "abcd efgh ijkl mnop"; the spaces aren't
+    # part of the password, so drop them when the result is a 16-letter app password.
+    compact = re.sub(r"\s+", "", password or "")
+    if compact != password and len(compact) == 16 and compact.isalpha():
+        password = compact
     try:
         srv.auth("PLAIN", lambda challenge=None: "\0%s\0%s" % (user, password),
                  initial_response_ok=True)
     except smtplib.SMTPAuthenticationError as exc:
         detail = exc.smtp_error.decode("utf-8", "replace") if isinstance(exc.smtp_error, bytes) else str(exc.smtp_error)
+        host = (getattr(srv, "_host", "") or "").lower()
+        if "gmail" in host or "googlemail" in host or user.lower().endswith(("@gmail.com", "@googlemail.com")):
+            hint = ""
+            if len(password.replace(" ", "")) != 16:
+                hint = "（当前保存的密码不是 16 位，应是普通登录密码）"
+            raise RuntimeError(
+                f"Gmail 拒绝登录（{exc.smtp_code}）{hint}：Gmail 不接受普通密码，必须使用 16 位“应用专用密码”。"
+                "请打开 https://myaccount.google.com/apppasswords（需先开启两步验证）生成后，"
+                "粘贴到「邮件设置」的密码栏并保存。 / Gmail rejected the login: it requires a 16-letter "
+                "App Password, not your normal password. Create one at myaccount.google.com/apppasswords "
+                "and paste it into Email settings."
+            ) from None
         raise RuntimeError(f"登录被邮件服务器拒绝（{exc.smtp_code}）：用户名或密码/应用专用密码不正确。{detail}") from None
 
 
@@ -5127,11 +5304,11 @@ def _send_via_smtp(to_email, subject, body, file_path, doc_name, cfg):
     from email.mime.text import MIMEText
     from email import encoders as _enc
 
-    smtp_host = (cfg.get("email_smtp_host") or "").strip()
+    smtp_host = _clean_smtp_host(cfg.get("email_smtp_host"))
     smtp_port = int(cfg.get("email_smtp_port") or 587)
     smtp_user = (cfg.get("email_smtp_user") or "").strip()
     smtp_pass = (cfg.get("email_smtp_pass") or "").strip()
-    from_addr = (cfg.get("email_from") or "").strip() or smtp_user
+    from_addr = _smtp_from_header(cfg.get("email_from"), smtp_user)
     use_ssl   = bool(cfg.get("email_ssl", False))
 
     msg = MIMEMultipart()
@@ -5189,7 +5366,7 @@ def get_email_settings():
 def set_email_settings():
     data = request.get_json(force=True) or {}
     cfg = load_config()
-    cfg["email_smtp_host"] = (data.get("smtp_host") or "").strip()
+    cfg["email_smtp_host"] = _clean_smtp_host(data.get("smtp_host"))
     cfg["email_smtp_port"] = int(data.get("smtp_port") or 587)
     cfg["email_smtp_user"] = (data.get("smtp_user") or "").strip()
     cfg["email_from"]      = (data.get("email_from") or "").strip()
@@ -5208,7 +5385,7 @@ def test_email_settings():
     # Use provided settings; fall back to saved config for password if blank
     cfg = load_config()
     test_cfg = {
-        "email_smtp_host": (data.get("smtp_host") or "").strip(),
+        "email_smtp_host": _clean_smtp_host(data.get("smtp_host")),
         "email_smtp_port": int(data.get("smtp_port") or 587),
         "email_smtp_user": (data.get("smtp_user") or "").strip(),
         "email_smtp_pass": (data.get("smtp_pass") or "").strip() or cfg.get("email_smtp_pass", ""),
@@ -5221,7 +5398,7 @@ def test_email_settings():
 
     import smtplib
     from email.mime.text import MIMEText
-    from_addr = test_cfg["email_from"] or to_addr
+    from_addr = _smtp_from_header(test_cfg["email_from"], to_addr)
     msg = MIMEText("这是来自 DMS 的测试邮件，表明 SMTP 设置配置正确。", "plain", "utf-8")
     msg["From"]    = from_addr
     msg["To"]      = to_addr
@@ -5242,6 +5419,11 @@ def test_email_settings():
                     _smtp_login(srv, test_cfg["email_smtp_user"], test_cfg["email_smtp_pass"])
                 srv.send_message(msg)
         return jsonify({"ok": True})
+    except OSError as exc:
+        if getattr(exc, "errno", None) in (11001, 11004, -2, -3, 8):
+            return jsonify({"error": f"SMTP 错误：无法解析服务器地址 {test_cfg['email_smtp_host']!r}。"
+                                     f"请检查服务器名称拼写和网络/DNS 连接。（{exc}）"}), 500
+        return jsonify({"error": f"SMTP 错误：{exc}"}), 500
     except Exception as exc:
         return jsonify({"error": f"SMTP 错误：{exc}"}), 500
 
@@ -5368,10 +5550,10 @@ def _send_text_via_smtp(to_email, subject, body, cfg):
     smtp_user = (cfg.get("email_smtp_user") or "").strip()
     smtp_pass = (cfg.get("email_smtp_pass") or "").strip()
     msg = MIMEText(body, "plain", "utf-8")
-    msg["From"] = (cfg.get("email_from") or "").strip() or smtp_user
+    msg["From"] = _smtp_from_header(cfg.get("email_from"), smtp_user)
     msg["To"] = to_email
     msg["Subject"] = subject
-    host = (cfg.get("email_smtp_host") or "").strip()
+    host = _clean_smtp_host(cfg.get("email_smtp_host"))
     port = int(cfg.get("email_smtp_port") or 587)
     try:
         if cfg.get("email_ssl"):

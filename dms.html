@@ -8498,8 +8498,67 @@ const PhoneLinkHelp = ({ ip, anyNetHint = false }) => {
   const pc = isWin ? t("这台电脑", "this PC") : t("这台 Mac", "this Mac");
   const H = ({ children }) => <div className="font-medium text-stone-800">{children}</div>;
   const S = ({ children }) => <div className="pl-2">{children}</div>;
+  // A phone on home Wi-Fi can only reach a private LAN address; anything else
+  // (169.254 link-local, VPN or public IP) means the wrong adapter was picked.
+  const badIp = ip && /^\d+\.\d+\.\d+\.\d+$/.test(ip) && !/^(192\.168|10)\.|^172\.(1[6-9]|2\d|3[01])\./.test(ip);
+  // Windows only: detect a firewall rule that blocks phones on this Wi-Fi
+  // (usually from dismissing Windows' "Allow access?" prompt) and offer a fix.
+  const [fw, setFw] = useState(null);
+  const [fwBusy, setFwBusy] = useState(false);
+  const [fwMsg, setFwMsg] = useState("");
+  useEffect(() => {
+    if (!isWin) return;
+    let alive = true;
+    fetch(API_BASE + "/api/firewall-status").then((r) => r.ok ? r.json() : null).then((d) => { if (alive) setFw(d); }).catch(() => {});
+    return () => { alive = false; };
+  }, [isWin]);
+  const fixFirewall = async () => {
+    setFwBusy(true); setFwMsg("");
+    try {
+      const r = await fetch(API_BASE + "/api/firewall-fix", { method: "POST" });
+      const d = await r.json();
+      setFw(d);
+      if (d.cancelled) setFwMsg(t("已取消。需要在 Windows 弹窗中点「是」才能修复。", "Cancelled. Click Yes in the Windows prompt to apply the fix."));
+      else if (d.ok) setFwMsg(t("已修复！请重新用手机扫描二维码。", "Fixed! Scan the QR code with the phone again."));
+      else if (d.category === "Public") setFwMsg(t("防火墙已允许 DMS，但 Wi-Fi 仍是「公用网络」。请按上面的说明改成「专用网络」，再重新打开此窗口。", "DMS is now allowed, but the Wi-Fi is still a Public network. Switch it to Private as described above, then reopen this window."));
+      else setFwMsg(t("没有修复成功，请按下方「被 Windows 防火墙拦截」的步骤手动设置。", "That didn't fix it. Follow the “Blocked by Windows Firewall” steps below instead."));
+    } catch (e) {
+      setFwMsg(t("修复失败，请按下方「被 Windows 防火墙拦截」的步骤手动设置。", "The fix didn't work. Follow the “Blocked by Windows Firewall” steps below instead."));
+    }
+    setFwBusy(false);
+  };
+  const fwPublic = fw && fw.category === "Public";
   return (
     <div className="text-[12px]">
+      {fw && fw.applicable && !fw.ok && fw.state !== "unknown" && (
+        <div className="mb-1 text-red-700 bg-red-50 border border-red-200 rounded p-1.5 space-y-1">
+          {fwPublic ? (
+            <div>{t("⚠ 这台电脑的 Wi-Fi 被设成了「公用网络」，Windows 会拦截手机的连接。请到 设置 → 网络和 Internet → WLAN → 点当前 Wi-Fi → 网络配置文件类型选「专用网络」，然后点下面的按钮。", "⚠ This PC's Wi-Fi is set to “Public network”, so Windows blocks the phone. Go to Settings → Network & internet → Wi-Fi → click your network → Network profile type: Private, then click the button below.")}</div>
+          ) : (
+            <div>{t("⚠ Windows 防火墙正在阻止手机连接 DMS。", "⚠ Windows Firewall is blocking the phone from reaching DMS.")}</div>
+          )}
+          <div className="flex items-center gap-2">
+            <button onClick={fixFirewall} disabled={fwBusy} className="px-2 py-0.5 rounded bg-red-700 text-white hover:bg-red-800 disabled:opacity-60">
+              {fwBusy ? t("请在 Windows 弹窗中点「是」…", "Click Yes in the Windows prompt…") : t("一键修复防火墙", "Fix firewall")}
+            </button>
+            {!fwBusy && <span className="text-stone-600">{t("（需要管理员确认一次）", "(asks for administrator permission once)")}</span>}
+          </div>
+        </div>
+      )}
+      {fwMsg && <div className={"mb-1 " + (fw && fw.ok ? "text-green-700" : "text-red-700")}>{fwMsg}</div>}
+      {badIp ? (
+        <div className="mb-1 text-red-700 bg-red-50 border border-red-200 rounded p-1.5">
+          {t("⚠ 链接里的 IP", "⚠ The IP in this link,")} <span className="font-mono font-bold">{ip}</span>{anyNetHint
+            ? t(" 不像家庭 Wi-Fi 地址，手机可能打不开。请断开 VPN 后重新打开此窗口，或改用「任何网络」。", ", doesn't look like a home Wi-Fi address, so the phone probably can't open it. Disconnect any VPN and reopen this window, or use “Any network”.")
+            : t(" 不像家庭 Wi-Fi 地址，手机可能打不开。请断开 VPN 后重新打开此窗口。", ", doesn't look like a home Wi-Fi address, so the phone probably can't open it. Disconnect any VPN and reopen this window.")}
+        </div>
+      ) : (
+        <div className="mb-1 text-stone-600">
+          {isWin
+            ? t(`提示：手机须与${pc}连同一个 Wi-Fi。如果 Windows 询问是否允许 DMS 访问网络，请点「允许访问」。`, `Tip: the phone must be on the same Wi-Fi as ${pc}. If Windows asks whether to allow DMS on the network, click Allow access.`)
+            : t(`提示：手机须与${pc}连同一个 Wi-Fi。如果 macOS 询问是否允许 DMS 接受传入连接，请点「允许」。`, `Tip: the phone must be on the same Wi-Fi as ${pc}. If macOS asks whether DMS may accept incoming connections, click Allow.`)}
+        </div>
+      )}
       <button onClick={() => setOpen(!open)} className="text-amber-700 underline">
         {open ? t("收起", "Collapse") : t("手机打不开链接？查看解决方法 ▾", "Link won't open on the phone? See troubleshooting ▾")}
       </button>
@@ -12648,15 +12707,30 @@ const EmailSettingsDialog = ({ onClose }) => {
               placeholder={t("留空则不更改现有密码", "Leave blank to keep the existing password")}
               className="w-full px-2 py-1.5 text-base border border-stone-300 rounded focus:outline-none focus:border-amber-500 mb-1"
             />
-            <div className="text-[12px] text-stone-600 mb-2 leading-relaxed">
-              {t("这里必须填 16 位“应用专用密码”，不是登录密码。", "Use a 16-character app password here, not your normal login password.")}{" "}
-              <a href="https://myaccount.google.com/apppasswords" target="_blank" rel="noreferrer" className="text-amber-700 underline">
-                {t("Gmail：myaccount.google.com/apppasswords（需先开启两步验证）", "Gmail: myaccount.google.com/apppasswords (turn on 2-Step Verification first)")}
-              </a>
-              {" · "}
-              <a href="https://login.yahoo.com/account/security" target="_blank" rel="noreferrer" className="text-amber-700 underline">
-                {t("Yahoo：账户安全 → 生成应用密码", "Yahoo: Account security → Generate app password")}
-              </a>
+            <div className="text-[13px] text-stone-800 bg-amber-50 border border-amber-300 rounded px-2.5 py-2 mb-2 leading-relaxed">
+              <div className="font-semibold text-amber-900 mb-1">
+                {t("⚠ 这里不是您登录 Gmail 的密码！", "⚠ This is NOT the password you use to sign in to Gmail!")}
+              </div>
+              <div className="mb-1">
+                {t("Gmail 发送邮件需要一个专门生成的 16 位“应用专用密码”，它与您的 Gmail 登录密码不同。获取方法：",
+                   "Sending email through Gmail needs a special 16-character \"app password\" that Google generates for you. It is different from your Gmail login password. To get one:")}
+              </div>
+              <ol className="list-decimal pl-5 mb-1 space-y-0.5">
+                <li>{t("先在 Google 账户中开启“两步验证”。", "Turn on 2-Step Verification in your Google account (required first).")}</li>
+                <li>
+                  {t("打开 ", "Open ")}
+                  <a href="https://myaccount.google.com/apppasswords" target="_blank" rel="noreferrer" className="text-amber-700 underline font-medium">myaccount.google.com/apppasswords</a>
+                  {t("，输入一个名称（如“DMS”），点击“创建”。", ", type a name (e.g. \"DMS\") and click Create.")}
+                </li>
+                <li>{t("复制显示的 16 位密码（如 abcd efgh ijkl mnop），粘贴到上面的密码框（空格可有可无）。", "Copy the 16-character password shown (like abcd efgh ijkl mnop) and paste it into the box above — spaces are optional.")}</li>
+                <li>{t("Google 只显示一次，请妥善保存。", "Google shows it only once, so keep a copy somewhere safe.")}</li>
+              </ol>
+              <div className="text-[12px] text-stone-700">
+                {t("Yahoo 邮箱同理：", "Yahoo works the same way: ")}
+                <a href="https://login.yahoo.com/account/security" target="_blank" rel="noreferrer" className="text-amber-700 underline">
+                  {t("账户安全 → 生成应用密码", "Account security → Generate app password")}
+                </a>
+              </div>
             </div>
 
             <label className="block text-[12px] uppercase tracking-wider text-stone-700 mb-1">
